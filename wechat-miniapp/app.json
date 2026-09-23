@@ -1,0 +1,19 @@
+{
+  "pages": [
+    "pages/index/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "童心日记",
+    "navigationBarBackgroundColor": "#fff8ec",
+    "navigationBarTextStyle": "black",
+    "backgroundColor": "#fff8ec",
+    "backgroundTextStyle": "light"
+  },
+  "permission": {
+    "scope.record": {
+      "desc": "用于听孩子讲故事并整理成日记"
+    }
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json"
+}

@@ -1,0 +1,4 @@
+{
+  "desc": "童心日记",
+  "rules": [{ "action": "allow", "page": "*" }]
+}

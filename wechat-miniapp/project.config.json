@@ -1,0 +1,16 @@
+{
+  "appid": "wx79e70247ffdfdde8",
+  "projectname": "tongxin-diary-miniapp",
+  "compileType": "miniprogram",
+  "libVersion": "trial",
+  "setting": {
+    "urlCheck": false,
+    "es6": true,
+    "enhance": true,
+    "postcss": true,
+    "minified": false,
+    "coverView": true,
+    "showShadowRootInWxmlPanel": true
+  },
+  "condition": {}
+}

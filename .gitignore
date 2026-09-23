@@ -1,0 +1,15 @@
+# Secrets and local runtime settings
+.env
+.env.local
+.env.*.local
+
+# WeChat developer tool local state
+wechat-miniapp/project.private.config.json
+wechat-miniapp/preview-qr.png
+
+# Generated archives and local artifacts
+*.zip
+*.log
+.DS_Store
+node_modules/
+

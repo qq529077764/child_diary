@@ -1,0 +1,69 @@
+<view class="page">
+  <view wx:if="{{phase === 'home'}}" class="screen home">
+    <view class="hero-card">
+      <view class="rabbit large">
+        <view class="ear left"></view><view class="ear right"></view>
+        <view class="head"><view class="eye left"></view><view class="eye right"></view><view class="nose"></view></view>
+      </view>
+      <text class="hero-title">今天的小故事，直接说给小耳朵听</text>
+      <text class="muted">开始以后一直说就好，中间不需要点按钮。</text>
+    </view>
+    <view class="theme-card"><text class="eyebrow">今日主题</text><text class="theme">今天你帮助别人做了什么？</text></view>
+    <button class="button primary" bindtap="startStory">开始说</button>
+  </view>
+
+  <view wx:elif="{{phase === 'listen'}}" class="screen listen-screen">
+    <view class="topic"><text>今日主题</text><text class="topic-strong">帮助别人</text></view>
+    <view class="listen-card {{isRecording ? 'recording' : ''}}">
+      <view class="rabbit small">
+        <view class="ear left"></view><view class="ear right"></view>
+        <view class="head"><view class="eye left"></view><view class="eye right"></view><view class="nose"></view></view>
+      </view>
+      <text class="listen-title">{{statusTitle}}</text>
+      <text class="muted center">{{statusHint}}</text>
+      <view wx:if="{{isRecording}}" class="wave"><view></view><view></view><view></view><view></view><view></view></view>
+    </view>
+    <view class="transcript">
+      <text class="transcript-label">刚刚听到</text>
+      <scroll-view class="transcript-window" scroll-y scroll-with-animation scroll-into-view="{{transcriptAnchorId}}" show-scrollbar="{{false}}">
+        <text class="transcript-text">{{latestText || '开始说以后，最新识别的文字会一直显示在这里'}}</text>
+        <view id="{{transcriptAnchorId}}" class="transcript-anchor"></view>
+      </scroll-view>
+    </view>
+    <scroll-view class="feed" scroll-y scroll-with-animation scroll-into-view="{{feedAnchorId}}">
+      <view wx:for="{{bubbles}}" wx:key="id" class="bubble {{item.type}}">{{item.text}}</view>
+      <view id="{{feedAnchorId}}" class="feed-anchor"></view>
+    </scroll-view>
+    <scroll-view class="chips" scroll-x><view wx:for="{{factChips}}" wx:key="id" class="chip">{{item.label}}：{{item.text}}</view></scroll-view>
+    <view class="actions"><view class="button green passive">{{isRecording ? '继续说就好' : '已经停止'}}</view><button class="button orange" disabled="{{isFinishing}}" bindtap="finishStory">{{isFinishing ? '正在整理' : '我说完啦'}}</button></view>
+  </view>
+
+  <view wx:elif="{{phase === 'diary'}}" class="screen diary-screen">
+    <scroll-view class="diary-card" scroll-y>
+      <text class="eyebrow orange-text">我的日记</text>
+      <text class="diary-title">{{diaryTitle}}</text>
+      <view class="diary-body"><text wx:for="{{diarySentences}}" wx:key="index" class="sentence color-{{index % 3}}">{{item.text}}</text></view>
+      <view class="source" wx:for="{{diarySentences}}" wx:key="index"><text class="source-sentence">{{item.text}}</text><text class="source-detail">{{item.sourceText}}</text></view>
+      <view class="pass">事实校验通过：每句话都来自孩子说过的内容。</view>
+    </scroll-view>
+    <button class="button orange" bindtap="readDiary">听小耳朵读</button>
+    <view class="actions"><button class="button green" bindtap="saveDiary">就是这样</button><button class="button soft" bindtap="startRevision">我想改一下</button></view>
+  </view>
+
+  <view wx:elif="{{phase === 'revise'}}" class="screen revise-screen">
+    <view class="topic"><text>语音修改</text><text class="topic-strong">不用打字</text></view>
+    <view class="listen-card revise-card recording">
+      <view class="rabbit small"><view class="ear left"></view><view class="ear right"></view><view class="head"><view class="eye left"></view><view class="eye right"></view><view class="nose"></view></view></view>
+      <text class="listen-title">正在听你修改</text>
+      <scroll-view class="revision-text" scroll-y>{{revisionDisplay || '直接说哪里要替换、删除或补充。'}}</scroll-view>
+      <view class="wave"><view></view><view></view><view></view><view></view><view></view></view>
+    </view>
+    <view class="tip">说完整一句，例如：“不是没有读绘本，是睡醒以后开始读绘本。”</view>
+    <button class="button orange bottom" disabled="{{isFinishing}}" bindtap="applyRevision">{{isFinishing ? '正在修改' : '说好了，帮我改'}}</button>
+  </view>
+
+  <view wx:else class="screen success">
+    <view class="success-icon">✓</view><text class="hero-title">保存成功</text><text class="muted">今天的小故事已经放进日记本里啦。</text>
+    <button class="button primary bottom" bindtap="restart">再讲一篇</button>
+  </view>
+</view>

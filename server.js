@@ -1,0 +1,1236 @@
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+
+const ROOT = __dirname;
+
+loadEnvFile(path.join(ROOT, ".env"));
+
+const PORT = Number(process.env.PORT || 5178);
+
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml; charset=utf-8",
+  ".md": "text/markdown; charset=utf-8"
+};
+
+function loadEnvFile(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const index = trimmed.indexOf("=");
+    if (index < 0) continue;
+    const key = trimmed.slice(0, index).trim();
+    const value = trimmed.slice(index + 1).trim().replace(/^["']|["']$/g, "");
+    if (key && process.env[key] === undefined) process.env[key] = value;
+  }
+}
+
+function sendJson(res, status, data) {
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Access-Control-Allow-Origin": "*"
+  });
+  res.end(JSON.stringify(data));
+}
+
+function collectBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", chunk => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+function getBoundary(contentType) {
+  const match = /boundary=([^;]+)/i.exec(contentType || "");
+  return match ? match[1] : "";
+}
+
+function parseMultipart(buffer, boundary) {
+  if (!boundary) return {};
+  const body = buffer.toString("binary");
+  const marker = `--${boundary}`;
+  const parts = body.split(marker).slice(1, -1);
+  const fields = {};
+
+  for (const part of parts) {
+    const trimmed = part.replace(/^\r\n/, "").replace(/\r\n$/, "");
+    const splitAt = trimmed.indexOf("\r\n\r\n");
+    if (splitAt < 0) continue;
+    const rawHeaders = trimmed.slice(0, splitAt);
+    const rawContent = trimmed.slice(splitAt + 4);
+    const name = /name="([^"]+)"/.exec(rawHeaders)?.[1];
+    if (!name) continue;
+    const filename = /filename="([^"]*)"/.exec(rawHeaders)?.[1];
+    const contentType = /Content-Type:\s*([^\r\n]+)/i.exec(rawHeaders)?.[1] || "application/octet-stream";
+    const content = Buffer.from(rawContent, "binary");
+    fields[name] = filename ? { filename, contentType, content } : rawContent;
+  }
+
+  return fields;
+}
+
+function hmacSha256(message, secret, encoding) {
+  return crypto.createHmac("sha256", secret).update(message).digest(encoding);
+}
+
+function sha256(message, encoding = "hex") {
+  return crypto.createHash("sha256").update(message).digest(encoding);
+}
+
+async function callTencentCloud(action, payload) {
+  const secretId = process.env.TENCENT_SECRET_ID;
+  const secretKey = process.env.TENCENT_SECRET_KEY;
+  if (!secretId || !secretKey) return null;
+
+  const service = "asr";
+  const host = "asr.tencentcloudapi.com";
+  const version = "2019-06-14";
+  const region = process.env.TENCENT_REGION || "ap-shanghai";
+  const timestamp = Math.floor(Date.now() / 1000);
+  const date = new Date(timestamp * 1000).toISOString().slice(0, 10);
+  const body = JSON.stringify(payload);
+
+  const httpRequestMethod = "POST";
+  const canonicalUri = "/";
+  const canonicalQueryString = "";
+  const canonicalHeaders = `content-type:application/json; charset=utf-8\nhost:${host}\nx-tc-action:${action.toLowerCase()}\n`;
+  const signedHeaders = "content-type;host;x-tc-action";
+  const hashedRequestPayload = sha256(body);
+  const canonicalRequest = [
+    httpRequestMethod,
+    canonicalUri,
+    canonicalQueryString,
+    canonicalHeaders,
+    signedHeaders,
+    hashedRequestPayload
+  ].join("\n");
+
+  const algorithm = "TC3-HMAC-SHA256";
+  const credentialScope = `${date}/${service}/tc3_request`;
+  const stringToSign = [
+    algorithm,
+    timestamp,
+    credentialScope,
+    sha256(canonicalRequest)
+  ].join("\n");
+
+  const secretDate = hmacSha256(date, `TC3${secretKey}`);
+  const secretService = hmacSha256(service, secretDate);
+  const secretSigning = hmacSha256("tc3_request", secretService);
+  const signature = crypto.createHmac("sha256", secretSigning).update(stringToSign).digest("hex");
+  const authorization = `${algorithm} Credential=${secretId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  const response = await fetch(`https://${host}`, {
+    method: "POST",
+    headers: {
+      Authorization: authorization,
+      "Content-Type": "application/json; charset=utf-8",
+      Host: host,
+      "X-TC-Action": action,
+      "X-TC-Timestamp": String(timestamp),
+      "X-TC-Version": version,
+      "X-TC-Region": region
+    },
+    body
+  });
+
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Tencent response parse failed: ${text.slice(0, 200)}`);
+  }
+
+  const error = data?.Response?.Error;
+  if (error) throw new Error(`${error.Code}: ${error.Message}`);
+  return data.Response;
+}
+
+async function transcribeWithTencent(audio) {
+  if (!process.env.TENCENT_SECRET_ID || !process.env.TENCENT_SECRET_KEY) return null;
+  const data = audio.content.toString("base64");
+  const response = await callTencentCloud("SentenceRecognition", {
+    ProjectId: 0,
+    SubServiceType: 2,
+    EngSerViceType: process.env.TENCENT_ASR_ENGINE_MODEL_TYPE || "16k_zh",
+    SourceType: 1,
+    VoiceFormat: "wav",
+    UsrAudioKey: `tongxin-${Date.now()}`,
+    Data: data,
+    DataLen: audio.content.length
+  });
+  return response?.Result || "";
+}
+
+async function transcribeWithOpenAI(audio) {
+  if (!process.env.OPENAI_API_KEY) return null;
+
+  const file = new File([audio.content], audio.filename || "audio.webm", {
+    type: audio.contentType || "audio/webm"
+  });
+  const form = new FormData();
+  form.append("file", file);
+  form.append("model", process.env.OPENAI_ASR_MODEL || "gpt-4o-mini-transcribe");
+  form.append("language", process.env.ASR_LANGUAGE || "zh");
+
+  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+    },
+    body: form
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`OpenAI ASR failed: ${response.status} ${text.slice(0, 200)}`);
+  }
+  const data = JSON.parse(text);
+  return data.text || "";
+}
+
+async function transcribeWithGenericProvider(audio) {
+  if (!process.env.ASR_API_URL) return null;
+
+  const response = await fetch(process.env.ASR_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": audio.contentType || "application/octet-stream",
+      ...(process.env.ASR_API_KEY ? { Authorization: `Bearer ${process.env.ASR_API_KEY}` } : {})
+    },
+    body: audio.content
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`ASR_API_URL failed: ${response.status} ${text.slice(0, 200)}`);
+
+  try {
+    const data = JSON.parse(text);
+    return data.text || data.result || data.transcript || text;
+  } catch {
+    return text;
+  }
+}
+
+function qwenConfig() {
+  return {
+    apiKey: process.env.QWEN_API_KEY || process.env.DASHSCOPE_API_KEY,
+    model: process.env.QWEN_MODEL || process.env.DASHSCOPE_MODEL || "qwen-plus",
+    baseUrl: (process.env.QWEN_BASE_URL || process.env.DASHSCOPE_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/$/, "")
+  };
+}
+
+function extractJson(text) {
+  const trimmed = String(text || "").trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {}
+  const match = trimmed.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error(`No JSON in model response: ${trimmed.slice(0, 200)}`);
+  return JSON.parse(match[0]);
+}
+
+async function callQwenJson(messages, fallback) {
+  const config = qwenConfig();
+  if (!config.apiKey) return fallback;
+  const response = await fetch(`${config.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.apiKey}`
+    },
+    body: JSON.stringify({
+      model: config.model,
+      messages,
+      temperature: 0.1,
+      max_tokens: 1200,
+      response_format: { type: "json_object" }
+    })
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`Qwen failed: ${response.status} ${text.slice(0, 200)}`);
+  const data = JSON.parse(text);
+  const content = data?.choices?.[0]?.message?.content || "";
+  return extractJson(content);
+}
+
+function localAnalyze({ text, kind, existingFacts = [], followupCount = 0, maxFollowups = 2 }) {
+  const facts = [];
+  const normalized = String(text || "").replace(/\s+/g, "");
+  const sourceQuote = String(text || "").trim();
+  if (/帮.*擦桌子|擦桌子/.test(normalized)) {
+    const person = normalized.includes("奶奶") ? "奶奶" : normalized.includes("爸爸") ? "爸爸" : normalized.includes("妈妈") ? "妈妈" : "家人";
+    facts.push({ slot: "what", label: "做了什么", text: `我帮${person}擦桌子`, quote: sourceQuote });
+  }
+  if (/去.*(公园|动物园|学校|超市)|公园玩|出去玩|玩了/.test(normalized)) {
+    const place = normalized.includes("动物园") ? "动物园" : normalized.includes("公园") ? "公园" : normalized.includes("学校") ? "学校" : normalized.includes("超市") ? "超市" : "";
+    facts.push({ slot: "what", label: "做了什么", text: place ? `我去了${place}玩` : "我出去玩了", quote: sourceQuote });
+  }
+  if (/小狗|小猫|长颈鹿|兔子|看到|遇到/.test(normalized)) {
+    const animal = normalized.match(/小狗|小猫|长颈鹿|兔子/)?.[0];
+    facts.push({ slot: "detail", label: "小细节", text: animal ? `我看到了${animal}` : "我看到了有趣的东西", quote: sourceQuote });
+  }
+  if (/湿|湿湿|抹布|擦了|擦一遍/.test(normalized)) {
+    facts.push({ slot: "detail", label: "小细节", text: /抹布/.test(normalized) ? "我用抹布擦桌子" : "我的手湿湿的", quote: sourceQuote });
+  }
+  if (/夸|干净|很棒|很好/.test(normalized)) {
+    const person = normalized.includes("奶奶") ? "奶奶" : normalized.includes("爸爸") ? "爸爸" : "妈妈";
+    facts.push({ slot: "result", label: "别人反馈", text: `${person}说我擦得很干净`, quote: sourceQuote });
+  }
+  if (/开心|高兴|快乐|骄傲|难过|害怕|生气/.test(normalized)) {
+    const feeling = normalized.match(/开心|高兴|快乐|骄傲|难过|害怕|生气/)?.[0] || "开心";
+    facts.push({ slot: "feeling", label: "我的感觉", text: `我很${feeling}`, quote: sourceQuote });
+  }
+  const allSlots = new Set([...existingFacts, ...facts].map(f => f.slot));
+  let action = "suggest_finish";
+  let question = "";
+  let reason = "";
+  if (!allSlots.has("what")) {
+    action = "ask_followup"; reason = "missing_what"; question = "你刚才做了什么呀？";
+  } else if (!allSlots.has("detail") && followupCount < maxFollowups) {
+    action = "ask_followup"; reason = "missing_detail"; question = "这件事里，你最想告诉我哪个小细节呀？";
+  } else if (!allSlots.has("feeling") && followupCount < maxFollowups) {
+    action = "ask_followup"; reason = "missing_feeling"; question = "做完这件事的时候，你是什么感觉呀？";
+  } else if (!allSlots.has("result") && followupCount < maxFollowups) {
+    action = "ask_followup"; reason = "missing_result"; question = "后来发生了什么呀？";
+  }
+  return { facts: facts.length ? facts : [{ slot: "raw", label: "原话", text: sourceQuote, quote: sourceQuote }], decision: { action, reason, question } };
+}
+
+function looksLikeNoise(text) {
+  const normalized = String(text || "").replace(/[\s，。！？、,.!?]/g, "");
+  if (!normalized) return false;
+  const hasStorySignal = /(今天|昨天|明天|后来|然后|因为|觉得|去了|看到|遇到|一起|玩了|做了|帮助|博物馆|公园|学校)/.test(normalized);
+  const latinNoise = (normalized.match(/[A-Za-z]/g) || []).length >= 6;
+  const repeatedNoise = /(.)\1{3,}|(哈哈){3,}|(呵呵){3,}|(嘿嘿){3,}/.test(normalized);
+  return !hasStorySignal && (latinNoise || repeatedNoise);
+}
+
+function isUsableDiaryFact(fact) {
+  if (!fact || !fact.text) return false;
+  const text = String(fact.text).trim();
+  const quote = String(fact.quote || "").trim();
+  if (!text) return false;
+  if (looksLikeNoise(text)) return false;
+  if (/^(我)?(说|讲)完(了|啦)?$|^结束(了)?$/u.test(text.replace(/[，。！!\s]/g, ""))) return false;
+  const isIntro = /^(你好|大家好|早上好|晚上好|我叫)/u.test(text);
+  const introContainsEvent = /(今天|昨天|明天|去了|来到|看到|遇到|一起|玩了|做了|帮助|上学|放学|回家)/u.test(text);
+  if (isIntro && !introContainsEvent) return false;
+  if (/(记不清|不记得|想不起来|不知道|不确定|可能|也许|大概|好像|猜)/u.test(text)) return false;
+  const quoteIsUncertain = /(记不清|不记得|想不起来|不确定|可能是|也许是|大概是|好像是|猜.*是)/u.test(quote);
+  const factIsAppearanceDetail = /(颜色|黑色|白色|红色|蓝色|粉色|衣服|鞋子|头发|长什么样)/u.test(text);
+  if (quoteIsUncertain && factIsAppearanceDetail) return false;
+  return true;
+}
+
+function normalizeSemanticText(text) {
+  return String(text || "")
+    .replace(/[，。！？、,.!?；;：:\s（）()《》“”"']/g, "")
+    .replace(/^(今天|然后|后来|接着|最后|我|我们)+/g, "");
+}
+
+function semanticBigrams(text) {
+  const value = normalizeSemanticText(text);
+  const grams = new Set();
+  for (let index = 0; index < value.length - 1; index += 1) grams.add(value.slice(index, index + 2));
+  return grams;
+}
+
+function semanticSimilarity(left, right) {
+  const a = normalizeSemanticText(left);
+  const b = normalizeSemanticText(right);
+  if (!a || !b) return 0;
+  if (a.includes(b) || b.includes(a)) return Math.min(a.length, b.length) >= 5 ? 1 : 0;
+  const aGrams = semanticBigrams(a);
+  const bGrams = semanticBigrams(b);
+  if (!aGrams.size || !bGrams.size) return 0;
+  let shared = 0;
+  for (const gram of aGrams) if (bGrams.has(gram)) shared += 1;
+  return (2 * shared) / (aGrams.size + bGrams.size);
+}
+
+function dedupeSemanticFacts(facts) {
+  const unique = [];
+  for (const fact of facts) {
+    const duplicateIndex = unique.findIndex(existing =>
+      existing.slot === fact.slot && semanticSimilarity(existing.text, fact.text) >= 0.72
+    );
+    if (duplicateIndex < 0) {
+      unique.push(fact);
+      continue;
+    }
+    const existing = unique[duplicateIndex];
+    if (normalizeSemanticText(fact.text).length > normalizeSemanticText(existing.text).length * 1.18) {
+      unique[duplicateIndex] = fact;
+    }
+  }
+  return unique;
+}
+
+function isLowValueQuestion(question) {
+  return /(什么颜色|哪种颜色|穿.{0,6}衣服|衣服.{0,6}(什么|哪种|颜色)|长什么样|多大|大小|什么形状|头发|鞋子|还在.{0,8}吗|在旁边|放在(哪里|哪儿)|带走了吗|拿回家了吗)/u.test(String(question || ""));
+}
+
+function removeAggregateDuplicateFacts(facts) {
+  return facts.filter((fact, index, list) => {
+    const text = String(fact.text || "");
+    const quote = String(fact.quote || "");
+    const containedFacts = list.filter((other, otherIndex) => {
+      if (otherIndex === index) return false;
+      const otherText = String(other.text || "");
+      const otherQuote = String(other.quote || "");
+      if (otherText.length < 4 && otherQuote.length < 4) return false;
+      return (otherText && text.includes(otherText)) || (otherQuote && quote.includes(otherQuote));
+    });
+    return containedFacts.length < 2;
+  });
+}
+
+async function refineFollowupWithQwen(input, rejectedQuestion, facts) {
+  const fallback = { action: "suggest_finish", reason: "complete", question: "" };
+  const messages = [
+    {
+      role: "system",
+      content: "你是儿童口述日记的引导老师。当前问题可能太琐碎、重复了已问事实，或 target_key 过于笼统。请改问另一个尚未引导的具体事实或新事件；target_key 必须是‘玩滑滑梯’这样的具体事件，不能只写‘感受’‘细节’‘结果’。优先原因、关键过程、结果或感受；禁止问外貌、衣服、颜色、大小、名字。若没有高价值缺口就结束引导。只返回 JSON。"
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        schema: { action: "ask_followup|suggest_finish", reason: "missing_detail|missing_result|missing_feeling|complete", question: "简短问题或空字符串", target_key: "问题针对的事实或事件简称" },
+        full_transcript: input.text || "",
+        known_facts: facts,
+        rejected_question: rejectedQuestion,
+        previous_questions: input.previousQuestions || [],
+        previous_question_keys: input.previousQuestionKeys || []
+      })
+    }
+  ];
+  return callQwenJson(messages, fallback);
+}
+
+async function auditFactsWithQwen(input, extractedFacts) {
+  const fallback = { facts: [] };
+  const knownFacts = [...(input.existingFacts || []), ...(extractedFacts || [])];
+  const messages = [
+    {
+      role: "system",
+      content: "你是儿童口述日记的最终事实审计模块。逐句检查完整口述，把现有事实池遗漏的清晰事实全部补出。不得提问，不得改写成作文，不得添加原话没有的信息。只返回 JSON。"
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        task: "扫描 full_transcript，返回 known_facts 尚未覆盖的全部事实。",
+        schema: {
+          facts: [{ slot: "what|detail|feeling|result", label: "中文短标签", text: "完整事实", quote: "对应原话片段" }]
+        },
+        rules: [
+          "按原话先后逐句扫描，不能只处理最后一句。",
+          "人物关系、共同活动、地点、时间变化、第二天等后续事件、看到的事物和感受都要保留。",
+          "时间和地点必须绑定到对应事件事实中，例如写成‘第二天爸爸带我去了博物馆’，不要单独返回‘第二天’或‘博物馆’。",
+          "同一事件中‘和谁一起’不能丢失，例如共同活动必须在事实 text 中保留同行人物。",
+          "忽略随机字母、重复音节、无意义逗趣和无法组成事件的片段。",
+          "孩子明确说记不清、不知道、不确定、可能或猜测的内容不是事实，不能补入事实池。",
+          "只返回 known_facts 没有覆盖的内容，不重复已有事实。"
+        ],
+        full_transcript: input.text || "",
+        known_facts: knownFacts
+      })
+    }
+  ];
+  return callQwenJson(messages, fallback);
+}
+
+async function analyzeWithQwen(input) {
+  const fallback = localAnalyze(input);
+  const messages = [
+    {
+      role: "system",
+      content: "你是儿童口述日记产品的事实抽取和追问老师。只能基于孩子原话抽取事实，不能添加孩子没说过的事实。追问必须由本次口述动态生成，紧贴孩子刚刚说到的具体人物、物品、动作、关系或事件，帮助孩子补清特征、原因、过程、结果或感受，禁止关键词匹配式预设问题和与当前内容无关的固定模板。只返回 JSON。"
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        task: "从本轮孩子口述中抽取事实，并结合已有事实判断下一步是否追问。",
+        schema: {
+          facts: [{ slot: "what|detail|feeling|result|raw", label: "中文短标签", text: "事实文本", quote: "孩子原话片段" }],
+          decision: {
+            action: "ask_followup|suggest_finish|redirect",
+            reason: "missing_what|missing_detail|missing_feeling|missing_result|complete",
+            question: "如果需要追问，只问一个适合5-9岁孩子的问题",
+            target_key: "本次问题针对的事实或事件简称，例如：玩滑滑梯",
+            question_status: "answered|invalidated|skipped|pending|none"
+          },
+          speech_quality: "coherent|unclear|nonsense|unsafe"
+        },
+        rules: [
+          "facts 只能来自 current_text。",
+          "必须抽取 current_text 中 existing_facts 尚未覆盖的所有清晰事实，不得只挑前一两个；人物、活动、地点变化和后续事件都要保留。",
+          "如果 current_text 无法抽取结构化事实，返回 raw。",
+          "把孩子明确做过或经历过的主要事件归为 what，把对象特征、过程、见闻等补充信息归为 detail。",
+          "已有事实不要重复抽取。",
+          "追问最多只问一个问题。",
+          "先识别 current_text 最后出现且尚未讲清楚的对象、关系或事件，再选择最有帮助的缺口：对象缺特征、行为缺过程、关系变化缺原因、事件缺结果、情绪缺原因。",
+          "问题中必须自然引用 current_text 里的具体人物、物品、动作或事件词，让孩子知道你在问哪件事。",
+          "不要问已经能从 current_text 或 existing_facts 回答的问题。",
+          "如果有 current_question，只用 answer_text_since_question 判断问题状态，不能用提问前的旧口述冒充回答。",
+          "明确回答问题返回 answered；孩子说‘你听错了’‘不是……’或纠正了问题前提返回 invalidated；孩子持续讲了另一件明确内容、已经自然跳过旧问题返回 skipped；仍在回答或新增内容很短返回 pending。",
+          "屏幕上的问题都是可选表达提示，不要求孩子按顺序逐一回答；未回答的旧问题不能阻塞新问题。",
+          "状态为 invalidated 或 skipped 时放弃旧问题；状态为 pending 只表示旧问题尚未回答，但孩子已继续讲出新的实质内容时，仍可生成一个不同的新问题。",
+          "previous_questions 是已经显示过的问题，禁止重复或换一种说法再次询问。",
+          "previous_question_keys 是已经引导过的事实或事件。同一个 target_key 整个讲述过程最多问一次，不得再追问该事实的另一个细节。",
+          "只要孩子又讲出了不同的事实或新事件，且该事实还有高价值缺口，就可以继续生成新问题，直到孩子主动结束。不要因为已经问过几个问题或已达到最低成文条件就停止。",
+          "先判断 recent_text 的质量。随机字母、重复音节、无意义逗趣、脏话起哄或无法组成事件的乱说标为 nonsense/unsafe：facts 返回空数组，action 返回 redirect，只温和邀请孩子回到真实故事，绝不追问乱说内容里的词。",
+          "如果 current_text 同时含有真实故事和乱说片段，只忽略乱说片段，继续抽取真实故事事实。",
+          "姓名、自我介绍、某个字怎么写以及语音识别纠错本身不是日记主体，不要围绕这些内容追问；纠错后回到孩子讲述的主要事件。",
+          "孩子说记不清、不知道、不确定、可能或猜测的描述不能抽成确定事实，也不要继续追问这项琐碎信息。",
+          "追问价值优先级：事件原因或结果 > 关键过程 > 孩子感受 > 有助识别对象的特征。除非不问就无法确认对象，否则禁止把颜色、大小、形状当作追问。",
+          "问题要短，一次只问一件事，不要用‘你是怎么做的’之类泛化问题，除非没有任何更具体的问法。",
+          "只有当前故事没有新的高价值表达缺口时才 suggest_finish；孩子继续讲出新事件后要重新判断，不受之前‘已完整’状态影响。"
+        ],
+        current_text: input.text,
+        kind: input.kind,
+        existing_facts: input.existingFacts || [],
+        current_question: input.currentQuestion || null,
+        answer_text_since_question: input.answerTextSinceQuestion || "",
+        previous_questions: input.previousQuestions || [],
+        previous_question_keys: input.previousQuestionKeys || [],
+        recent_text: input.recentText || input.text || "",
+        followup_count: input.followupCount || 0,
+        max_followups: input.maxFollowups || 50
+      })
+    }
+  ];
+  const result = await callQwenJson(messages, fallback);
+  const recentText = input.recentText || input.text || "";
+  const quality = result.speech_quality || "coherent";
+  if (["nonsense", "unsafe"].includes(quality) || looksLikeNoise(recentText)) {
+    return {
+      facts: [],
+      decision: {
+        action: "redirect",
+        reason: "unclear",
+        question: "我们回到今天的小故事吧，你刚才和谁一起做了什么呀？",
+        question_status: input.currentQuestion ? "skipped" : "none"
+      },
+      speech_quality: quality === "unsafe" ? "unsafe" : "nonsense"
+    };
+  }
+  const existingFacts = Array.isArray(input.existingFacts) ? input.existingFacts : [];
+  let candidateFacts = Array.isArray(result.facts) ? result.facts : [];
+  if (input.realtime !== true) {
+    const audit = await auditFactsWithQwen(input, candidateFacts);
+    if (Array.isArray(audit.facts)) candidateFacts = [...candidateFacts, ...audit.facts];
+  }
+  const supportedSlots = new Set(["what", "detail", "feeling", "result", "raw"]);
+  const facts = dedupeSemanticFacts(removeAggregateDuplicateFacts(candidateFacts
+    .filter(fact => fact && fact.slot && fact.text)
+    .map(fact => supportedSlots.has(fact.slot) ? fact : { ...fact, slot: "detail" })
+    .filter(isUsableDiaryFact)
+    .filter(fact => !existingFacts.some(existing =>
+      existing.text === fact.text || semanticSimilarity(existing.text, fact.text) >= 0.72 ||
+      (existing.quote && fact.quote && existing.quote === fact.quote)
+    ))
+    .filter((fact, index, list) => list.findIndex(other =>
+      other.text === fact.text || (other.quote && fact.quote && other.quote === fact.quote)
+    ) === index)));
+  const allFacts = [...existingFacts.filter(isUsableDiaryFact), ...facts];
+  const slots = new Set(allFacts.map(fact => fact.slot));
+  const configuredLimit = Number(input.maxFollowups || 0);
+  const reachedLimit = configuredLimit > 0 && Number(input.followupCount || 0) >= configuredLimit;
+  const allowedStatuses = new Set(["answered", "invalidated", "skipped", "pending", "none"]);
+  const rawStatus = result.decision?.question_status;
+  const answerText = String(input.answerTextSinceQuestion || "").replace(/\s+/g, "");
+  const correctionIntent = /(你|小耳朵)?听错(了)?|识别错(了)?|说错(了)?|不对|不是.{0,16}(是|叫)|我(没有|没)说/.test(answerText);
+  const generatedDifferentQuestion = result.decision?.action === "ask_followup" &&
+    result.decision?.question &&
+    result.decision.question !== input.currentQuestion?.question;
+  let questionStatus = "none";
+  if (input.currentQuestion) {
+    if (correctionIntent) questionStatus = "invalidated";
+    else if (allowedStatuses.has(rawStatus) && rawStatus !== "none") questionStatus = rawStatus;
+    else if (generatedDifferentQuestion && answerText.length >= 4) questionStatus = "skipped";
+    else questionStatus = "pending";
+  }
+  let decision = { ...(result.decision || fallback.decision), question_status: questionStatus };
+  if (decision.action === "ask_followup") {
+    decision.target_key = String(decision.target_key || decision.question || decision.reason || "").trim();
+    const previousKeys = (input.previousQuestionKeys || []).map(key => String(key).trim()).filter(Boolean);
+    let genericTarget = /^(感受|心情|结果|细节|过程|原因|事件|故事|其他)$/u.test(decision.target_key);
+    if (genericTarget) {
+      const concreteFact = [...facts, ...existingFacts].reverse().find(fact => fact.slot === "what") ||
+        [...facts, ...existingFacts].reverse().find(fact => ["detail", "result"].includes(fact.slot));
+      if (concreteFact?.text) {
+        decision.target_key = concreteFact.text;
+        genericTarget = false;
+      }
+    }
+    const matchingFact = [...facts, ...existingFacts].reverse().find(fact =>
+      fact?.text && (hasDistinctSharedPhrase(decision.target_key, fact.text) || semanticSimilarity(decision.target_key, fact.text) >= 0.48)
+    );
+    if (matchingFact?.text) decision.target_key = matchingFact.text;
+    const repeatsTarget = previousKeys.some(key =>
+      key === decision.target_key || key.includes(decision.target_key) || decision.target_key.includes(key) ||
+      semanticSimilarity(key, decision.target_key) >= 0.66
+    );
+    const repeatsQuestion = (input.previousQuestions || []).some(question =>
+      question === decision.question || semanticSimilarity(question, decision.question) >= 0.62
+    );
+    if (genericTarget || repeatsTarget || repeatsQuestion) {
+      const refined = await refineFollowupWithQwen(input, decision.question, allFacts);
+      const refinedKey = String(refined.target_key || refined.reason || "").trim();
+      const refinedGeneric = /^(感受|心情|结果|细节|过程|原因|事件|故事|其他)$/u.test(refinedKey);
+      const refinedRepeats = !refinedKey || refinedGeneric || previousKeys.some(key =>
+        key === refinedKey || key.includes(refinedKey) || refinedKey.includes(key) || semanticSimilarity(key, refinedKey) >= 0.66
+      ) || (input.previousQuestions || []).some(question =>
+        question === refined.question || semanticSimilarity(question, refined.question) >= 0.62
+      );
+      decision = refined.action === "ask_followup" && refined.question && !refinedRepeats
+        ? { ...refined, target_key: refinedKey, question_status: questionStatus }
+        : { action: "suggest_finish", reason: "duplicate_target", question: "", target_key: "", question_status: questionStatus };
+    }
+  }
+  const storyHasEnoughShape = allFacts.some(fact => fact.slot === "feeling") &&
+    allFacts.filter(fact => ["what", "detail", "result"].includes(fact.slot)).length >= 3;
+  if (reachedLimit) {
+    decision = { action: "suggest_finish", reason: "complete", question: "", question_status: questionStatus };
+  } else if (storyHasEnoughShape && decision.action === "ask_followup" && decision.reason === "missing_result") {
+    decision = { action: "suggest_finish", reason: "complete", question: "", question_status: questionStatus };
+  } else if (decision.action === "ask_followup" && isLowValueQuestion(decision.question)) {
+    const storySlots = new Set(allFacts.map(fact => fact.slot));
+    if (storySlots.has("what") && storySlots.has("detail") && storySlots.has("feeling")) {
+      decision = { action: "suggest_finish", reason: "complete", question: "", question_status: questionStatus };
+    } else {
+      const refined = await refineFollowupWithQwen(input, decision.question, allFacts);
+      if (refined.action === "ask_followup" && refined.question && !isLowValueQuestion(refined.question)) {
+        decision = { ...refined, question_status: questionStatus };
+      } else {
+        decision = { action: "suggest_finish", reason: "complete", question: "", question_status: questionStatus };
+      }
+    }
+  }
+  if (decision.action === "suggest_finish") {
+    const previousKeys = (input.previousQuestionKeys || []).map(key => String(key).trim()).filter(Boolean);
+    const newestEvent = [...facts].reverse().find(fact => fact.slot === "what");
+    const eventAlreadyAsked = newestEvent && previousKeys.some(key =>
+      key === newestEvent.text || key.includes(newestEvent.text) || newestEvent.text.includes(key) ||
+      semanticSimilarity(key, newestEvent.text) >= 0.66
+    );
+    if (newestEvent && !eventAlreadyAsked) {
+      const question = !slots.has("feeling")
+        ? `“${newestEvent.text}”的时候，你是什么感觉呀？`
+        : `“${newestEvent.text}”后来怎么样了？`;
+      decision = {
+        action: "ask_followup",
+        reason: slots.has("feeling") ? "missing_result" : "missing_feeling",
+        question,
+        target_key: newestEvent.text,
+        question_status: questionStatus
+      };
+    }
+  }
+  return { facts, decision, speech_quality: quality };
+}
+
+function factIsCovered(fact, usedFactTexts, sentences = []) {
+  if ([...usedFactTexts].some(text =>
+    text === fact.text || String(text).includes(fact.text) || fact.text.includes(String(text)) ||
+    semanticSimilarity(text, fact.text) >= 0.68
+  )) return true;
+  return sentences.some(sentence =>
+    semanticSimilarity(sentence.text, fact.text) >= 0.52 || hasDistinctSharedPhrase(sentence.text, fact.text)
+  );
+}
+
+function hasDistinctSharedPhrase(left, right) {
+  const generic = new Set(["今天我", "我们一", "们一起", "在公园", "公园里", "然后我", "后来我", "最后我", "回家后", "的时候"]);
+  const a = normalizeSemanticText(left);
+  const b = normalizeSemanticText(right);
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  for (let size = Math.min(5, shorter.length); size >= 3; size -= 1) {
+    for (let index = 0; index <= shorter.length - size; index += 1) {
+      const phrase = shorter.slice(index, index + size);
+      if (generic.has(phrase) || /^(今天|我们|一起|然后|后来|最后|公园)/u.test(phrase)) continue;
+      if (longer.includes(phrase)) return true;
+    }
+  }
+  return false;
+}
+
+function dedupeCompositionSentences(sentences) {
+  const unique = [];
+  for (const sentence of sentences || []) {
+    if (!sentence?.text) continue;
+    const duplicate = unique.find(existing => semanticSimilarity(existing.text, sentence.text) >= 0.68);
+    if (!duplicate) {
+      unique.push(sentence);
+      continue;
+    }
+    duplicate.factTexts = [...new Set([
+      ...(Array.isArray(duplicate.factTexts) ? duplicate.factTexts : []),
+      ...(Array.isArray(sentence.factTexts) ? sentence.factTexts : [])
+    ])];
+  }
+  return unique;
+}
+
+function compositionPenalty(draft) {
+  const sentences = Array.isArray(draft?.sentences) ? draft.sentences : [];
+  let penalty = sentences.length ? 0 : 100;
+  for (const sentence of sentences) {
+    const text = String(sentence?.text || "").trim();
+    if (text.length < 5) penalty += 8;
+    if (!/[。！？!?]$/.test(text)) penalty += 2;
+    if (/(与之前矛盾|保留原话|事实冲突|编辑说明)/u.test(text)) penalty += 20;
+    if (/(.{2,5})(?:之后|以后|接着|然后).{0,4}\1/u.test(text)) penalty += 12;
+    if (/(吃完|做完|玩完|看完|说完).{0,6}\1/u.test(text)) penalty += 12;
+    if (/(之后|以后|接着|然后|因为|所以|但是)[，。！？!?]?$/u.test(text)) penalty += 10;
+    if (!/(我|我们|爸爸|妈妈|老师|哥哥|姐姐|弟弟|妹妹|同学|朋友|小朋友|他|她|大家)/u.test(text)) penalty += 3;
+  }
+  return penalty;
+}
+
+async function repairCompositionWithQwen(input, draft, facts, missingFacts) {
+  const fallback = draft;
+  const messages = [
+    {
+      role: "system",
+      content: "你是儿童日记的事实覆盖校对老师。把遗漏事实自然合并进现有短日记，不能简单追加重复句，不能新增事实。相同活动的连续动作要合成一个事件；感受放在对应事件之后。只返回 JSON。"
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        schema: { title: "短标题", sentences: [{ text: "一句日记", factTexts: ["实际使用的事实 text"] }] },
+        rules: [
+          "所有 facts 都必须覆盖且每个事实只表达一次。",
+          "每个独立句子必须有明确主语和谓语，优先使用孩子事实中的‘我、我们、爸爸、妈妈、老师、哥哥’作为主语；禁止写‘在公园玩了滑滑梯’这类缺主语句，应写‘我在公园玩了滑滑梯’。并列动作可以共用一次主语。",
+          "爬上滑梯、从滑梯滑下等同一活动的连续阶段合并成一句或一个紧凑事件，不能拆成重复叙述。",
+          "按时间和事件顺序组织：发生了什么、过程或结果、最后感受；感受不得放在对应事情之前。",
+          "离开某地点、回家、吃晚饭或睡觉等收尾事件出现后，之前地点的活动绝不能再放到文章末尾。遗漏事实必须合并回它原本发生的位置。",
+          "忽略并禁止写入记不清、不确定、可能、猜测的内容。",
+          "保持儿童口吻，不写编辑说明，不添加原话没有的信息。"
+        ],
+        facts,
+        missing_facts: missingFacts,
+        current_draft: draft,
+        original_utterances: input.utterances || []
+      })
+    }
+  ];
+  return callQwenJson(messages, fallback);
+}
+
+async function polishCompositionWithQwen(input, draft, facts) {
+  const fallback = draft;
+  const messages = [
+    {
+      role: "system",
+      content: "你是小学低年级句子表达校对老师。只调整已有事实的句子结构、先后顺序和衔接，不新增任何事实。让孩子能从成文中学习完整的主谓宾句子，同时保留孩子自己的形容和口吻。只返回 JSON。"
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        schema: { title: "短标题", sentences: [{ text: "完整句子", factTexts: ["实际使用的事实 text"] }] },
+        rules: [
+          "每个独立句子都要有明确主语和谓语，需要宾语的动作必须有宾语。地点或时间可以放句首，但后面仍必须出现主语，例如‘在公园里，我遇到了哥哥’。",
+          "同一主语的连续动作可以在一句中共享一次主语；换了人物或另起一句时必须重新写出主语，不能出现无主句和零散短语。",
+          "严格按孩子口述的时间顺序。公园活动全部放在离开公园或回家之前；回家、吃晚饭、洗澡、睡觉等收尾事件之后不能再出现白天或公园活动。",
+          "每个事实只表达一次。已经合并进句子的滑滑梯、荡秋千、比赛等活动不得在末尾再次补写。",
+          "保留孩子说过的形容词和有特点的表达，不添加天气、心情、评价、因果或华丽词语。",
+          "把重复口头禅改成自然衔接，全文‘然后’最多一次，可以按真实先后使用‘……之后、接着、后来、最后’。",
+          "factTexts 必须使用 facts 中的原始 text，列出该句覆盖的全部事实；不得只列一部分而导致系统误判遗漏。"
+        ],
+        facts,
+        current_draft: draft,
+        original_utterances: input.utterances || []
+      })
+    }
+  ];
+  return callQwenJson(messages, fallback);
+}
+
+async function composeWithQwen(input) {
+  const facts = dedupeSemanticFacts((input.facts || [])
+    .filter(fact => ["what", "detail", "result", "feeling"].includes(fact.slot))
+    .filter(isUsableDiaryFact));
+  const fallback = {
+    title: facts.find(f => f.slot === "what")?.text || "我的日记",
+    sentences: facts
+      .map((f, index) => ({ text: index === 0 ? `今天${f.text}。` : `${f.text}。`, factTexts: [f.text] }))
+  };
+  const messages = [
+    {
+      role: "system",
+      content: "你是帮助5-9岁儿童学习完整表达的口述日记整理老师。必须事实约束生成：不得添加孩子没说过的人物、地点、时间、天气、颜色、数量、动作、因果、评价或情绪。你可以调整语序、合并重复片段、补充必要的语法成分和连接词，让每句话完整、自然，前后有清楚的事件顺序，同时尽量保留孩子原本的词语和口吻。只返回 JSON。"
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        task: "参考孩子完整口述，把事实池整理成句子完整、顺序清楚、适合5-9岁孩子学习表达的短日记。",
+        schema: {
+          title: "短标题",
+          sentences: [{ text: "一句日记", factTexts: ["这句话使用到的事实 text"] }]
+        },
+        rules: [
+          "每一句只能表达 facts 中已有的事实，factTexts 必须逐项列出该句实际使用的事实 text。",
+          "可以调整语序、主语和谓语位置，合并相邻事实，去掉口头重复和无意义语气词。",
+          "每个独立句子必须符合小学低年级可学习的完整表达：有明确主语和谓语，需要宾语时写清宾语。地点或时间放句首后仍要写主语，例如‘在公园里，我遇到了哥哥’，不能写成‘在公园遇到了哥哥’。",
+          "保留孩子自己说过的有特点的词、形容和语气，但不要逐句照抄口头禅。孩子反复说‘然后’时，按真实先后关系自然改成‘……之后、接着、后来、最后’或直接分句；全文‘然后’最多出现一次。",
+          "连接词只用于孩子已经明确表达的时间先后，不得为了文采新增因果、感受或场景。语言要比口述完整，但仍像孩子自己的日记，不使用成人化华丽词语。",
+          "按真实时间顺序写：先写事件，再写过程和结果，最后写与该事件对应的感受；不能把感受放到事情发生之前。",
+          "离开公园、回家、吃晚饭、洗澡或睡觉属于收尾节点；这些节点之后禁止再出现此前的公园或白天活动。",
+          "同一个活动只叙述一次。连续动作属于同一事件时要合并，例如‘一起爬上滑梯’和‘再一起滑下来’应组成一个完整事件，不能拆成两次滑滑梯。",
+          "严禁为了衔接而重复同一动作，不能写出‘吃完之后就只吃完’这类前后同义、缺少新信息的病句。",
+          "可以使用‘今天、然后、后来、但是、所以’等连接词，但不能用连接词暗示孩子没有说过的因果。",
+          "不要逐条照抄事实；要把零散短语组织成主谓完整、前后连贯的句子。",
+          "人物、地点、物品和属性必须保持原绑定关系，禁止把‘公园里人多’改写成‘滑滑梯上人多’之类主体转移。",
+          "同一主体的事实直接冲突时，只有原口述明确出现纠正关系才能采用较后的纠正；否则省略不确定冲突，不要自行判断。",
+          "正文禁止出现‘与之前矛盾、保留原话、事实冲突’等编辑说明或括号注释。",
+          "孩子说记不清、不知道、不确定、可能、猜测的内容不属于事实，禁止写入正文，也不能把猜测改成确定描述。",
+          "保持儿童口吻，不使用成人作文腔，不扩写、不编细节。",
+          "如果没有 feeling，不要写心情。"
+        ],
+        facts,
+        original_utterances: input.utterances || []
+      })
+    }
+  ];
+  let result = await callQwenJson(messages, fallback);
+  if (!Array.isArray(result.sentences)) result.sentences = [];
+  result.sentences = dedupeCompositionSentences(result.sentences);
+  if (compositionPenalty(result) > 0) {
+    const polished = await polishCompositionWithQwen(input, result, facts);
+    if (Array.isArray(polished.sentences)) polished.sentences = dedupeCompositionSentences(polished.sentences);
+    if (compositionPenalty(polished) < compositionPenalty(result)) result = polished;
+  }
+  let usedFactTexts = new Set(
+    result.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : [])
+  );
+  let missingFacts = facts.filter(fact => !factIsCovered(fact, usedFactTexts, result.sentences));
+  if (missingFacts.length) {
+    result = await repairCompositionWithQwen(input, result, facts, missingFacts);
+    if (!Array.isArray(result.sentences)) result.sentences = [];
+    result.sentences = dedupeCompositionSentences(result.sentences);
+    usedFactTexts = new Set(
+      result.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : [])
+    );
+    missingFacts = facts.filter(fact => !factIsCovered(fact, usedFactTexts, result.sentences));
+  }
+  // 不再把模型认为遗漏的事实机械追加到文章末尾。机械追加会破坏时间顺序，
+  // 也会把已经合并表达过的活动再次写一遍；遗漏只允许通过上面的整体重排修复。
+  result.sentences = dedupeCompositionSentences(result.sentences);
+  return result;
+}
+
+function quoteAppearsInTranscript(quote, transcript) {
+  const source = normalizeSemanticText(transcript);
+  const fragment = normalizeSemanticText(quote);
+  return fragment.length >= 2 && source.includes(fragment);
+}
+
+async function finalizeWithQwen(input) {
+  const existingFacts = dedupeSemanticFacts((input.facts || [])
+    .filter(fact => ["what", "detail", "result", "feeling"].includes(fact.slot))
+    .filter(isUsableDiaryFact));
+  const transcript = String(input.transcript || "");
+  const fallback = { facts: [], title: "我的日记", sentences: [] };
+  const messages = [
+    {
+      role: "system",
+      content: "你是5-9岁儿童口述日记的最终整理器。一次完成遗漏事实审计和成文。所有内容必须来自孩子原话，不得新增人物、动作、原因、感受或细节。只返回 JSON。"
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        task: "先找出 known_facts 遗漏的清晰事实，再用全部事实写出第一版锁定日记。",
+        schema: {
+          facts: [{ slot: "what|detail|feeling|result", label: "简短标签", text: "遗漏事实", quote: "孩子原话片段" }],
+          title: "短标题",
+          sentences: [{ text: "完整句子", factTexts: ["本句使用的完整事实 text"] }]
+        },
+        rules: [
+          "facts 只返回 known_facts 没有覆盖的事实，quote 必须是 full_transcript 里真实出现的片段。",
+          "逐段扫描全部口述，人物、地点、活动、先后变化、结果和感受都不能丢；乱说、猜测和否定纠错不能当成新事实。",
+          "正文覆盖 known_facts 和新增 facts 的全部有效事实，每个事实只表达一次。",
+          "每个独立句子要有明确主语和谓语，按真实时间顺序组织，感受放在对应事件之后。",
+          "同一活动的连续动作合并表达，禁止同义重复和‘吃完之后就只吃完’这类病句。",
+          "保留孩子自己的形容和口吻，但去掉口头重复；全文‘然后’最多一次。",
+          "factTexts 必须使用 known_facts 或返回 facts 中完整的 text，不能自创事实名称。"
+        ],
+        full_transcript: transcript,
+        known_facts: existingFacts,
+        previous_questions: input.previousQuestions || []
+      })
+    }
+  ];
+  let result = await callQwenJson(messages, fallback);
+  const candidates = Array.isArray(result.facts) ? result.facts : [];
+  const newFacts = dedupeSemanticFacts(candidates
+    .filter(isUsableDiaryFact)
+    .filter(fact => quoteAppearsInTranscript(fact.quote, transcript))
+    .filter(fact => !existingFacts.some(existing => semanticSimilarity(existing.text, fact.text) >= 0.72)));
+  const allFacts = dedupeSemanticFacts([...existingFacts, ...newFacts]);
+  result.sentences = dedupeCompositionSentences(Array.isArray(result.sentences) ? result.sentences : []);
+  const usedFactTexts = new Set(result.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []));
+  const missingFacts = allFacts.filter(fact => !factIsCovered(fact, usedFactTexts, result.sentences));
+  if (compositionPenalty(result) > 0 || missingFacts.length) {
+    result = await composeWithQwen({ facts: allFacts, utterances: [transcript] });
+  }
+  return { facts: newFacts, title: result.title || "我的日记", sentences: result.sentences || [] };
+}
+
+async function reviseWithQwen(input) {
+  const fallback = {
+    operations: [],
+    message: "暂时无法理解这次修改，请再说清楚原来哪里不对、想改成什么。"
+  };
+  const messages = [
+    {
+      role: "system",
+      content: "你是儿童口述日记的事实修改模块。把孩子的语音修改指令转换为可验证的事实操作。只能修改明确对应的事实，不得猜测、不得改动未提及事实。只返回 JSON。"
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        task: "根据 instruction 对 facts 生成替换、删除或补充操作。",
+        schema: {
+          operations: [{
+            type: "replace|delete|add",
+            target_fact_id: "replace/delete 必须填写现有事实 id；add 为空",
+            slot: "what|detail|feeling|result",
+            label: "简短中文标签",
+            new_text: "replace/add 后的完整事实；delete 为空",
+            reason: "为什么执行此操作"
+          }],
+          message: "没有安全可执行操作时，告诉孩子怎样说得更清楚"
+        },
+        rules: [
+          "‘不是A，是B’通常是 replace，只修改包含A且语义对应的事实。",
+          "‘我没有说A/删掉A’通常是 delete，只删除明确对应的事实。",
+          "‘还要加上A/我还想说A’通常是 add，A必须是孩子明确说出的事实。",
+          "如果现有事实是否定或误识别句，而 instruction 给出了同一事件的正确肯定说法，必须 replace 这条错误事实，不能只 add 正确说法后同时保留错误说法。例如现有‘没有读绘本’，孩子改为‘睡醒后开始读绘本’，应替换原事实。",
+          "如果同一个错误事实在 facts 中有多个近似版本，返回对应的 delete 操作一并清除重复项，只保留一条修改后的正确事实。",
+          "replace/delete 的 target_fact_id 必须来自 facts，禁止编造 id。",
+          "不能确定目标事实时 operations 返回空数组，不得凭相似词强行修改。",
+          "不要把指令措辞写进日记事实，只保留修改后的事实内容。"
+        ],
+        instruction: input.instruction || "",
+        facts: input.facts || [],
+        diary: input.diary || []
+      })
+    }
+  ];
+  return callQwenJson(messages, fallback);
+}
+
+function hasNegation(text) {
+  return /(没有|没能|没去|没做|没看|没读|不是|不再|不会)/u.test(String(text || ""));
+}
+
+function sharesSpecificBigram(left, right) {
+  const ignored = new Set(["今天", "然后", "后来", "我们", "之后", "开始", "一起", "回家"]);
+  const strip = value => String(value || "").replace(/没有|没能|没去|没做|没看|没读|不是|不再|不会/gu, "");
+  const leftGrams = semanticBigrams(strip(left));
+  const rightGrams = semanticBigrams(strip(right));
+  for (const gram of leftGrams) {
+    if (!ignored.has(gram) && rightGrams.has(gram)) return true;
+  }
+  return false;
+}
+
+function normalizeRevisionOperations(input, operations) {
+  const facts = Array.isArray(input.facts) ? input.facts : [];
+  const normalized = [...operations];
+  for (let index = 0; index < normalized.length; index += 1) {
+    const operation = normalized[index];
+    if (operation?.type !== "add" || !operation.new_text || hasNegation(operation.new_text)) continue;
+    const conflicting = facts.find(fact =>
+      fact?.id && hasNegation(fact.text) && sharesSpecificBigram(fact.text, operation.new_text)
+    );
+    if (!conflicting) continue;
+    normalized[index] = {
+      ...operation,
+      type: "replace",
+      target_fact_id: conflicting.id,
+      slot: operation.slot || conflicting.slot,
+      label: operation.label || conflicting.label,
+      reason: operation.reason || "用孩子刚刚说出的正确事实替换原来的否定误识别"
+    };
+  }
+
+  const replacements = normalized.filter(operation => operation?.type === "replace");
+  for (const replacement of replacements) {
+    const target = facts.find(fact => fact.id === replacement.target_fact_id);
+    if (!target) continue;
+    for (const fact of facts) {
+      if (!fact?.id || fact.id === target.id) continue;
+      if (semanticSimilarity(fact.text, target.text) < 0.7) continue;
+      if (normalized.some(operation => operation.type === "delete" && operation.target_fact_id === fact.id)) continue;
+      normalized.push({ type: "delete", target_fact_id: fact.id, slot: fact.slot, label: fact.label, new_text: "", reason: "清除同一错误事实的重复版本" });
+    }
+  }
+  return normalized;
+}
+
+async function reviseLockedCompositionWithQwen(input) {
+  const lockedDiary = Array.isArray(input.lockedDiary) ? input.lockedDiary : [];
+  const operations = Array.isArray(input.revisionOperations) ? input.revisionOperations : [];
+  const facts = (input.facts || []).filter(fact => fact.active !== false && isUsableDiaryFact(fact));
+  const factById = new Map(facts.map(fact => [fact.id, fact]));
+  const affectedIds = new Set();
+  for (const operation of operations) {
+    if (operation.target_fact_id) affectedIds.add(operation.target_fact_id);
+    if (operation.applied_fact_id) affectedIds.add(operation.applied_fact_id);
+  }
+  const affectedSentences = lockedDiary.filter(sentence =>
+    (sentence.factIds || []).some(id => affectedIds.has(id))
+  );
+  const addedFacts = operations
+    .filter(operation => operation.type === "add" && operation.applied_fact_id)
+    .map(operation => factById.get(operation.applied_fact_id))
+    .filter(Boolean);
+  const fallback = { changes: [], additions: [] };
+  const messages = [
+    {
+      role: "system",
+      content: "你是儿童日记的局部修改器。第一版日记已锁定，只能改写包含本次受影响事实的句子，其他句子一个字也不能改。不得重新生成整篇，不得加入修改指令之外的新信息。只返回 JSON。"
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        schema: {
+          changes: [{ sentenceId: "受影响的原句 id", text: "修改后完整句子", factTexts: ["本句使用的有效事实 text"] }],
+          additions: [{ text: "新增事实组成的完整句子", factTexts: ["新增事实 text"] }]
+        },
+        rules: [
+          "changes 只能使用 affected_sentences 中的 sentenceId。",
+          "replace 要在原句位置替换错误信息；delete 只删除目标事实，保留该句里其他事实。",
+          "未受影响的句子不返回，系统会原样保留。",
+          "每个修改后句子要有主语和谓语，不重复动作，不新增事实。",
+          "factTexts 只能使用 active_facts 里完整的 text。"
+        ],
+        instruction: input.revisionInstruction || "",
+        operations,
+        affected_sentences: affectedSentences,
+        added_facts: addedFacts,
+        active_facts: facts
+      })
+    }
+  ];
+  const result = await callQwenJson(messages, fallback);
+  const changes = new Map((result.changes || []).map(change => [change.sentenceId, change]));
+  const activeFactTexts = new Set(facts.map(fact => fact.text));
+  const revised = [];
+  for (const sentence of lockedDiary) {
+    const linkedActiveFacts = (sentence.factIds || []).map(id => factById.get(id)).filter(Boolean);
+    const isAffected = (sentence.factIds || []).some(id => affectedIds.has(id));
+    if (!isAffected) {
+      revised.push(sentence);
+      continue;
+    }
+    if (!linkedActiveFacts.length) continue;
+    const change = changes.get(sentence.id);
+    const validFactTexts = (change?.factTexts || []).filter(text => activeFactTexts.has(text));
+    const fallbackText = `${linkedActiveFacts.map(fact => fact.text).join("，")}。`;
+    revised.push({
+      ...sentence,
+      text: change?.text && validFactTexts.length ? change.text : fallbackText,
+      factTexts: validFactTexts.length ? validFactTexts : linkedActiveFacts.map(fact => fact.text),
+      factIds: validFactTexts.length
+        ? facts.filter(fact => validFactTexts.includes(fact.text)).map(fact => fact.id)
+        : linkedActiveFacts.map(fact => fact.id)
+    });
+  }
+  const additions = Array.isArray(result.additions) ? result.additions : [];
+  for (const fact of addedFacts) {
+    const generated = additions.find(item => (item.factTexts || []).includes(fact.text));
+    revised.push({
+      id: `sentence_added_${Date.now()}_${revised.length}`,
+      text: generated?.text || `${fact.text}。`,
+      factTexts: generated?.factTexts?.filter(text => activeFactTexts.has(text)) || [fact.text],
+      factIds: [fact.id]
+    });
+  }
+  let title = input.lockedTitle || "我的日记";
+  for (const operation of operations) {
+    if (operation.type === "replace" && operation.old_text && operation.new_text && title.includes(operation.old_text)) {
+      title = title.replace(operation.old_text, operation.new_text);
+    }
+  }
+  return {
+    title,
+    sentences: revised
+  };
+}
+
+async function handleAsr(req, res) {
+  const body = await collectBody(req);
+  const fields = parseMultipart(body, getBoundary(req.headers["content-type"]));
+  const audio = fields.audio;
+  const kind = String(fields.kind || "initial");
+
+  if (!audio?.content?.length) {
+    sendJson(res, 400, { error: "missing_audio" });
+    return;
+  }
+
+  try {
+    if (process.env.TENCENT_SECRET_ID && process.env.TENCENT_SECRET_KEY) {
+      const tencentText = await transcribeWithTencent(audio);
+      sendJson(res, 200, { text: tencentText || "", provider: "tencent" });
+      return;
+    }
+
+    const genericText = await transcribeWithGenericProvider(audio);
+    if (genericText) {
+      sendJson(res, 200, { text: genericText, provider: "generic" });
+      return;
+    }
+
+    const openaiText = await transcribeWithOpenAI(audio);
+    if (openaiText) {
+      sendJson(res, 200, { text: openaiText, provider: "openai" });
+      return;
+    }
+  } catch (error) {
+    sendJson(res, 502, { error: "asr_failed", message: error.message });
+    return;
+  }
+
+  sendJson(res, 503, {
+    error: "asr_not_configured",
+    message: "语音识别服务未配置，本次录音不会使用模拟文字替代。"
+  });
+}
+
+async function readJson(req) {
+  const body = await collectBody(req);
+  if (!body.length) return {};
+  return JSON.parse(body.toString("utf8"));
+}
+
+async function handleAnalyze(req, res) {
+  const input = await readJson(req);
+  const result = await analyzeWithQwen(input);
+  sendJson(res, 200, { ...result, provider: qwenConfig().apiKey ? "qwen" : "local" });
+}
+
+async function handleCompose(req, res) {
+  const input = await readJson(req);
+  const result = Array.isArray(input.lockedDiary) && Array.isArray(input.revisionOperations)
+    ? await reviseLockedCompositionWithQwen(input)
+    : await composeWithQwen(input);
+  sendJson(res, 200, { ...result, provider: qwenConfig().apiKey ? "qwen" : "local" });
+}
+
+async function handleFinalize(req, res) {
+  const input = await readJson(req);
+  const result = await finalizeWithQwen(input);
+  sendJson(res, 200, { ...result, provider: qwenConfig().apiKey ? "qwen" : "local" });
+}
+
+async function handleRevise(req, res) {
+  const input = await readJson(req);
+  const result = await reviseWithQwen(input);
+  const validIds = new Set((input.facts || []).map(fact => fact.id));
+  const normalizedOperations = normalizeRevisionOperations(input, Array.isArray(result.operations) ? result.operations : []);
+  const operations = normalizedOperations.filter(operation => {
+    if (!["replace", "delete", "add"].includes(operation?.type)) return false;
+    if (operation.type === "add") return Boolean(operation.new_text && operation.slot);
+    if (!validIds.has(operation.target_fact_id)) return false;
+    return operation.type === "delete" || Boolean(operation.new_text);
+  });
+  sendJson(res, 200, {
+    operations,
+    message: result.message || "",
+    provider: qwenConfig().apiKey ? "qwen" : "local"
+  });
+}
+
+function serveStatic(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = decodeURIComponent(url.pathname === "/" ? "/tongxin-diary-mvp.html" : url.pathname);
+  const filePath = path.normalize(path.join(ROOT, pathname));
+
+  if (!filePath.startsWith(ROOT)) {
+    res.writeHead(403);
+    res.end("Forbidden");
+    return;
+  }
+
+  fs.readFile(filePath, (error, content) => {
+    if (error) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Not found");
+      return;
+    }
+    res.writeHead(200, { "Content-Type": MIME[path.extname(filePath)] || "application/octet-stream" });
+    res.end(content);
+  });
+}
+
+const server = http.createServer((req, res) => {
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type,Authorization"
+    });
+    res.end();
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/asr") {
+    handleAsr(req, res).catch(error => sendJson(res, 500, { error: error.message }));
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/analyze") {
+    handleAnalyze(req, res).catch(error => sendJson(res, 500, { error: error.message }));
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/compose") {
+    handleCompose(req, res).catch(error => sendJson(res, 500, { error: error.message }));
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/finalize") {
+    handleFinalize(req, res).catch(error => sendJson(res, 500, { error: error.message }));
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/revise") {
+    handleRevise(req, res).catch(error => sendJson(res, 500, { error: error.message }));
+    return;
+  }
+
+  if (req.method === "GET") {
+    serveStatic(req, res);
+    return;
+  }
+
+  res.writeHead(405);
+  res.end("Method not allowed");
+});
+
+server.listen(PORT, () => {
+  console.log(`童心日记原型服务已启动：http://127.0.0.1:${PORT}`);
+  if (!process.env.TENCENT_SECRET_ID && !process.env.OPENAI_API_KEY && !process.env.ASR_API_URL) {
+    console.log("未配置真实 ASR，/api/asr 会返回配置错误，不会伪造识别文本。");
+  }
+  console.log(qwenConfig().apiKey ? "已配置通义千问，/api/analyze 和 /api/compose 将调用千问。" : "未配置通义千问，将使用本地规则兜底。");
+});
