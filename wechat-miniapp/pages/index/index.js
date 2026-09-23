@@ -309,9 +309,14 @@ Page({
     this.setData({ phase: "diary", isFinishing: false, diaryTitle: data.title || "我的日记", diarySentences: sentences });
   },
 
-  readDiary() { wx.showToast({ title: "小程序 TTS 下一步接入", icon: "none" }); },
-
-  saveDiary() { this.setData({ phase: "success" }); },
+  saveDiary() {
+    wx.setStorageSync("latestDiary", {
+      title: this.data.diaryTitle,
+      sentences: this.data.diarySentences,
+      savedAt: Date.now()
+    });
+    this.setData({ phase: "success" });
+  },
 
   async startRevision() {
     this.revisionTranscript = ""; this.uploads = []; this.finalizeStarted = false;

@@ -9,19 +9,6 @@ loadEnvFile(path.join(ROOT, ".env"));
 
 const PORT = Number(process.env.PORT || 5178);
 
-const MIME = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".webp": "image/webp",
-  ".svg": "image/svg+xml; charset=utf-8",
-  ".md": "text/markdown; charset=utf-8"
-};
-
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
   const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
@@ -176,60 +163,11 @@ async function transcribeWithTencent(audio) {
   return response?.Result || "";
 }
 
-async function transcribeWithOpenAI(audio) {
-  if (!process.env.OPENAI_API_KEY) return null;
-
-  const file = new File([audio.content], audio.filename || "audio.webm", {
-    type: audio.contentType || "audio/webm"
-  });
-  const form = new FormData();
-  form.append("file", file);
-  form.append("model", process.env.OPENAI_ASR_MODEL || "gpt-4o-mini-transcribe");
-  form.append("language", process.env.ASR_LANGUAGE || "zh");
-
-  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-    },
-    body: form
-  });
-
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`OpenAI ASR failed: ${response.status} ${text.slice(0, 200)}`);
-  }
-  const data = JSON.parse(text);
-  return data.text || "";
-}
-
-async function transcribeWithGenericProvider(audio) {
-  if (!process.env.ASR_API_URL) return null;
-
-  const response = await fetch(process.env.ASR_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": audio.contentType || "application/octet-stream",
-      ...(process.env.ASR_API_KEY ? { Authorization: `Bearer ${process.env.ASR_API_KEY}` } : {})
-    },
-    body: audio.content
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`ASR_API_URL failed: ${response.status} ${text.slice(0, 200)}`);
-
-  try {
-    const data = JSON.parse(text);
-    return data.text || data.result || data.transcript || text;
-  } catch {
-    return text;
-  }
-}
-
 function qwenConfig() {
   return {
-    apiKey: process.env.QWEN_API_KEY || process.env.DASHSCOPE_API_KEY,
-    model: process.env.QWEN_MODEL || process.env.DASHSCOPE_MODEL || "qwen-plus",
-    baseUrl: (process.env.QWEN_BASE_URL || process.env.DASHSCOPE_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/$/, "")
+    apiKey: process.env.QWEN_API_KEY,
+    model: process.env.QWEN_MODEL || "qwen-plus",
+    baseUrl: (process.env.QWEN_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/$/, "")
   };
 }
 
@@ -243,9 +181,9 @@ function extractJson(text) {
   return JSON.parse(match[0]);
 }
 
-async function callQwenJson(messages, fallback) {
+async function callQwenJson(messages) {
   const config = qwenConfig();
-  if (!config.apiKey) return fallback;
+  if (!config.apiKey) throw new Error("QWEN_API_KEY is not configured");
   const response = await fetch(`${config.baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
@@ -265,49 +203,6 @@ async function callQwenJson(messages, fallback) {
   const data = JSON.parse(text);
   const content = data?.choices?.[0]?.message?.content || "";
   return extractJson(content);
-}
-
-function localAnalyze({ text, kind, existingFacts = [], followupCount = 0, maxFollowups = 2 }) {
-  const facts = [];
-  const normalized = String(text || "").replace(/\s+/g, "");
-  const sourceQuote = String(text || "").trim();
-  if (/帮.*擦桌子|擦桌子/.test(normalized)) {
-    const person = normalized.includes("奶奶") ? "奶奶" : normalized.includes("爸爸") ? "爸爸" : normalized.includes("妈妈") ? "妈妈" : "家人";
-    facts.push({ slot: "what", label: "做了什么", text: `我帮${person}擦桌子`, quote: sourceQuote });
-  }
-  if (/去.*(公园|动物园|学校|超市)|公园玩|出去玩|玩了/.test(normalized)) {
-    const place = normalized.includes("动物园") ? "动物园" : normalized.includes("公园") ? "公园" : normalized.includes("学校") ? "学校" : normalized.includes("超市") ? "超市" : "";
-    facts.push({ slot: "what", label: "做了什么", text: place ? `我去了${place}玩` : "我出去玩了", quote: sourceQuote });
-  }
-  if (/小狗|小猫|长颈鹿|兔子|看到|遇到/.test(normalized)) {
-    const animal = normalized.match(/小狗|小猫|长颈鹿|兔子/)?.[0];
-    facts.push({ slot: "detail", label: "小细节", text: animal ? `我看到了${animal}` : "我看到了有趣的东西", quote: sourceQuote });
-  }
-  if (/湿|湿湿|抹布|擦了|擦一遍/.test(normalized)) {
-    facts.push({ slot: "detail", label: "小细节", text: /抹布/.test(normalized) ? "我用抹布擦桌子" : "我的手湿湿的", quote: sourceQuote });
-  }
-  if (/夸|干净|很棒|很好/.test(normalized)) {
-    const person = normalized.includes("奶奶") ? "奶奶" : normalized.includes("爸爸") ? "爸爸" : "妈妈";
-    facts.push({ slot: "result", label: "别人反馈", text: `${person}说我擦得很干净`, quote: sourceQuote });
-  }
-  if (/开心|高兴|快乐|骄傲|难过|害怕|生气/.test(normalized)) {
-    const feeling = normalized.match(/开心|高兴|快乐|骄傲|难过|害怕|生气/)?.[0] || "开心";
-    facts.push({ slot: "feeling", label: "我的感觉", text: `我很${feeling}`, quote: sourceQuote });
-  }
-  const allSlots = new Set([...existingFacts, ...facts].map(f => f.slot));
-  let action = "suggest_finish";
-  let question = "";
-  let reason = "";
-  if (!allSlots.has("what")) {
-    action = "ask_followup"; reason = "missing_what"; question = "你刚才做了什么呀？";
-  } else if (!allSlots.has("detail") && followupCount < maxFollowups) {
-    action = "ask_followup"; reason = "missing_detail"; question = "这件事里，你最想告诉我哪个小细节呀？";
-  } else if (!allSlots.has("feeling") && followupCount < maxFollowups) {
-    action = "ask_followup"; reason = "missing_feeling"; question = "做完这件事的时候，你是什么感觉呀？";
-  } else if (!allSlots.has("result") && followupCount < maxFollowups) {
-    action = "ask_followup"; reason = "missing_result"; question = "后来发生了什么呀？";
-  }
-  return { facts: facts.length ? facts : [{ slot: "raw", label: "原话", text: sourceQuote, quote: sourceQuote }], decision: { action, reason, question } };
 }
 
 function looksLikeNoise(text) {
@@ -400,7 +295,6 @@ function removeAggregateDuplicateFacts(facts) {
 }
 
 async function refineFollowupWithQwen(input, rejectedQuestion, facts) {
-  const fallback = { action: "suggest_finish", reason: "complete", question: "" };
   const messages = [
     {
       role: "system",
@@ -418,43 +312,15 @@ async function refineFollowupWithQwen(input, rejectedQuestion, facts) {
       })
     }
   ];
-  return callQwenJson(messages, fallback);
-}
-
-async function auditFactsWithQwen(input, extractedFacts) {
-  const fallback = { facts: [] };
-  const knownFacts = [...(input.existingFacts || []), ...(extractedFacts || [])];
-  const messages = [
-    {
-      role: "system",
-      content: "你是儿童口述日记的最终事实审计模块。逐句检查完整口述，把现有事实池遗漏的清晰事实全部补出。不得提问，不得改写成作文，不得添加原话没有的信息。只返回 JSON。"
-    },
-    {
-      role: "user",
-      content: JSON.stringify({
-        task: "扫描 full_transcript，返回 known_facts 尚未覆盖的全部事实。",
-        schema: {
-          facts: [{ slot: "what|detail|feeling|result", label: "中文短标签", text: "完整事实", quote: "对应原话片段" }]
-        },
-        rules: [
-          "按原话先后逐句扫描，不能只处理最后一句。",
-          "人物关系、共同活动、地点、时间变化、第二天等后续事件、看到的事物和感受都要保留。",
-          "时间和地点必须绑定到对应事件事实中，例如写成‘第二天爸爸带我去了博物馆’，不要单独返回‘第二天’或‘博物馆’。",
-          "同一事件中‘和谁一起’不能丢失，例如共同活动必须在事实 text 中保留同行人物。",
-          "忽略随机字母、重复音节、无意义逗趣和无法组成事件的片段。",
-          "孩子明确说记不清、不知道、不确定、可能或猜测的内容不是事实，不能补入事实池。",
-          "只返回 known_facts 没有覆盖的内容，不重复已有事实。"
-        ],
-        full_transcript: input.text || "",
-        known_facts: knownFacts
-      })
-    }
-  ];
-  return callQwenJson(messages, fallback);
+  return callQwenJson(messages);
 }
 
 async function analyzeWithQwen(input) {
-  const fallback = localAnalyze(input);
+  const fallback = {
+    facts: [],
+    decision: { action: "keep_listening", reason: "model_unavailable", question: "", question_status: "none" },
+    speech_quality: "unclear"
+  };
   const messages = [
     {
       role: "system",
@@ -513,7 +379,7 @@ async function analyzeWithQwen(input) {
       })
     }
   ];
-  const result = await callQwenJson(messages, fallback);
+  const result = await callQwenJson(messages);
   const recentText = input.recentText || input.text || "";
   const quality = result.speech_quality || "coherent";
   if (["nonsense", "unsafe"].includes(quality) || looksLikeNoise(recentText)) {
@@ -530,10 +396,6 @@ async function analyzeWithQwen(input) {
   }
   const existingFacts = Array.isArray(input.existingFacts) ? input.existingFacts : [];
   let candidateFacts = Array.isArray(result.facts) ? result.facts : [];
-  if (input.realtime !== true) {
-    const audit = await auditFactsWithQwen(input, candidateFacts);
-    if (Array.isArray(audit.facts)) candidateFacts = [...candidateFacts, ...audit.facts];
-  }
   const supportedSlots = new Set(["what", "detail", "feeling", "result", "raw"]);
   const facts = dedupeSemanticFacts(removeAggregateDuplicateFacts(candidateFacts
     .filter(fact => fact && fact.slot && fact.text)
@@ -704,7 +566,6 @@ function compositionPenalty(draft) {
 }
 
 async function repairCompositionWithQwen(input, draft, facts, missingFacts) {
-  const fallback = draft;
   const messages = [
     {
       role: "system",
@@ -730,11 +591,10 @@ async function repairCompositionWithQwen(input, draft, facts, missingFacts) {
       })
     }
   ];
-  return callQwenJson(messages, fallback);
+  return callQwenJson(messages);
 }
 
 async function polishCompositionWithQwen(input, draft, facts) {
-  const fallback = draft;
   const messages = [
     {
       role: "system",
@@ -759,18 +619,13 @@ async function polishCompositionWithQwen(input, draft, facts) {
       })
     }
   ];
-  return callQwenJson(messages, fallback);
+  return callQwenJson(messages);
 }
 
 async function composeWithQwen(input) {
   const facts = dedupeSemanticFacts((input.facts || [])
     .filter(fact => ["what", "detail", "result", "feeling"].includes(fact.slot))
     .filter(isUsableDiaryFact));
-  const fallback = {
-    title: facts.find(f => f.slot === "what")?.text || "我的日记",
-    sentences: facts
-      .map((f, index) => ({ text: index === 0 ? `今天${f.text}。` : `${f.text}。`, factTexts: [f.text] }))
-  };
   const messages = [
     {
       role: "system",
@@ -808,7 +663,7 @@ async function composeWithQwen(input) {
       })
     }
   ];
-  let result = await callQwenJson(messages, fallback);
+  let result = await callQwenJson(messages);
   if (!Array.isArray(result.sentences)) result.sentences = [];
   result.sentences = dedupeCompositionSentences(result.sentences);
   if (compositionPenalty(result) > 0) {
@@ -846,7 +701,6 @@ async function finalizeWithQwen(input) {
     .filter(fact => ["what", "detail", "result", "feeling"].includes(fact.slot))
     .filter(isUsableDiaryFact));
   const transcript = String(input.transcript || "");
-  const fallback = { facts: [], title: "我的日记", sentences: [] };
   const messages = [
     {
       role: "system",
@@ -876,7 +730,7 @@ async function finalizeWithQwen(input) {
       })
     }
   ];
-  let result = await callQwenJson(messages, fallback);
+  let result = await callQwenJson(messages);
   const candidates = Array.isArray(result.facts) ? result.facts : [];
   const newFacts = dedupeSemanticFacts(candidates
     .filter(isUsableDiaryFact)
@@ -893,10 +747,6 @@ async function finalizeWithQwen(input) {
 }
 
 async function reviseWithQwen(input) {
-  const fallback = {
-    operations: [],
-    message: "暂时无法理解这次修改，请再说清楚原来哪里不对、想改成什么。"
-  };
   const messages = [
     {
       role: "system",
@@ -933,7 +783,7 @@ async function reviseWithQwen(input) {
       })
     }
   ];
-  return callQwenJson(messages, fallback);
+  return callQwenJson(messages);
 }
 
 function hasNegation(text) {
@@ -1002,7 +852,6 @@ async function reviseLockedCompositionWithQwen(input) {
     .filter(operation => operation.type === "add" && operation.applied_fact_id)
     .map(operation => factById.get(operation.applied_fact_id))
     .filter(Boolean);
-  const fallback = { changes: [], additions: [] };
   const messages = [
     {
       role: "system",
@@ -1030,7 +879,7 @@ async function reviseLockedCompositionWithQwen(input) {
       })
     }
   ];
-  const result = await callQwenJson(messages, fallback);
+  const result = await callQwenJson(messages);
   const changes = new Map((result.changes || []).map(change => [change.sentenceId, change]));
   const activeFactTexts = new Set(facts.map(fact => fact.text));
   const revised = [];
@@ -1080,7 +929,6 @@ async function handleAsr(req, res) {
   const body = await collectBody(req);
   const fields = parseMultipart(body, getBoundary(req.headers["content-type"]));
   const audio = fields.audio;
-  const kind = String(fields.kind || "initial");
 
   if (!audio?.content?.length) {
     sendJson(res, 400, { error: "missing_audio" });
@@ -1088,32 +936,16 @@ async function handleAsr(req, res) {
   }
 
   try {
-    if (process.env.TENCENT_SECRET_ID && process.env.TENCENT_SECRET_KEY) {
-      const tencentText = await transcribeWithTencent(audio);
-      sendJson(res, 200, { text: tencentText || "", provider: "tencent" });
+    if (!process.env.TENCENT_SECRET_ID || !process.env.TENCENT_SECRET_KEY) {
+      sendJson(res, 503, { error: "asr_not_configured", message: "腾讯语音识别服务未配置。" });
       return;
     }
-
-    const genericText = await transcribeWithGenericProvider(audio);
-    if (genericText) {
-      sendJson(res, 200, { text: genericText, provider: "generic" });
-      return;
-    }
-
-    const openaiText = await transcribeWithOpenAI(audio);
-    if (openaiText) {
-      sendJson(res, 200, { text: openaiText, provider: "openai" });
-      return;
-    }
+    const text = await transcribeWithTencent(audio);
+    sendJson(res, 200, { text: text || "", provider: "tencent" });
+    return;
   } catch (error) {
     sendJson(res, 502, { error: "asr_failed", message: error.message });
-    return;
   }
-
-  sendJson(res, 503, {
-    error: "asr_not_configured",
-    message: "语音识别服务未配置，本次录音不会使用模拟文字替代。"
-  });
 }
 
 async function readJson(req) {
@@ -1160,28 +992,6 @@ async function handleRevise(req, res) {
   });
 }
 
-function serveStatic(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const pathname = decodeURIComponent(url.pathname === "/" ? "/tongxin-diary-mvp.html" : url.pathname);
-  const filePath = path.normalize(path.join(ROOT, pathname));
-
-  if (!filePath.startsWith(ROOT)) {
-    res.writeHead(403);
-    res.end("Forbidden");
-    return;
-  }
-
-  fs.readFile(filePath, (error, content) => {
-    if (error) {
-      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("Not found");
-      return;
-    }
-    res.writeHead(200, { "Content-Type": MIME[path.extname(filePath)] || "application/octet-stream" });
-    res.end(content);
-  });
-}
-
 const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
@@ -1218,8 +1028,13 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === "GET") {
-    serveStatic(req, res);
+  if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
+    sendJson(res, 200, {
+      ok: true,
+      service: "tongxin-diary-api",
+      asr: Boolean(process.env.TENCENT_SECRET_ID && process.env.TENCENT_SECRET_KEY),
+      qwen: Boolean(qwenConfig().apiKey)
+    });
     return;
   }
 
@@ -1228,9 +1043,9 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`童心日记原型服务已启动：http://127.0.0.1:${PORT}`);
-  if (!process.env.TENCENT_SECRET_ID && !process.env.OPENAI_API_KEY && !process.env.ASR_API_URL) {
-    console.log("未配置真实 ASR，/api/asr 会返回配置错误，不会伪造识别文本。");
+  console.log(`童心日记 API 已启动：http://127.0.0.1:${PORT}`);
+  if (!process.env.TENCENT_SECRET_ID || !process.env.TENCENT_SECRET_KEY) {
+    console.log("未配置腾讯 ASR，/api/asr 会返回配置错误，不会伪造识别文本。");
   }
-  console.log(qwenConfig().apiKey ? "已配置通义千问，/api/analyze 和 /api/compose 将调用千问。" : "未配置通义千问，将使用本地规则兜底。");
+  console.log(qwenConfig().apiKey ? "已配置通义千问。" : "未配置通义千问，AI 接口会明确返回错误。");
 });
