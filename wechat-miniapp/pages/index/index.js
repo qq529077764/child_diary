@@ -21,8 +21,16 @@ Page({
 
   onLoad() {
     this.recorder = wx.getRecorderManager();
+    this.recorder.onStart(() => {
+      this.segmentActive = true;
+      this.setData({
+        isRecording: true,
+        statusTitle: this.segmentKind === "revision" ? "正在听你修改" : "正在听你说",
+        statusHint: this.segmentKind === "revision" ? "请把要修改的话完整说出来。" : "看到问题后直接继续说，不用点按钮。"
+      });
+    });
     this.recorder.onStop(result => this.handleSegmentStop(result));
-    this.recorder.onError(() => this.handleRecorderError());
+    this.recorder.onError(error => this.handleRecorderError(error));
     this.resetRuntime();
   },
 
@@ -77,30 +85,70 @@ Page({
       wx.getSetting({
         success: setting => {
           if (setting.authSetting["scope.record"] === true) return resolve(true);
+          if (setting.authSetting["scope.record"] === false) {
+            this.openRecordSettings(resolve);
+            return;
+          }
           wx.authorize({
             scope: "scope.record",
             success: () => resolve(true),
-            fail: () => {
-              wx.showModal({ title: "需要麦克风", content: "请在设置中允许录音，小耳朵才能听见故事。", confirmText: "去设置", success: modal => modal.confirm && wx.openSetting() });
-              resolve(false);
-            }
+            fail: () => this.openRecordSettings(resolve)
           });
         },
-        fail: () => resolve(false)
+        fail: error => {
+          this.handleRecorderError(error);
+          resolve(false);
+        }
       });
     });
+  },
+
+  openRecordSettings(resolve) {
+    wx.showModal({
+      title: "需要麦克风",
+      content: "请允许使用麦克风，小耳朵才能听见故事。",
+      confirmText: "去设置",
+      cancelText: "暂时不要",
+      success: modal => {
+        if (!modal.confirm) {
+          this.setData({ statusTitle: "还没有打开麦克风", statusHint: "准备好后，点下面的按钮再试一次。" });
+          resolve(false);
+          return;
+        }
+        wx.openSetting({
+          success: setting => {
+            const allowed = setting.authSetting["scope.record"] === true;
+            if (!allowed) this.setData({ statusTitle: "还没有打开麦克风", statusHint: "请在设置里打开麦克风权限。" });
+            resolve(allowed);
+          },
+          fail: error => {
+            this.handleRecorderError(error);
+            resolve(false);
+          }
+        });
+      },
+      fail: error => {
+        this.handleRecorderError(error);
+        resolve(false);
+      }
+    });
+  },
+
+  retryRecording() {
+    if (this.data.isRecording || this.data.isFinishing) return;
+    this.setData({ statusTitle: "正在打开麦克风", statusHint: "请在微信提示中允许录音。" });
+    this.startRecorder(this.segmentKind || "story");
   },
 
   startSegment() {
     if (!this.keepRecording) return;
     try {
-      this.segmentActive = true;
+      this.segmentActive = false;
       this.recorder.start({ duration: SEGMENT_MS + 1000, sampleRate: 16000, numberOfChannels: 1, encodeBitRate: 48000, format: "wav" });
-      this.setData({ isRecording: true, statusTitle: this.segmentKind === "revision" ? "正在听你修改" : "正在听你说", statusHint: this.segmentKind === "revision" ? "请把要修改的话完整说出来。" : "看到问题后直接继续说，不用点按钮。" });
       clearTimeout(this.segmentTimer);
       this.segmentTimer = setTimeout(() => { if (this.keepRecording) this.recorder.stop(); }, SEGMENT_MS);
     } catch (error) {
-      this.handleRecorderError();
+      this.handleRecorderError(error);
     }
   },
 
@@ -114,10 +162,17 @@ Page({
     else if (this.data.isFinishing) Promise.all(this.uploads).then(() => this.finalizeCurrentFlow());
   },
 
-  handleRecorderError() {
+  handleRecorderError(error = {}) {
     clearTimeout(this.segmentTimer);
     this.keepRecording = false;
-    this.setData({ isRecording: false, isFinishing: false, statusTitle: "麦克风没有启动", statusHint: "请检查录音权限后再试。" });
+    this.segmentActive = false;
+    const detail = String(error.errMsg || error.message || "").replace(/^.*?:\s*/, "").trim();
+    this.setData({
+      isRecording: false,
+      isFinishing: false,
+      statusTitle: "麦克风没有启动",
+      statusHint: detail ? `请重试（${detail}）` : "请检查录音权限后再试。"
+    });
   },
 
   uploadAudio(filePath, kind) {
