@@ -549,9 +549,29 @@ function dedupeCompositionSentences(sentences) {
   return unique;
 }
 
+function normalizeRepeatedThen(sentences) {
+  let seenThen = false;
+  let replacementIndex = 0;
+  const replacements = ["接着", "后来", "接下来"];
+  return (sentences || []).map(sentence => ({
+    ...sentence,
+    text: String(sentence.text || "").replace(/然后/gu, () => {
+      if (!seenThen) {
+        seenThen = true;
+        return "然后";
+      }
+      const replacement = replacements[Math.min(replacementIndex, replacements.length - 1)];
+      replacementIndex += 1;
+      return replacement;
+    })
+  }));
+}
+
 function compositionPenalty(draft) {
   const sentences = Array.isArray(draft?.sentences) ? draft.sentences : [];
   let penalty = sentences.length ? 0 : 100;
+  const thenCount = (sentences.map(sentence => String(sentence?.text || "")).join("").match(/然后/gu) || []).length;
+  if (thenCount > 1) penalty += (thenCount - 1) * 10;
   for (const sentence of sentences) {
     const text = String(sentence?.text || "").trim();
     if (text.length < 5) penalty += 8;
@@ -606,10 +626,11 @@ async function polishCompositionWithQwen(input, draft, facts) {
         schema: { title: "短标题", sentences: [{ text: "完整句子", factTexts: ["实际使用的事实 text"] }] },
         rules: [
           "每个独立句子都要有明确主语和谓语，需要宾语的动作必须有宾语。地点或时间可以放句首，但后面仍必须出现主语，例如‘在公园里，我遇到了哥哥’。",
+          "按小学低年级句子表达组织正文：一句主要表达一件事或一个连续动作，句子过长时按事件边界断句，不能把许多事情只用逗号串成一整句。",
           "同一主语的连续动作可以在一句中共享一次主语；换了人物或另起一句时必须重新写出主语，不能出现无主句和零散短语。",
           "严格按孩子口述的时间顺序。公园活动全部放在离开公园或回家之前；回家、吃晚饭、洗澡、睡觉等收尾事件之后不能再出现白天或公园活动。",
           "每个事实只表达一次。已经合并进句子的滑滑梯、荡秋千、比赛等活动不得在末尾再次补写。",
-          "保留孩子说过的形容词和有特点的表达，不添加天气、心情、评价、因果或华丽词语。",
+          "优先原样保留孩子口述中的形容词和有特点的表达，不擅自替换成近义词；禁止新增原话没有的形容词、副词、天气、心情、评价、因果或华丽词语。",
           "把重复口头禅改成自然衔接，全文‘然后’最多一次，可以按真实先后使用‘……之后、接着、后来、最后’。",
           "factTexts 必须使用 facts 中的原始 text，列出该句覆盖的全部事实；不得只列一部分而导致系统误判遗漏。"
         ],
@@ -643,7 +664,9 @@ async function composeWithQwen(input) {
           "每一句只能表达 facts 中已有的事实，factTexts 必须逐项列出该句实际使用的事实 text。",
           "可以调整语序、主语和谓语位置，合并相邻事实，去掉口头重复和无意义语气词。",
           "每个独立句子必须符合小学低年级可学习的完整表达：有明确主语和谓语，需要宾语时写清宾语。地点或时间放句首后仍要写主语，例如‘在公园里，我遇到了哥哥’，不能写成‘在公园遇到了哥哥’。",
-          "保留孩子自己说过的有特点的词、形容和语气，但不要逐句照抄口头禅。孩子反复说‘然后’时，按真实先后关系自然改成‘……之后、接着、后来、最后’或直接分句；全文‘然后’最多出现一次。",
+          "一句主要表达一件事或一个连续动作；一个句子包含多个不同事件时，按事件边界用句号断开，不能只用逗号一直串联。连续动作仍应合并，不能为了断句重复同一活动。",
+          "优先原样保留孩子收音中使用的形容词、叠词和有特点的说法，不擅自替换成更成人化的近义词，也不新增原话没有的形容词或副词。",
+          "不要逐句照抄口头禅。孩子反复说‘然后’时，按真实先后关系自然改成‘……之后、接着、后来、最后’或直接分句；全文‘然后’最多出现一次。",
           "连接词只用于孩子已经明确表达的时间先后，不得为了文采新增因果、感受或场景。语言要比口述完整，但仍像孩子自己的日记，不使用成人化华丽词语。",
           "按真实时间顺序写：先写事件，再写过程和结果，最后写与该事件对应的感受；不能把感受放到事情发生之前。",
           "离开公园、回家、吃晚饭、洗澡或睡觉属于收尾节点；这些节点之后禁止再出现此前的公园或白天活动。",
@@ -686,7 +709,7 @@ async function composeWithQwen(input) {
   }
   // 不再把模型认为遗漏的事实机械追加到文章末尾。机械追加会破坏时间顺序，
   // 也会把已经合并表达过的活动再次写一遍；遗漏只允许通过上面的整体重排修复。
-  result.sentences = dedupeCompositionSentences(result.sentences);
+  result.sentences = normalizeRepeatedThen(dedupeCompositionSentences(result.sentences));
   return result;
 }
 
@@ -704,25 +727,20 @@ async function finalizeWithQwen(input) {
   const messages = [
     {
       role: "system",
-      content: "你是5-9岁儿童口述日记的最终整理器。一次完成遗漏事实审计和成文。所有内容必须来自孩子原话，不得新增人物、动作、原因、感受或细节。只返回 JSON。"
+      content: "你是5-9岁儿童口述日记的最终事实审计器。只负责找出实时事实池遗漏的清晰事实，不负责写文章。所有事实必须来自孩子原话，不得新增、推测或润色。只返回 JSON。"
     },
     {
       role: "user",
       content: JSON.stringify({
-        task: "先找出 known_facts 遗漏的清晰事实，再用全部事实写出第一版锁定日记。",
+        task: "逐段扫描 full_transcript，只返回 known_facts 遗漏的清晰事实。",
         schema: {
-          facts: [{ slot: "what|detail|feeling|result", label: "简短标签", text: "遗漏事实", quote: "孩子原话片段" }],
-          title: "短标题",
-          sentences: [{ text: "完整句子", factTexts: ["本句使用的完整事实 text"] }]
+          facts: [{ slot: "what|detail|feeling|result", label: "简短标签", text: "遗漏事实", quote: "孩子原话片段" }]
         },
         rules: [
           "facts 只返回 known_facts 没有覆盖的事实，quote 必须是 full_transcript 里真实出现的片段。",
           "逐段扫描全部口述，人物、地点、活动、先后变化、结果和感受都不能丢；乱说、猜测和否定纠错不能当成新事实。",
-          "正文覆盖 known_facts 和新增 facts 的全部有效事实，每个事实只表达一次。",
-          "每个独立句子要有明确主语和谓语，按真实时间顺序组织，感受放在对应事件之后。",
-          "同一活动的连续动作合并表达，禁止同义重复和‘吃完之后就只吃完’这类病句。",
-          "保留孩子自己的形容和口吻，但去掉口头重复；全文‘然后’最多一次。",
-          "factTexts 必须使用 known_facts 或返回 facts 中完整的 text，不能自创事实名称。"
+          "事实 text 保留孩子原话里的关键形容词、叠词和人物关系，不改写成作文句子。",
+          "同一事实不要重复返回；不确定、记不清和模型猜测的内容一律不返回。"
         ],
         full_transcript: transcript,
         known_facts: existingFacts,
@@ -730,20 +748,19 @@ async function finalizeWithQwen(input) {
       })
     }
   ];
-  let result = await callQwenJson(messages);
-  const candidates = Array.isArray(result.facts) ? result.facts : [];
+  const audit = await callQwenJson(messages);
+  const candidates = Array.isArray(audit.facts) ? audit.facts : [];
   const newFacts = dedupeSemanticFacts(candidates
     .filter(isUsableDiaryFact)
     .filter(fact => quoteAppearsInTranscript(fact.quote, transcript))
     .filter(fact => !existingFacts.some(existing => semanticSimilarity(existing.text, fact.text) >= 0.72)));
   const allFacts = dedupeSemanticFacts([...existingFacts, ...newFacts]);
-  result.sentences = dedupeCompositionSentences(Array.isArray(result.sentences) ? result.sentences : []);
-  const usedFactTexts = new Set(result.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []));
-  const missingFacts = allFacts.filter(fact => !factIsCovered(fact, usedFactTexts, result.sentences));
-  if (compositionPenalty(result) > 0 || missingFacts.length) {
-    result = await composeWithQwen({ facts: allFacts, utterances: [transcript] });
-  }
-  return { facts: newFacts, title: result.title || "我的日记", sentences: result.sentences || [] };
+  const result = await composeWithQwen({ facts: allFacts, utterances: [transcript] });
+  return {
+    facts: newFacts,
+    title: result.title || "我的日记",
+    sentences: normalizeRepeatedThen(result.sentences || [])
+  };
 }
 
 async function reviseWithQwen(input) {
@@ -835,19 +852,56 @@ function normalizeRevisionOperations(input, operations) {
   return normalized;
 }
 
+function sentenceMatchesRevision(sentence, operation, originalFact) {
+  if (operation.target_fact_id && (sentence.factIds || []).includes(operation.target_fact_id)) return true;
+  const candidates = [operation.old_text, originalFact?.text].filter(Boolean);
+  return candidates.some(text =>
+    String(sentence.text || "").includes(text) ||
+    (sentence.factTexts || []).some(source => semanticSimilarity(source, text) >= 0.58)
+  );
+}
+
+function deterministicRevisionText(sentence, operations, linkedFacts) {
+  let text = String(sentence.text || "");
+  let replaced = false;
+  for (const operation of operations) {
+    if (operation.type === "replace" && operation.old_text && operation.new_text && text.includes(operation.old_text)) {
+      text = text.replace(operation.old_text, operation.new_text);
+      replaced = true;
+    }
+  }
+  if (replaced) return text;
+  return linkedFacts.length ? `${linkedFacts.map(fact => fact.text).join("，")}。` : "";
+}
+
+function revisionChangeIsValid(change, operations) {
+  if (!change?.text) return false;
+  return operations.every(operation => {
+    if (operation.type !== "replace") return true;
+    const includesNew = operation.new_text && (
+      String(change.text).includes(operation.new_text) ||
+      semanticSimilarity(change.text, operation.new_text) >= 0.48
+    );
+    const keepsOld = operation.old_text && String(change.text).includes(operation.old_text);
+    return includesNew && !keepsOld;
+  });
+}
+
 async function reviseLockedCompositionWithQwen(input) {
   const lockedDiary = Array.isArray(input.lockedDiary) ? input.lockedDiary : [];
   const operations = Array.isArray(input.revisionOperations) ? input.revisionOperations : [];
   const facts = (input.facts || []).filter(fact => fact.active !== false && isUsableDiaryFact(fact));
   const factById = new Map(facts.map(fact => [fact.id, fact]));
-  const affectedIds = new Set();
+  const originalFacts = new Map();
   for (const operation of operations) {
-    if (operation.target_fact_id) affectedIds.add(operation.target_fact_id);
-    if (operation.applied_fact_id) affectedIds.add(operation.applied_fact_id);
+    if (operation.target_fact_id && operation.old_text) {
+      originalFacts.set(operation.target_fact_id, { id: operation.target_fact_id, text: operation.old_text });
+    }
   }
-  const affectedSentences = lockedDiary.filter(sentence =>
-    (sentence.factIds || []).some(id => affectedIds.has(id))
+  const operationsForSentence = sentence => operations.filter(operation =>
+    sentenceMatchesRevision(sentence, operation, originalFacts.get(operation.target_fact_id))
   );
+  const affectedSentences = lockedDiary.filter(sentence => operationsForSentence(sentence).length > 0);
   const addedFacts = operations
     .filter(operation => operation.type === "add" && operation.applied_fact_id)
     .map(operation => factById.get(operation.applied_fact_id))
@@ -879,26 +933,37 @@ async function reviseLockedCompositionWithQwen(input) {
       })
     }
   ];
-  const result = await callQwenJson(messages);
+  let result;
+  try {
+    result = await callQwenJson(messages);
+  } catch {
+    result = { changes: [], additions: [] };
+  }
   const changes = new Map((result.changes || []).map(change => [change.sentenceId, change]));
   const activeFactTexts = new Set(facts.map(fact => fact.text));
   const revised = [];
   for (const sentence of lockedDiary) {
-    const linkedActiveFacts = (sentence.factIds || []).map(id => factById.get(id)).filter(Boolean);
-    const isAffected = (sentence.factIds || []).some(id => affectedIds.has(id));
-    if (!isAffected) {
+    const sentenceOperations = operationsForSentence(sentence);
+    if (!sentenceOperations.length) {
       revised.push(sentence);
       continue;
     }
+    const linkedIds = new Set(sentence.factIds || []);
+    for (const operation of sentenceOperations) {
+      if (operation.target_fact_id) linkedIds.add(operation.target_fact_id);
+      if (operation.applied_fact_id) linkedIds.add(operation.applied_fact_id);
+    }
+    const linkedActiveFacts = [...linkedIds].map(id => factById.get(id)).filter(Boolean);
     if (!linkedActiveFacts.length) continue;
     const change = changes.get(sentence.id);
     const validFactTexts = (change?.factTexts || []).filter(text => activeFactTexts.has(text));
-    const fallbackText = `${linkedActiveFacts.map(fact => fact.text).join("，")}。`;
+    const validChange = validFactTexts.length && revisionChangeIsValid(change, sentenceOperations);
+    const fallbackText = deterministicRevisionText(sentence, sentenceOperations, linkedActiveFacts);
     revised.push({
       ...sentence,
-      text: change?.text && validFactTexts.length ? change.text : fallbackText,
-      factTexts: validFactTexts.length ? validFactTexts : linkedActiveFacts.map(fact => fact.text),
-      factIds: validFactTexts.length
+      text: validChange ? change.text : fallbackText,
+      factTexts: validChange ? validFactTexts : linkedActiveFacts.map(fact => fact.text),
+      factIds: validChange
         ? facts.filter(fact => validFactTexts.includes(fact.text)).map(fact => fact.id)
         : linkedActiveFacts.map(fact => fact.id)
     });
