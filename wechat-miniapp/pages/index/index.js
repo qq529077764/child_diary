@@ -234,6 +234,24 @@ Page({
     this.setData({ phase: "history", selectedDiary: null });
   },
 
+  restoreDiaryForRevision() {
+    const diary = this.data.selectedDiary;
+    if (!diary) return;
+    const sentences = JSON.parse(JSON.stringify(diary.sentences || []));
+    this.resetRuntime();
+    this.transcript = String(diary.transcript || "");
+    this.utterances = this.transcript ? [this.transcript] : [];
+    this.facts = JSON.parse(JSON.stringify(diary.facts || [])).map(fact => ({ ...fact, active: fact.active !== false }));
+    this.firstDiarySnapshot = { title: diary.title || "我的日记", sentences: JSON.parse(JSON.stringify(sentences)) };
+    this.setData({
+      phase: "diary",
+      selectedDiary: null,
+      diaryTitle: diary.title || "我的日记",
+      diarySentences: sentences,
+      factChips: this.facts.filter(fact => fact.active !== false)
+    });
+  },
+
   deleteDiaryRecord() {
     const diary = this.data.selectedDiary;
     if (!diary) return;
