@@ -214,12 +214,32 @@ function looksLikeNoise(text) {
   return !hasStorySignal && (latinNoise || repeatedNoise);
 }
 
+function looksLikeNarrationControl(text) {
+  const value = String(text || "").replace(/[\s，。！？、,.!?]/g, "");
+  if (!value) return false;
+  return /(然后呢|还有呢|接着说|继续说|你说呀|你自己说|你先说|直接说你的)/u.test(value) ||
+    /(还有|有没有).{0,8}(什么|事情|内容).{0,8}(没说|要说|忘了说)/u.test(value) ||
+    /(事情|故事).{0,6}(说完|讲完|完了)/u.test(value) ||
+    /为什么.{0,8}(提醒|不说|还不说)/u.test(value);
+}
+
+function hasConcreteStorySignal(text) {
+  return /(去了|来到|参观|看到|遇到|吃了|喝了|玩了|做了|帮助|买了|坐了|爬了|滑了|跑了|走了|学了|读了|画了|搭了|回家|上学|放学|睡觉|洗澡|比赛)/u.test(String(text || ""));
+}
+
+function isLikelyNarrationControlFact(fact, recentText) {
+  if (!looksLikeNarrationControl(recentText)) return false;
+  const combined = `${fact?.text || ""}${fact?.quote || ""}`;
+  return !hasConcreteStorySignal(combined);
+}
+
 function isUsableDiaryFact(fact) {
   if (!fact || !fact.text) return false;
   const text = String(fact.text).trim();
   const quote = String(fact.quote || "").trim();
   if (!text) return false;
   if (looksLikeNoise(text)) return false;
+  if (looksLikeNarrationControl(text) || looksLikeNarrationControl(quote)) return false;
   if (/^(我)?(说|讲)完(了|啦)?$|^结束(了)?$/u.test(text.replace(/[，。！!\s]/g, ""))) return false;
   const isIntro = /^(你好|大家好|早上好|晚上好|我叫)/u.test(text);
   const introContainsEvent = /(今天|昨天|明天|去了|来到|看到|遇到|一起|玩了|做了|帮助|上学|放学|回家)/u.test(text);
@@ -324,14 +344,14 @@ async function analyzeWithQwen(input) {
   const messages = [
     {
       role: "system",
-      content: "你是儿童口述日记产品的事实抽取和追问老师。只能基于孩子原话抽取事实，不能添加孩子没说过的事实。追问必须由本次口述动态生成，紧贴孩子刚刚说到的具体人物、物品、动作、关系或事件，帮助孩子补清特征、原因、过程、结果或感受，禁止关键词匹配式预设问题和与当前内容无关的固定模板。只返回 JSON。"
+      content: "你是儿童口述日记产品的事实抽取和追问老师。麦克风可能同时收到孩子叙事、家长引导、旁人对话或电视声。只能抽取孩子自己在讲述主线故事的内容，家长如何提醒说话、旁人如何指挥、媒体台词和与主线无可解释关系的语句都不是日记事实。不能添加孩子没说过的事实。追问必须由本次口述动态生成，紧贴有效的孩子叙事。只返回 JSON。"
     },
     {
       role: "user",
       content: JSON.stringify({
         task: "从本轮孩子口述中抽取事实，并结合已有事实判断下一步是否追问。",
         schema: {
-          facts: [{ slot: "what|detail|feeling|result|raw", label: "中文短标签", text: "事实文本", quote: "孩子原话片段" }],
+          facts: [{ slot: "what|detail|feeling|result|raw", label: "中文短标签", text: "事实文本", quote: "孩子原话片段", source_role: "child_story|adult_guidance|background_audio|meta_speech|uncertain", story_relation: "main|related|new_explicit_event|unrelated" }],
           decision: {
             action: "ask_followup|suggest_finish|redirect",
             reason: "missing_what|missing_detail|missing_feeling|missing_result|complete",
@@ -339,11 +359,16 @@ async function analyzeWithQwen(input) {
             target_key: "本次问题针对的事实或事件简称，例如：玩滑滑梯",
             question_status: "answered|invalidated|skipped|pending|none"
           },
-          speech_quality: "coherent|unclear|nonsense|unsafe"
+          speech_quality: "coherent|unclear|nonsense|unsafe",
+          segment_role: "child_story|adult_guidance|background_audio|meta_speech|mixed|unclear"
         },
         rules: [
-          "facts 只能来自 current_text。",
-          "必须抽取 current_text 中 existing_facts 尚未覆盖的所有清晰事实，不得只挑前一两个；人物、活动、地点变化和后续事件都要保留。",
+          "以 recent_text 作为本轮新收音，current_text 只用于理解上下文和故事主线。facts 的 quote 必须能在 recent_text 中找到。",
+          "先判断 segment_role。家长或旁人在提示‘然后呢’‘还有什么没说’‘你自己说’、纠正说话方式、讨论是否说完时，属于 adult_guidance 或 meta_speech，facts 返回空数组。",
+          "由于 ASR 没有说话人分离，出现‘我’不代表一定是孩子。‘我邀请某人一起说’‘我提醒他自己说’‘为什么还不说’等讨论讲述过程本身的语句仍是 meta_speech，不是故事事件。",
+          "电视、广播、短视频或旁人对话中突然出现的台词、口号、誓词、广告语，与已知人物、地点、时间或活动没有清楚关系时，属于 background_audio，facts 返回空数组。",
+          "只接收 source_role=child_story 且 story_relation 为 main、related 或 new_explicit_event 的事实。无法确定说话人或与主线关系时标为 uncertain，不要当成事实。",
+          "必须抽取 recent_text 中 existing_facts 尚未覆盖的所有清晰且相关的孩子叙事；人物、活动、地点变化和后续事件都要保留。",
           "如果 current_text 无法抽取结构化事实，返回 raw。",
           "把孩子明确做过或经历过的主要事件归为 what，把对象特征、过程、见闻等补充信息归为 detail。",
           "已有事实不要重复抽取。",
@@ -359,7 +384,7 @@ async function analyzeWithQwen(input) {
           "previous_question_keys 是已经引导过的事实或事件。同一个 target_key 整个讲述过程最多问一次，不得再追问该事实的另一个细节。",
           "只要孩子又讲出了不同的事实或新事件，且该事实还有高价值缺口，就可以继续生成新问题，直到孩子主动结束。不要因为已经问过几个问题或已达到最低成文条件就停止。",
           "先判断 recent_text 的质量。随机字母、重复音节、无意义逗趣、脏话起哄或无法组成事件的乱说标为 nonsense/unsafe：facts 返回空数组，action 返回 redirect，只温和邀请孩子回到真实故事，绝不追问乱说内容里的词。",
-          "如果 current_text 同时含有真实故事和乱说片段，只忽略乱说片段，继续抽取真实故事事实。",
+          "如果 recent_text 同时含有孩子故事和家长引导或背景声，segment_role 返回 mixed，但 facts 只保留孩子叙事部分。",
           "姓名、自我介绍、某个字怎么写以及语音识别纠错本身不是日记主体，不要围绕这些内容追问；纠错后回到孩子讲述的主要事件。",
           "孩子说记不清、不知道、不确定、可能或猜测的描述不能抽成确定事实，也不要继续追问这项琐碎信息。",
           "追问价值优先级：事件原因或结果 > 关键过程 > 孩子感受 > 有助识别对象的特征。除非不问就无法确认对象，否则禁止把颜色、大小、形状当作追问。",
@@ -382,6 +407,15 @@ async function analyzeWithQwen(input) {
   const result = await callQwenJson(messages);
   const recentText = input.recentText || input.text || "";
   const quality = result.speech_quality || "coherent";
+  const segmentRole = result.segment_role || "child_story";
+  if (["adult_guidance", "background_audio", "meta_speech"].includes(segmentRole)) {
+    return {
+      facts: [],
+      decision: { action: "keep_listening", reason: "non_story_audio", question: "", question_status: input.currentQuestion ? "pending" : "none" },
+      speech_quality: quality,
+      segment_role: segmentRole
+    };
+  }
   if (["nonsense", "unsafe"].includes(quality) || looksLikeNoise(recentText)) {
     return {
       facts: [],
@@ -399,6 +433,9 @@ async function analyzeWithQwen(input) {
   const supportedSlots = new Set(["what", "detail", "feeling", "result", "raw"]);
   const facts = dedupeSemanticFacts(removeAggregateDuplicateFacts(candidateFacts
     .filter(fact => fact && fact.slot && fact.text)
+    .filter(fact => !fact.source_role || fact.source_role === "child_story")
+    .filter(fact => !fact.story_relation || ["main", "related", "new_explicit_event"].includes(fact.story_relation))
+    .filter(fact => !isLikelyNarrationControlFact(fact, recentText))
     .map(fact => supportedSlots.has(fact.slot) ? fact : { ...fact, slot: "detail" })
     .filter(isUsableDiaryFact)
     .filter(fact => !existingFacts.some(existing =>
@@ -503,7 +540,7 @@ async function analyzeWithQwen(input) {
       };
     }
   }
-  return { facts, decision, speech_quality: quality };
+  return { facts, decision, speech_quality: quality, segment_role: segmentRole };
 }
 
 function factIsCovered(fact, usedFactTexts, sentences = []) {
@@ -727,20 +764,28 @@ async function finalizeWithQwen(input) {
   const messages = [
     {
       role: "system",
-      content: "你是5-9岁儿童口述日记的最终事实审计器。只负责找出实时事实池遗漏的清晰事实，不负责写文章。所有事实必须来自孩子原话，不得新增、推测或润色。只返回 JSON。"
+      content: "你是5-9岁儿童口述日记的最终事实审计器。麦克风里可能同时有孩子叙事、家长引导、旁人对话和电视声。先确定孩子持续讲述的主线事件，再审核已有事实和遗漏内容。只保留孩子在讲主线故事或明确相关后续事件的内容，不负责写文章。所有事实必须来自原始口述，不得新增、推测或润色。只返回 JSON。"
     },
     {
       role: "user",
       content: JSON.stringify({
-        task: "逐段扫描 full_transcript，只返回 known_facts 遗漏的清晰事实。",
+        task: "先识别主线故事并过滤串音，再逐段扫描 full_transcript，审核 known_facts 并补充遗漏事实。",
         schema: {
-          facts: [{ slot: "what|detail|feeling|result", label: "简短标签", text: "遗漏事实", quote: "孩子原话片段" }]
+          main_story: { summary: "主线事件简述", anchors: ["主线人物、地点、时间或活动词"] },
+          accepted_existing_fact_ids: ["应保留的 known_facts id"],
+          excluded_existing_facts: [{ id: "应排除的 known_facts id", reason: "adult_guidance|background_audio|meta_speech|unrelated|uncertain" }],
+          facts: [{ slot: "what|detail|feeling|result", label: "简短标签", text: "遗漏事实", quote: "孩子原话片段", source_role: "child_story", story_relation: "main|related|new_explicit_event" }]
         },
         rules: [
-          "facts 只返回 known_facts 没有覆盖的事实，quote 必须是 full_transcript 里真实出现的片段。",
-          "逐段扫描全部口述，人物、地点、活动、先后变化、结果和感受都不能丢；乱说、猜测和否定纠错不能当成新事实。",
+          "主线是孩子连续、重复或具有时间与人物关系的亲历事件。同一次出行中的多个活动、同行人、饮食、见闻和感受都可以属于主线，不能因为有多个活动就删掉。",
+          "家长或旁人在提示下一句、追问还有什么没说、要求孩子自己说、讨论是否说完或纠正说话方式，都是 adult_guidance 或 meta_speech，必须排除。",
+          "突然出现的广告语、台词、誓词、口号或成人化长句，如果与主线的人物、地点、时间和活动无清楚关系，视为 background_audio 并排除。不能因为它语法通顺就保留。",
+          "与主线语义距离很大且没有明确过渡的单句按 unrelated 排除。孩子明确使用‘后来’‘回家后’‘第二天’等引入的新事件可标为 new_explicit_event 保留。",
+          "accepted_existing_fact_ids 只能使用 known_facts 中真实存在的 id。每个 known_fact 必须在 accepted 或 excluded 中二选一，不能遗漏。",
+          "facts 只返回 known_facts 没有覆盖、确定来自孩子叙事且与主线相关的事实，quote 必须是 full_transcript 里真实出现的片段。",
+          "逐段扫描全部口述，主线中的人物、地点、活动、先后变化、结果和感受都不能丢；引导话、背景声、乱说、猜测和否定纠错不能当成新事实。",
           "事实 text 保留孩子原话里的关键形容词、叠词和人物关系，不改写成作文句子。",
-          "同一事实不要重复返回；不确定、记不清和模型猜测的内容一律不返回。"
+          "同一事实不要重复返回；无法确定是孩子叙事还是旁人串音时，宁可标为 uncertain 排除，不得写入日记。"
         ],
         full_transcript: transcript,
         known_facts: existingFacts,
@@ -749,15 +794,28 @@ async function finalizeWithQwen(input) {
     }
   ];
   const audit = await callQwenJson(messages);
+  const knownIds = new Set(existingFacts.map(fact => fact.id).filter(Boolean));
+  const acceptedIds = Array.isArray(audit.accepted_existing_fact_ids)
+    ? new Set(audit.accepted_existing_fact_ids.filter(id => knownIds.has(id)))
+    : new Set(existingFacts.map(fact => fact.id).filter(Boolean));
+  const acceptedExistingFacts = existingFacts.filter(fact => !fact.id || acceptedIds.has(fact.id));
+  const excludedFactIds = existingFacts
+    .filter(fact => fact.id && !acceptedIds.has(fact.id))
+    .map(fact => fact.id);
   const candidates = Array.isArray(audit.facts) ? audit.facts : [];
   const newFacts = dedupeSemanticFacts(candidates
+    .filter(fact => !fact.source_role || fact.source_role === "child_story")
+    .filter(fact => !fact.story_relation || ["main", "related", "new_explicit_event"].includes(fact.story_relation))
     .filter(isUsableDiaryFact)
     .filter(fact => quoteAppearsInTranscript(fact.quote, transcript))
-    .filter(fact => !existingFacts.some(existing => semanticSimilarity(existing.text, fact.text) >= 0.72)));
-  const allFacts = dedupeSemanticFacts([...existingFacts, ...newFacts]);
+    .filter(fact => !acceptedExistingFacts.some(existing => semanticSimilarity(existing.text, fact.text) >= 0.72)));
+  const allFacts = dedupeSemanticFacts([...acceptedExistingFacts, ...newFacts]);
   const result = await composeWithQwen({ facts: allFacts, utterances: [transcript] });
   return {
     facts: newFacts,
+    acceptedFactIds: [...acceptedIds],
+    excludedFactIds,
+    mainStory: audit.main_story || null,
     title: result.title || "我的日记",
     sentences: normalizeRepeatedThen(result.sentences || [])
   };

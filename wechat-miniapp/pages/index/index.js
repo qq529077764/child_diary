@@ -401,6 +401,13 @@ Page({
         facts: this.facts.filter(fact => fact.active !== false),
         previousQuestions: this.questions
       });
+      if (Array.isArray(data.acceptedFactIds)) {
+        const acceptedIds = new Set(data.acceptedFactIds);
+        this.facts.forEach(fact => {
+          if (fact.id && !acceptedIds.has(fact.id)) fact.active = false;
+        });
+        this.setData({ factChips: this.facts.filter(fact => fact.active !== false) });
+      }
       this.mergeFacts(data.facts || []);
       this.applyDiaryResponse(data, true);
     } catch (error) {
