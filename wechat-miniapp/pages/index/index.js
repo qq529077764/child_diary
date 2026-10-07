@@ -154,7 +154,7 @@ Page({
       success: response => response.statusCode >= 200 && response.statusCode < 300
         ? resolve(response.data)
         : (() => {
-          const error = new Error(response.data?.message || `请求失败 ${response.statusCode}`);
+          const error = new Error(response.data?.message || response.data?.error || `请求失败 ${response.statusCode}`);
           error.statusCode = response.statusCode;
           reject(error);
         })(),
@@ -539,7 +539,7 @@ Page({
       this.applyDiaryResponse(data, true);
     } catch (error) {
       this.finalizeStarted = false;
-      this.setData({ isFinishing: false, statusTitle: "整理暂时失败", statusHint: "请检查手机和电脑的网络连接。" });
+      this.setData({ isFinishing: false, statusTitle: "整理暂时失败", statusHint: error.message || "请稍后再试。" });
     }
   },
 

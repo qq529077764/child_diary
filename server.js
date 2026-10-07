@@ -324,25 +324,40 @@ function extractJson(text) {
 async function callQwenJson(messages) {
   const config = qwenConfig();
   if (!config.apiKey) throw new Error("QWEN_API_KEY is not configured");
-  const response = await fetch(`${config.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey}`
-    },
-    body: JSON.stringify({
-      model: config.model,
-      messages,
-      temperature: 0.1,
-      max_tokens: 1200,
-      response_format: { type: "json_object" }
-    })
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`Qwen failed: ${response.status} ${text.slice(0, 200)}`);
-  const data = JSON.parse(text);
-  const content = data?.choices?.[0]?.message?.content || "";
-  return extractJson(content);
+  let lastError;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const response = await fetch(`${config.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${config.apiKey}`
+        },
+        body: JSON.stringify({
+          model: config.model,
+          messages,
+          temperature: 0.1,
+          max_tokens: 1600,
+          response_format: { type: "json_object" }
+        })
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        const error = new Error(`Qwen failed: ${response.status} ${text.slice(0, 200)}`);
+        error.retryable = response.status === 429 || response.status >= 500;
+        throw error;
+      }
+      const data = JSON.parse(text);
+      const content = data?.choices?.[0]?.message?.content || "";
+      return extractJson(content);
+    } catch (error) {
+      lastError = error;
+      const retryable = error.retryable !== false;
+      if (attempt >= 2 || !retryable) break;
+      await new Promise(resolve => setTimeout(resolve, 450));
+    }
+  }
+  throw lastError;
 }
 
 function looksLikeNoise(text) {
@@ -867,22 +882,27 @@ async function composeWithQwen(input) {
   if (!Array.isArray(result.sentences)) result.sentences = [];
   result.sentences = dedupeCompositionSentences(result.sentences);
   if (compositionPenalty(result) > 0) {
-    const polished = await polishCompositionWithQwen(input, result, facts);
-    if (Array.isArray(polished.sentences)) polished.sentences = dedupeCompositionSentences(polished.sentences);
-    if (compositionPenalty(polished) < compositionPenalty(result)) result = polished;
+    try {
+      const polished = await polishCompositionWithQwen(input, result, facts);
+      if (Array.isArray(polished.sentences)) polished.sentences = dedupeCompositionSentences(polished.sentences);
+      if (compositionPenalty(polished) < compositionPenalty(result)) result = polished;
+    } catch (error) {
+      console.error("Optional composition polish failed:", error.message);
+    }
   }
   let usedFactTexts = new Set(
     result.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : [])
   );
   let missingFacts = facts.filter(fact => !factIsCovered(fact, usedFactTexts, result.sentences));
   if (missingFacts.length) {
-    result = await repairCompositionWithQwen(input, result, facts, missingFacts);
-    if (!Array.isArray(result.sentences)) result.sentences = [];
-    result.sentences = dedupeCompositionSentences(result.sentences);
-    usedFactTexts = new Set(
-      result.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : [])
-    );
-    missingFacts = facts.filter(fact => !factIsCovered(fact, usedFactTexts, result.sentences));
+    try {
+      const repaired = await repairCompositionWithQwen(input, result, facts, missingFacts);
+      if (!Array.isArray(repaired.sentences)) repaired.sentences = [];
+      repaired.sentences = dedupeCompositionSentences(repaired.sentences);
+      if (repaired.sentences.length) result = repaired;
+    } catch (error) {
+      console.error("Optional composition repair failed:", error.message);
+    }
   }
   // 不再把模型认为遗漏的事实机械追加到文章末尾。机械追加会破坏时间顺序，
   // 也会把已经合并表达过的活动再次写一遍；遗漏只允许通过上面的整体重排修复。
@@ -933,7 +953,17 @@ async function finalizeWithQwen(input) {
       })
     }
   ];
-  const audit = await callQwenJson(messages);
+  let audit;
+  try {
+    audit = await callQwenJson(messages);
+  } catch (error) {
+    console.error("Final fact audit failed; using realtime facts:", error.message);
+    audit = {
+      accepted_existing_fact_ids: existingFacts.map(fact => fact.id).filter(Boolean),
+      facts: [],
+      main_story: null
+    };
+  }
   const knownIds = new Set(existingFacts.map(fact => fact.id).filter(Boolean));
   const acceptedIds = Array.isArray(audit.accepted_existing_fact_ids)
     ? new Set(audit.accepted_existing_fact_ids.filter(id => knownIds.has(id)))
@@ -1427,7 +1457,10 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "POST" && pathname === "/api/finalize") {
-    handleFinalize(req, res).catch(error => sendJson(res, 500, { error: error.message }));
+    handleFinalize(req, res).catch(error => {
+      console.error("Finalize failed:", error.message);
+      sendJson(res, 500, { error: error.message });
+    });
     return;
   }
 
