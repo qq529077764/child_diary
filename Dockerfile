@@ -3,6 +3,7 @@ FROM node:24-bookworm-slim
 WORKDIR /app
 
 COPY server.js ./server.js
+COPY scripts/backup-database.js ./scripts/backup-database.js
 
 RUN mkdir -p /app/data && chown -R node:node /app
 

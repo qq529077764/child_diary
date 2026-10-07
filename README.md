@@ -68,6 +68,7 @@ QWEN_BASE_URL
 - 容器只绑定 `127.0.0.1:5178`，公网由 Nginx 反向代理。
 - 生产域名为 `https://childdiary.127space.com`。
 - 数据库持久化到 `./data/child-diary.sqlite`，该目录不进入 Git。
+- `scripts/backup-database.js` 使用 SQLite 在线备份 API 生成一致性副本，服务器每日执行并默认保留 30 天。
 
 ## 当前边界
 
