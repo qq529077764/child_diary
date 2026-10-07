@@ -40,7 +40,11 @@ Page({
     this.resetRuntime();
     this.loadDiaryHistory();
     this.cloudToken = wx.getStorageSync(CLOUD_TOKEN_KEY) || "";
-    this.authPromise = this.initializeCloudDiary().catch(() => null);
+    this.authError = null;
+    this.authPromise = this.initializeCloudDiary().catch(error => {
+      this.authError = error;
+      return null;
+    });
   },
 
   onUnload() {
@@ -132,7 +136,10 @@ Page({
   },
 
   wechatLoginCode() {
-    return new Promise((resolve, reject) => wx.login({ success: result => result.code ? resolve(result.code) : reject(new Error("微信登录失败")), fail: reject }));
+    return new Promise((resolve, reject) => wx.login({
+      success: result => result.code ? resolve(result.code) : reject(new Error("微信登录没有返回 code")),
+      fail: error => reject(new Error(error.errMsg || "微信登录失败"))
+    }));
   },
 
   rawRequest(path, method = "GET", data = {}, includeAuth = true) {
@@ -151,7 +158,7 @@ Page({
           error.statusCode = response.statusCode;
           reject(error);
         })(),
-      fail: reject
+      fail: error => reject(new Error(error.errMsg || "网络请求失败"))
     }));
   },
 
@@ -169,6 +176,7 @@ Page({
     }
     if (!auth.token) throw new Error("服务器未返回登录信息");
     this.cloudToken = auth.token;
+    this.authError = null;
     wx.setStorageSync(CLOUD_TOKEN_KEY, auth.token);
     const localHistory = this.readDiaryHistory();
     for (const record of localHistory) {
@@ -182,8 +190,10 @@ Page({
     if (!this.authPromise) this.authPromise = this.initializeCloudDiary().catch(error => { throw error; });
     await this.authPromise;
     if (!this.cloudToken) {
+      const error = this.authError;
       this.authPromise = null;
-      throw new Error("还没有连接到日记服务器");
+      this.authError = null;
+      throw new Error(error?.message || "还没有连接到日记服务器");
     }
     return this.cloudToken;
   },
