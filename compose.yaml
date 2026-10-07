@@ -1,0 +1,11 @@
+services:
+  childdiary-api:
+    build: .
+    container_name: childdiary-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:5178:5178"
+    volumes:
+      - ./data:/app/data

@@ -12,13 +12,13 @@
 
 ## 后端地址
 
-`utils/config.js` 保存当前测试接口地址。真机不能使用电脑的 `127.0.0.1`，应填写电脑局域网 IP，例如：
+`utils/config.js` 使用正式 HTTPS 接口：
 
 ```js
-const API_BASE_URL = "http://192.168.1.10:5178";
+const API_BASE_URL = "https://childdiary.127space.com";
 ```
 
-手机和电脑必须连接同一个 Wi-Fi。电脑网络变化后需要更新 IP 并重新编译预览。
+正式测试前需将该域名配置为小程序 `request` 和 `uploadFile` 合法域名。
 
 ## 当前交互
 
@@ -29,8 +29,9 @@ const API_BASE_URL = "http://192.168.1.10:5178";
 - 孩子中途直接继续说，不需要点击问题。
 - 点击或说“我说完啦”后生成日记。
 - 支持语音替换、删除和补充事实。
-- 确认后的日记追加保存到本地 `diaryHistory`，首页可以查询全部已保存日记。
-- 旧版 `latestDiary` 会自动迁移，不会覆盖已有历史。
+- 确认后的日记保存到服务器，本地 `diaryHistory` 作为离线副本。
+- 旧版本地日记首次登录时自动上传，失败后下次启动重试。
+- 日记详情页支持二次确认后删除。
 
 ## 接口
 
@@ -39,6 +40,11 @@ const API_BASE_URL = "http://192.168.1.10:5178";
 - `POST /api/finalize`
 - `POST /api/revise`
 - `POST /api/compose`
+- `POST /api/auth/session`
+- `POST /api/diaries`
+- `GET /api/diaries`
+- `GET /api/diaries/:id`
+- `DELETE /api/diaries/:id`
 - `GET /health`
 
 后端密钥只保存在服务器 `.env`，不得写入小程序源码。

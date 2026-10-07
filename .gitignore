@@ -12,4 +12,4 @@ wechat-miniapp/preview-qr.png
 *.log
 .DS_Store
 node_modules/
-
+data/

@@ -36,7 +36,7 @@
       <view class="diary-body"><text wx:for="{{selectedDiary.sentences}}" wx:key="id" class="sentence color-{{index % 3}}">{{item.text}}</text></view>
       <block wx:for="{{selectedDiary.sentences}}" wx:key="id"><view wx:if="{{item.sourceText}}" class="source"><text class="source-sentence">{{item.text}}</text><text class="source-detail">{{item.sourceText}}</text></view></block>
     </scroll-view>
-    <button class="button soft" bindtap="backHistory">返回日记本</button>
+    <view class="detail-actions"><button class="button soft" bindtap="backHistory">返回日记本</button><button class="delete-button" bindtap="deleteDiaryRecord">删除日记</button></view>
   </view>
 
   <view wx:elif="{{phase === 'listen'}}" class="screen listen-screen">

@@ -2,12 +2,50 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { DatabaseSync } = require("node:sqlite");
 
 const ROOT = __dirname;
 
 loadEnvFile(path.join(ROOT, ".env"));
 
 const PORT = Number(process.env.PORT || 5178);
+const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, "data");
+const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, "child-diary.sqlite");
+
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const database = new DatabaseSync(DB_PATH);
+database.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA foreign_keys = ON;
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    wechat_openid TEXT UNIQUE,
+    auth_mode TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS diaries (
+    user_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    sentences_json TEXT NOT NULL,
+    transcript TEXT NOT NULL DEFAULT '',
+    facts_json TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    deleted_at INTEGER,
+    PRIMARY KEY (user_id, id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_diaries_user_created
+    ON diaries(user_id, created_at DESC);
+`);
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -29,6 +67,108 @@ function sendJson(res, status, data) {
     "Access-Control-Allow-Origin": "*"
   });
   res.end(JSON.stringify(data));
+}
+
+function sendError(res, status, error, message) {
+  sendJson(res, status, { error, message });
+}
+
+function tokenHash(token) {
+  return sha256(String(token || ""));
+}
+
+function bearerToken(req) {
+  const match = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ""));
+  return match ? match[1].trim() : "";
+}
+
+function authenticatedUser(req) {
+  const token = bearerToken(req);
+  if (!token) return null;
+  const session = database.prepare(`
+    SELECT users.id, users.wechat_openid, users.auth_mode
+    FROM sessions
+    JOIN users ON users.id = sessions.user_id
+    WHERE sessions.token_hash = ?
+  `).get(tokenHash(token));
+  if (!session) return null;
+  database.prepare("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?")
+    .run(Date.now(), tokenHash(token));
+  return session;
+}
+
+function requireUser(req, res) {
+  const user = authenticatedUser(req);
+  if (!user) sendError(res, 401, "unauthorized", "请重新登录后再试。");
+  return user;
+}
+
+async function exchangeWechatCode(code) {
+  const appId = process.env.WECHAT_APP_ID;
+  const appSecret = process.env.WECHAT_APP_SECRET;
+  if (!appId || !appSecret) throw new Error("wechat_auth_not_configured");
+  const query = new URLSearchParams({
+    appid: appId,
+    secret: appSecret,
+    js_code: code,
+    grant_type: "authorization_code"
+  });
+  const response = await fetch(`https://api.weixin.qq.com/sns/jscode2session?${query}`);
+  const data = await response.json();
+  if (!response.ok || data.errcode || !data.openid) {
+    throw new Error(`wechat_login_failed:${data.errcode || response.status}:${data.errmsg || "unknown"}`);
+  }
+  return data;
+}
+
+function createSession(userId) {
+  const token = crypto.randomBytes(32).toString("base64url");
+  const now = Date.now();
+  database.prepare("INSERT INTO sessions(token_hash, user_id, created_at, last_seen_at) VALUES (?, ?, ?, ?)")
+    .run(tokenHash(token), userId, now, now);
+  return token;
+}
+
+function upsertWechatUser(openid) {
+  let user = database.prepare("SELECT id FROM users WHERE wechat_openid = ?").get(openid);
+  if (user) return user.id;
+  const id = crypto.randomUUID();
+  database.prepare("INSERT INTO users(id, wechat_openid, auth_mode, created_at) VALUES (?, ?, 'wechat', ?)")
+    .run(id, openid, Date.now());
+  return id;
+}
+
+function upsertDeviceUser(installationId) {
+  const openid = `device:${sha256(installationId).slice(0, 48)}`;
+  let user = database.prepare("SELECT id FROM users WHERE wechat_openid = ?").get(openid);
+  if (user) return user.id;
+  const id = crypto.randomUUID();
+  database.prepare("INSERT INTO users(id, wechat_openid, auth_mode, created_at) VALUES (?, ?, 'device', ?)")
+    .run(id, openid, Date.now());
+  return id;
+}
+
+async function handleAuthSession(req, res) {
+  const current = authenticatedUser(req);
+  if (current) {
+    sendJson(res, 200, { token: bearerToken(req), authMode: current.auth_mode });
+    return;
+  }
+  const input = await readJson(req);
+  let userId;
+  let authMode;
+  if (input.code && process.env.WECHAT_APP_ID && process.env.WECHAT_APP_SECRET) {
+    const session = await exchangeWechatCode(String(input.code));
+    userId = upsertWechatUser(session.openid);
+    authMode = "wechat";
+  } else if (process.env.ALLOW_DEVICE_AUTH === "true" && input.installationId) {
+    userId = upsertDeviceUser(String(input.installationId));
+    authMode = "device";
+  } else {
+    sendError(res, 503, "wechat_auth_not_configured", "服务器尚未配置小程序 AppSecret。");
+    return;
+  }
+  sendJson(res, 200, { token: createSession(userId), authMode });
 }
 
 function collectBody(req) {
@@ -1077,6 +1217,115 @@ async function readJson(req) {
   return JSON.parse(body.toString("utf8"));
 }
 
+function parseStoredJson(value, fallback) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function presentStoredDiary(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    sentences: parseStoredJson(row.sentences_json, []),
+    transcript: row.transcript || "",
+    facts: parseStoredJson(row.facts_json, []),
+    savedAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function validatedDiaryInput(input) {
+  const id = String(input.id || "").trim();
+  const title = String(input.title || "我的日记").trim().slice(0, 80);
+  const sentences = Array.isArray(input.sentences) ? input.sentences.slice(0, 80) : [];
+  const facts = Array.isArray(input.facts) ? input.facts.slice(0, 200) : [];
+  const transcript = String(input.transcript || "").slice(0, 30000);
+  const savedAt = Number(input.savedAt);
+  if (!/^[A-Za-z0-9_-]{3,128}$/.test(id)) throw new Error("invalid_diary_id");
+  if (!sentences.length || sentences.some(item => !item || typeof item.text !== "string" || item.text.length > 1000)) {
+    throw new Error("invalid_diary_sentences");
+  }
+  return {
+    id,
+    title: title || "我的日记",
+    sentences,
+    facts,
+    transcript,
+    savedAt: Number.isFinite(savedAt) && savedAt > 0 ? savedAt : null
+  };
+}
+
+async function handleCreateDiary(req, res, user) {
+  let diary;
+  try {
+    diary = validatedDiaryInput(await readJson(req));
+  } catch (error) {
+    sendError(res, 400, error.message || "invalid_diary", "日记内容格式不正确。");
+    return;
+  }
+  const input = diary;
+  const now = Date.now();
+  const original = database.prepare("SELECT created_at FROM diaries WHERE user_id = ? AND id = ?").get(user.id, input.id);
+  const createdAt = original?.created_at || input.savedAt || now;
+  database.prepare(`
+    INSERT INTO diaries(user_id, id, title, sentences_json, transcript, facts_json, created_at, updated_at, deleted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    ON CONFLICT(user_id, id) DO UPDATE SET
+      title = excluded.title,
+      sentences_json = excluded.sentences_json,
+      transcript = excluded.transcript,
+      facts_json = excluded.facts_json,
+      updated_at = excluded.updated_at,
+      deleted_at = NULL
+  `).run(
+    user.id,
+    input.id,
+    input.title,
+    JSON.stringify(input.sentences),
+    input.transcript,
+    JSON.stringify(input.facts),
+    createdAt,
+    now
+  );
+  const row = database.prepare("SELECT * FROM diaries WHERE user_id = ? AND id = ?").get(user.id, input.id);
+  sendJson(res, original ? 200 : 201, { diary: presentStoredDiary(row) });
+}
+
+function handleListDiaries(res, user) {
+  const rows = database.prepare(`
+    SELECT * FROM diaries
+    WHERE user_id = ? AND deleted_at IS NULL
+    ORDER BY created_at DESC
+    LIMIT 500
+  `).all(user.id);
+  sendJson(res, 200, { diaries: rows.map(presentStoredDiary) });
+}
+
+function handleGetDiary(res, user, diaryId) {
+  const row = database.prepare("SELECT * FROM diaries WHERE user_id = ? AND id = ? AND deleted_at IS NULL")
+    .get(user.id, diaryId);
+  if (!row) {
+    sendError(res, 404, "diary_not_found", "没有找到这篇日记。");
+    return;
+  }
+  sendJson(res, 200, { diary: presentStoredDiary(row) });
+}
+
+function handleDeleteDiary(res, user, diaryId) {
+  const result = database.prepare(`
+    UPDATE diaries SET deleted_at = ?, updated_at = ?
+    WHERE user_id = ? AND id = ? AND deleted_at IS NULL
+  `).run(Date.now(), Date.now(), user.id, diaryId);
+  if (!result.changes) {
+    sendError(res, 404, "diary_not_found", "没有找到这篇日记。");
+    return;
+  }
+  sendJson(res, 200, { deleted: true, id: diaryId });
+}
+
 async function handleAnalyze(req, res) {
   const input = await readJson(req);
   const result = await analyzeWithQwen(input);
@@ -1116,47 +1365,85 @@ async function handleRevise(req, res) {
 }
 
 const server = http.createServer((req, res) => {
+  const requestUrl = new URL(req.url, "http://127.0.0.1");
+  const pathname = requestUrl.pathname;
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type,Authorization"
     });
     res.end();
     return;
   }
 
-  if (req.method === "POST" && req.url === "/api/asr") {
+  if (req.method === "POST" && pathname === "/api/auth/session") {
+    handleAuthSession(req, res).catch(error => sendError(res, 502, "auth_failed", error.message));
+    return;
+  }
+
+  if (pathname === "/api/diaries" || pathname.startsWith("/api/diaries/")) {
+    const user = requireUser(req, res);
+    if (!user) return;
+    const diaryId = decodeURIComponent(pathname.slice("/api/diaries/".length));
+    if (req.method === "POST" && pathname === "/api/diaries") {
+      handleCreateDiary(req, res, user).catch(error => sendError(res, 500, "diary_save_failed", error.message));
+      return;
+    }
+    if (req.method === "GET" && pathname === "/api/diaries") {
+      handleListDiaries(res, user);
+      return;
+    }
+    if (req.method === "GET" && diaryId) {
+      handleGetDiary(res, user, diaryId);
+      return;
+    }
+    if (req.method === "DELETE" && diaryId) {
+      handleDeleteDiary(res, user, diaryId);
+      return;
+    }
+    sendError(res, 405, "method_not_allowed", "不支持该操作。");
+    return;
+  }
+
+  if (req.method === "POST" && pathname.startsWith("/api/")) {
+    const user = requireUser(req, res);
+    if (!user) return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/asr") {
     handleAsr(req, res).catch(error => sendJson(res, 500, { error: error.message }));
     return;
   }
 
-  if (req.method === "POST" && req.url === "/api/analyze") {
+  if (req.method === "POST" && pathname === "/api/analyze") {
     handleAnalyze(req, res).catch(error => sendJson(res, 500, { error: error.message }));
     return;
   }
 
-  if (req.method === "POST" && req.url === "/api/compose") {
+  if (req.method === "POST" && pathname === "/api/compose") {
     handleCompose(req, res).catch(error => sendJson(res, 500, { error: error.message }));
     return;
   }
 
-  if (req.method === "POST" && req.url === "/api/finalize") {
+  if (req.method === "POST" && pathname === "/api/finalize") {
     handleFinalize(req, res).catch(error => sendJson(res, 500, { error: error.message }));
     return;
   }
 
-  if (req.method === "POST" && req.url === "/api/revise") {
+  if (req.method === "POST" && pathname === "/api/revise") {
     handleRevise(req, res).catch(error => sendJson(res, 500, { error: error.message }));
     return;
   }
 
-  if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
+  if (req.method === "GET" && (pathname === "/" || pathname === "/health")) {
     sendJson(res, 200, {
       ok: true,
       service: "tongxin-diary-api",
       asr: Boolean(process.env.TENCENT_SECRET_ID && process.env.TENCENT_SECRET_KEY),
-      qwen: Boolean(qwenConfig().apiKey)
+      qwen: Boolean(qwenConfig().apiKey),
+      storage: Boolean(database),
+      auth: process.env.WECHAT_APP_ID && process.env.WECHAT_APP_SECRET ? "wechat" : process.env.ALLOW_DEVICE_AUTH === "true" ? "device-test" : "not-configured"
     });
     return;
   }

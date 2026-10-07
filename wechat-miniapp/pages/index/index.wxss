@@ -545,6 +545,33 @@
   margin-bottom: 10rpx;
 }
 
+.detail-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 18rpx;
+  flex-shrink: 0;
+}
+
+.detail-actions .button {
+  width: 100%;
+}
+
+.delete-button {
+  width: 100%;
+  height: 76rpx;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #b85d49;
+  font-size: 28rpx;
+  line-height: 76rpx;
+}
+
+.delete-button::after {
+  border: 0;
+}
+
 .diary-card {
   flex: 1;
   min-height: 0;

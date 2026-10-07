@@ -3,6 +3,8 @@ const { API_BASE_URL } = require("../../utils/config");
 const SEGMENT_MS = 6200;
 const DIARY_HISTORY_KEY = "diaryHistory";
 const LATEST_DIARY_KEY = "latestDiary";
+const CLOUD_TOKEN_KEY = "cloudSessionToken";
+const INSTALLATION_ID_KEY = "installationId";
 
 Page({
   data: {
@@ -37,6 +39,8 @@ Page({
     this.recorder.onError(error => this.handleRecorderError(error));
     this.resetRuntime();
     this.loadDiaryHistory();
+    this.cloudToken = wx.getStorageSync(CLOUD_TOKEN_KEY) || "";
+    this.authPromise = this.initializeCloudDiary().catch(() => null);
   },
 
   onUnload() {
@@ -118,9 +122,90 @@ Page({
     return diaryHistory;
   },
 
-  openHistory() {
+  installationId() {
+    let id = wx.getStorageSync(INSTALLATION_ID_KEY);
+    if (!id) {
+      id = `wx_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+      wx.setStorageSync(INSTALLATION_ID_KEY, id);
+    }
+    return id;
+  },
+
+  wechatLoginCode() {
+    return new Promise((resolve, reject) => wx.login({ success: result => result.code ? resolve(result.code) : reject(new Error("微信登录失败")), fail: reject }));
+  },
+
+  rawRequest(path, method = "GET", data = {}, includeAuth = true) {
+    return new Promise((resolve, reject) => wx.request({
+      url: `${API_BASE_URL}${path}`,
+      method,
+      data,
+      header: {
+        "content-type": "application/json",
+        ...(includeAuth && this.cloudToken ? { Authorization: `Bearer ${this.cloudToken}` } : {})
+      },
+      success: response => response.statusCode >= 200 && response.statusCode < 300
+        ? resolve(response.data)
+        : (() => {
+          const error = new Error(response.data?.message || `请求失败 ${response.statusCode}`);
+          error.statusCode = response.statusCode;
+          reject(error);
+        })(),
+      fail: reject
+    }));
+  },
+
+  async initializeCloudDiary() {
+    const code = await this.wechatLoginCode();
+    const payload = { code, installationId: this.installationId() };
+    let auth;
+    try {
+      auth = await this.rawRequest("/api/auth/session", "POST", payload, true);
+    } catch (error) {
+      if (error.statusCode !== 401 || !this.cloudToken) throw error;
+      this.cloudToken = "";
+      wx.removeStorageSync(CLOUD_TOKEN_KEY);
+      auth = await this.rawRequest("/api/auth/session", "POST", payload, false);
+    }
+    if (!auth.token) throw new Error("服务器未返回登录信息");
+    this.cloudToken = auth.token;
+    wx.setStorageSync(CLOUD_TOKEN_KEY, auth.token);
+    const localHistory = this.readDiaryHistory();
+    for (const record of localHistory) {
+      try { await this.rawRequest("/api/diaries", "POST", record); } catch (error) {}
+    }
+    return this.refreshCloudHistory();
+  },
+
+  async ensureCloudSession() {
+    if (this.cloudToken) return this.cloudToken;
+    if (!this.authPromise) this.authPromise = this.initializeCloudDiary().catch(error => { throw error; });
+    await this.authPromise;
+    if (!this.cloudToken) {
+      this.authPromise = null;
+      throw new Error("还没有连接到日记服务器");
+    }
+    return this.cloudToken;
+  },
+
+  async refreshCloudHistory() {
+    const data = await this.rawRequest("/api/diaries", "GET");
+    const diaryHistory = (data.diaries || [])
+      .map((record, index) => this.presentDiary(record, index))
+      .sort((left, right) => right.savedAt - left.savedAt);
+    wx.setStorageSync(DIARY_HISTORY_KEY, diaryHistory);
+    if (diaryHistory[0]) wx.setStorageSync(LATEST_DIARY_KEY, diaryHistory[0]);
+    this.setData({ diaryHistory });
+    return diaryHistory;
+  },
+
+  async openHistory() {
     this.loadDiaryHistory();
     this.setData({ phase: "history", selectedDiary: null });
+    try {
+      await this.ensureCloudSession();
+      await this.refreshCloudHistory();
+    } catch (error) {}
   },
 
   openDiaryRecord(event) {
@@ -137,7 +222,38 @@ Page({
     this.setData({ phase: "history", selectedDiary: null });
   },
 
+  deleteDiaryRecord() {
+    const diary = this.data.selectedDiary;
+    if (!diary) return;
+    wx.showModal({
+      title: "删除这篇日记？",
+      content: "删除后，日记本里就看不到它了。",
+      confirmText: "删除",
+      confirmColor: "#d85f3f",
+      success: async result => {
+        if (!result.confirm) return;
+        try {
+          await this.ensureCloudSession();
+          await this.rawRequest(`/api/diaries/${encodeURIComponent(diary.id)}`, "DELETE");
+          const history = this.readDiaryHistory().filter(item => item.id !== diary.id);
+          wx.setStorageSync(DIARY_HISTORY_KEY, history);
+          if (history[0]) wx.setStorageSync(LATEST_DIARY_KEY, history[0]);
+          else wx.removeStorageSync(LATEST_DIARY_KEY);
+          this.setData({ phase: "history", selectedDiary: null, diaryHistory: history.map((item, index) => this.presentDiary(item, index)) });
+        } catch (error) {
+          wx.showModal({ title: "还没有删除成功", content: error.message || "请检查网络后再试。", showCancel: false });
+        }
+      }
+    });
+  },
+
   async startStory() {
+    try {
+      await this.ensureCloudSession();
+    } catch (error) {
+      wx.showModal({ title: "还没有连上服务器", content: error.message || "请稍后再试。", showCancel: false });
+      return;
+    }
     this.resetRuntime();
     this.setData({ phase: "listen", statusTitle: "正在打开麦克风", statusHint: "开始以后一直说就好。" });
     await this.startRecorder("story");
@@ -250,6 +366,7 @@ Page({
     return new Promise(resolve => {
       wx.uploadFile({
         url: `${API_BASE_URL}/api/asr`, filePath, name: "audio",
+        header: this.cloudToken ? { Authorization: `Bearer ${this.cloudToken}` } : {},
         formData: { kind, realtime: "1" },
         success: response => {
           try {
@@ -442,7 +559,7 @@ Page({
     this.setData({ phase: "diary", isFinishing: false, diaryTitle: data.title || "我的日记", diarySentences: sentences });
   },
 
-  saveDiary() {
+  async saveDiary() {
     const savedAt = Date.now();
     const record = {
       id: `diary_${savedAt}`,
@@ -458,7 +575,15 @@ Page({
       wx.setStorageSync(DIARY_HISTORY_KEY, history);
       wx.setStorageSync(LATEST_DIARY_KEY, record);
       this.loadDiaryHistory();
-      this.setData({ phase: "success" });
+      try {
+        await this.ensureCloudSession();
+        await this.rawRequest("/api/diaries", "POST", record);
+        await this.refreshCloudHistory();
+        this.setData({ phase: "success" });
+      } catch (error) {
+        this.setData({ phase: "success" });
+        wx.showModal({ title: "手机已保存", content: "云端暂时没有同步，下次打开会自动重试。", showCancel: false });
+      }
     } catch (error) {
       wx.showModal({ title: "还没有保存成功", content: "手机存储空间不足，请清理后再试。", showCancel: false });
     }
@@ -521,11 +646,6 @@ Page({
   restart() { this.resetRuntime(); this.setData({ phase: "home", diaryTitle: "", diarySentences: [], selectedDiary: null }); },
 
   request(path, data) {
-    return new Promise((resolve, reject) => wx.request({
-      url: `${API_BASE_URL}${path}`, method: "POST", data,
-      header: { "content-type": "application/json" },
-      success: response => response.statusCode >= 200 && response.statusCode < 300 ? resolve(response.data) : reject(new Error(`请求失败 ${response.statusCode}`)),
-      fail: reject
-    }));
+    return this.ensureCloudSession().then(() => this.rawRequest(path, "POST", data));
   }
 });
