@@ -1,6 +1,8 @@
 const { API_BASE_URL } = require("../../utils/config");
 
 const SEGMENT_MS = 6200;
+const DIARY_HISTORY_KEY = "diaryHistory";
+const LATEST_DIARY_KEY = "latestDiary";
 
 Page({
   data: {
@@ -14,6 +16,8 @@ Page({
     factChips: [],
     diaryTitle: "",
     diarySentences: [],
+    diaryHistory: [],
+    selectedDiary: null,
     revisionDisplay: "",
     transcriptAnchorId: "transcript_end_0",
     feedAnchorId: "feed_end_0"
@@ -32,6 +36,7 @@ Page({
     this.recorder.onStop(result => this.handleSegmentStop(result));
     this.recorder.onError(error => this.handleRecorderError(error));
     this.resetRuntime();
+    this.loadDiaryHistory();
   },
 
   onUnload() {
@@ -64,6 +69,72 @@ Page({
     this.transcriptAnchorSequence = 0;
     this.feedAnchorSequence = 0;
     this.setData({ isRecording: false, isFinishing: false, bubbles: [], factChips: [], latestText: "", revisionDisplay: "", transcriptAnchorId: "transcript_end_0", feedAnchorId: "feed_end_0" });
+  },
+
+  readDiaryHistory() {
+    try {
+      const stored = wx.getStorageSync(DIARY_HISTORY_KEY);
+      if (Array.isArray(stored)) return stored;
+      const latest = wx.getStorageSync(LATEST_DIARY_KEY);
+      if (latest && latest.title && Array.isArray(latest.sentences)) {
+        const migrated = [{ ...latest, id: latest.id || `legacy_${latest.savedAt || Date.now()}` }];
+        wx.setStorageSync(DIARY_HISTORY_KEY, migrated);
+        return migrated;
+      }
+    } catch (error) {}
+    return [];
+  },
+
+  formatSavedTime(timestamp) {
+    const date = new Date(Number(timestamp) || Date.now());
+    const pad = value => String(value).padStart(2, "0");
+    return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  },
+
+  presentDiary(record, index = 0) {
+    const savedAt = Number(record.savedAt) || Date.now();
+    const sentences = (record.sentences || []).map((sentence, sentenceIndex) => {
+      if (typeof sentence === "string") {
+        return { id: `stored_${savedAt}_${sentenceIndex}`, text: sentence, sourceText: "" };
+      }
+      return { ...sentence, id: sentence.id || `stored_${savedAt}_${sentenceIndex}` };
+    });
+    return {
+      ...record,
+      id: record.id || `diary_${savedAt}_${index}`,
+      title: record.title || "我的日记",
+      savedAt,
+      savedLabel: this.formatSavedTime(savedAt),
+      sentences,
+      preview: sentences.map(sentence => sentence.text).join("").slice(0, 54)
+    };
+  },
+
+  loadDiaryHistory() {
+    const diaryHistory = this.readDiaryHistory()
+      .map((record, index) => this.presentDiary(record, index))
+      .sort((left, right) => right.savedAt - left.savedAt);
+    this.setData({ diaryHistory });
+    return diaryHistory;
+  },
+
+  openHistory() {
+    this.loadDiaryHistory();
+    this.setData({ phase: "history", selectedDiary: null });
+  },
+
+  openDiaryRecord(event) {
+    const id = event.currentTarget.dataset.id;
+    const selectedDiary = this.data.diaryHistory.find(record => record.id === id);
+    if (selectedDiary) this.setData({ phase: "historyDetail", selectedDiary });
+  },
+
+  backHome() {
+    this.setData({ phase: "home", selectedDiary: null });
+  },
+
+  backHistory() {
+    this.setData({ phase: "history", selectedDiary: null });
   },
 
   async startStory() {
@@ -365,12 +436,25 @@ Page({
   },
 
   saveDiary() {
-    wx.setStorageSync("latestDiary", {
+    const savedAt = Date.now();
+    const record = {
+      id: `diary_${savedAt}`,
       title: this.data.diaryTitle,
-      sentences: this.data.diarySentences,
-      savedAt: Date.now()
-    });
-    this.setData({ phase: "success" });
+      sentences: JSON.parse(JSON.stringify(this.data.diarySentences)),
+      transcript: this.transcript,
+      facts: JSON.parse(JSON.stringify(this.facts.filter(fact => fact.active !== false))),
+      savedAt
+    };
+    try {
+      const history = this.readDiaryHistory().filter(item => item.id !== record.id);
+      history.unshift(record);
+      wx.setStorageSync(DIARY_HISTORY_KEY, history);
+      wx.setStorageSync(LATEST_DIARY_KEY, record);
+      this.loadDiaryHistory();
+      this.setData({ phase: "success" });
+    } catch (error) {
+      wx.showModal({ title: "还没有保存成功", content: "手机存储空间不足，请清理后再试。", showCancel: false });
+    }
   },
 
   async startRevision() {
@@ -427,7 +511,7 @@ Page({
     }
   },
 
-  restart() { this.resetRuntime(); this.setData({ phase: "home", diaryTitle: "", diarySentences: [] }); },
+  restart() { this.resetRuntime(); this.setData({ phase: "home", diaryTitle: "", diarySentences: [], selectedDiary: null }); },
 
   request(path, data) {
     return new Promise((resolve, reject) => wx.request({

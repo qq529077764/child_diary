@@ -9,7 +9,34 @@
       <text class="muted">开始以后一直说就好，中间不需要点按钮。</text>
     </view>
     <view class="theme-card"><text class="eyebrow">今日主题</text><text class="theme">今天你帮助别人做了什么？</text></view>
-    <button class="button primary" bindtap="startStory">开始说</button>
+    <view class="home-actions">
+      <button class="button primary" bindtap="startStory">开始说</button>
+      <button class="button soft history-entry" bindtap="openHistory">我的日记 {{diaryHistory.length ? diaryHistory.length + ' 篇' : ''}}</button>
+    </view>
+  </view>
+
+  <view wx:elif="{{phase === 'history'}}" class="screen history-screen">
+    <view class="page-header"><button class="icon-button" bindtap="backHome">‹</button><text class="page-title">我的日记</text><view class="header-spacer"></view></view>
+    <scroll-view class="history-list" scroll-y>
+      <view wx:if="{{!diaryHistory.length}}" class="history-empty"><text class="empty-title">还没有日记</text><text class="muted center">讲完第一个故事，它就会出现在这里。</text></view>
+      <view wx:for="{{diaryHistory}}" wx:key="id" class="history-item" data-id="{{item.id}}" bindtap="openDiaryRecord">
+        <view class="history-meta"><text class="history-date">{{item.savedLabel}}</text><text class="history-arrow">›</text></view>
+        <text class="history-title">{{item.title}}</text>
+        <text class="history-preview">{{item.preview}}</text>
+      </view>
+    </scroll-view>
+    <button class="button primary" bindtap="startStory">讲一个新故事</button>
+  </view>
+
+  <view wx:elif="{{phase === 'historyDetail'}}" class="screen history-detail-screen">
+    <view class="page-header"><button class="icon-button" bindtap="backHistory">‹</button><text class="page-title">日记详情</text><view class="header-spacer"></view></view>
+    <scroll-view class="diary-card stored-diary" scroll-y>
+      <text class="saved-time">{{selectedDiary.savedLabel}}</text>
+      <text class="diary-title">{{selectedDiary.title}}</text>
+      <view class="diary-body"><text wx:for="{{selectedDiary.sentences}}" wx:key="id" class="sentence color-{{index % 3}}">{{item.text}}</text></view>
+      <block wx:for="{{selectedDiary.sentences}}" wx:key="id"><view wx:if="{{item.sourceText}}" class="source"><text class="source-sentence">{{item.text}}</text><text class="source-detail">{{item.sourceText}}</text></view></block>
+    </scroll-view>
+    <button class="button soft" bindtap="backHistory">返回日记本</button>
   </view>
 
   <view wx:elif="{{phase === 'listen'}}" class="screen listen-screen">
@@ -65,6 +92,6 @@
 
   <view wx:else class="screen success">
     <view class="success-icon">✓</view><text class="hero-title">保存成功</text><text class="muted">今天的小故事已经放进日记本里啦。</text>
-    <button class="button primary bottom" bindtap="restart">再讲一篇</button>
+    <view class="actions bottom"><button class="button green" bindtap="openHistory">查看日记本</button><button class="button primary" bindtap="restart">再讲一篇</button></view>
   </view>
 </view>
