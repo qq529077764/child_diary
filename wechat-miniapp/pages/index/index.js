@@ -5,6 +5,7 @@ const DIARY_HISTORY_KEY = "diaryHistory";
 const LATEST_DIARY_KEY = "latestDiary";
 const CLOUD_TOKEN_KEY = "cloudSessionToken";
 const INSTALLATION_ID_KEY = "installationId";
+const PENDING_REVISION_KEY = "pendingDiaryRevision";
 
 Page({
   data: {
@@ -74,6 +75,7 @@ Page({
     this.analysisPromise = null;
     this.latestSegmentText = "";
     this.firstDiarySnapshot = null;
+    this.revisionBaseSnapshot = null;
     this.transcriptAnchorSequence = 0;
     this.feedAnchorSequence = 0;
     this.setData({ isRecording: false, isFinishing: false, bubbles: [], factChips: [], latestText: "", revisionDisplay: "", transcriptAnchorId: "transcript_end_0", feedAnchorId: "feed_end_0" });
@@ -411,6 +413,10 @@ Page({
   acceptTranscript(text, kind) {
     if (kind === "revision") {
       this.revisionTranscript = this.appendText(this.revisionTranscript, text);
+      try {
+        const pending = wx.getStorageSync(PENDING_REVISION_KEY) || {};
+        wx.setStorageSync(PENDING_REVISION_KEY, { ...pending, instruction: this.revisionTranscript, updatedAt: Date.now() });
+      } catch (error) {}
       this.setData({ revisionDisplay: `我听到：${this.tail(this.revisionTranscript, 72)}` });
       return;
     }
@@ -550,7 +556,11 @@ Page({
       utterances: this.utterances,
       ...options
     });
+    if (Number(options.minimumSentenceCount) > 0 && (data.sentences || []).length < Number(options.minimumSentenceCount)) {
+      throw new Error("这次修改丢失了原文内容，已自动恢复修改前版本。");
+    }
     this.applyDiaryResponse(data, false);
+    return data;
   },
 
   applyDiaryResponse(data, lockFirstVersion) {
@@ -601,6 +611,14 @@ Page({
 
   async startRevision() {
     this.revisionTranscript = ""; this.uploads = []; this.finalizeStarted = false;
+    this.revisionBaseSnapshot = {
+      title: this.data.diaryTitle,
+      sentences: JSON.parse(JSON.stringify(this.data.diarySentences)),
+      facts: JSON.parse(JSON.stringify(this.facts))
+    };
+    try {
+      wx.setStorageSync(PENDING_REVISION_KEY, { ...this.revisionBaseSnapshot, instruction: "", createdAt: Date.now() });
+    } catch (error) {}
     this.setData({ phase: "revise", revisionDisplay: "", isFinishing: false });
     await this.startRecorder("revision");
   },
@@ -620,6 +638,11 @@ Page({
   async finishRevision() {
     if (!this.revisionTranscript) { this.finalizeStarted = false; this.setData({ isFinishing: false, revisionDisplay: "刚才没有听清，请再说一次。" }); return; }
     try {
+      const revisionBase = this.revisionBaseSnapshot || {
+        title: this.data.diaryTitle,
+        sentences: JSON.parse(JSON.stringify(this.data.diarySentences)),
+        facts: JSON.parse(JSON.stringify(this.facts))
+      };
       const activeFacts = this.facts.filter(fact => fact.active !== false);
       const result = await this.request("/api/revise", { instruction: this.revisionTranscript, facts: activeFacts, diary: this.data.diarySentences.map(item => item.text) });
       let changed = 0;
@@ -641,15 +664,28 @@ Page({
         }
       });
       if (!changed) throw new Error(result.message || "没有找到修改内容");
+      const explicitDeleteCount = appliedOperations.filter(operation => operation.type === "delete").length;
       await this.composeDiary({
         lockedTitle: this.data.diaryTitle,
         lockedDiary: this.data.diarySentences.map(item => ({ id: item.id, text: item.text, factTexts: item.factTexts, factIds: item.factIds })),
         revisionOperations: appliedOperations,
-        revisionInstruction: this.revisionTranscript
+        revisionInstruction: this.revisionTranscript,
+        minimumSentenceCount: Math.max(1, revisionBase.sentences.length - explicitDeleteCount)
       });
+      this.revisionBaseSnapshot = null;
+      try { wx.removeStorageSync(PENDING_REVISION_KEY); } catch (error) {}
     } catch (error) {
+      if (this.revisionBaseSnapshot) {
+        this.facts = JSON.parse(JSON.stringify(this.revisionBaseSnapshot.facts));
+        this.setData({
+          phase: "diary",
+          diaryTitle: this.revisionBaseSnapshot.title,
+          diarySentences: JSON.parse(JSON.stringify(this.revisionBaseSnapshot.sentences))
+        });
+      }
       this.finalizeStarted = false;
       this.setData({ isFinishing: false, revisionDisplay: error.message || "修改失败，请重新说一次。" });
+      wx.showModal({ title: "已恢复修改前版本", content: error.message || "这次修改没有应用，请重新说一次。", showCancel: false });
     }
   },
 

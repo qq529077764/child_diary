@@ -965,9 +965,13 @@ async function finalizeWithQwen(input) {
     };
   }
   const knownIds = new Set(existingFacts.map(fact => fact.id).filter(Boolean));
-  const acceptedIds = Array.isArray(audit.accepted_existing_fact_ids)
-    ? new Set(audit.accepted_existing_fact_ids.filter(id => knownIds.has(id)))
-    : new Set(existingFacts.map(fact => fact.id).filter(Boolean));
+  const allowedExclusionReasons = new Set(["adult_guidance", "background_audio", "meta_speech", "unrelated", "uncertain"]);
+  const explicitlyExcludedIds = new Set((Array.isArray(audit.excluded_existing_facts) ? audit.excluded_existing_facts : [])
+    .filter(item => knownIds.has(item?.id) && allowedExclusionReasons.has(item?.reason))
+    .map(item => item.id));
+  // A long model response can be truncated before every accepted id is listed. Only an
+  // explicit exclusion with a supported reason may remove an existing realtime fact.
+  const acceptedIds = new Set([...knownIds].filter(id => !explicitlyExcludedIds.has(id)));
   const acceptedExistingFacts = existingFacts.filter(fact => !fact.id || acceptedIds.has(fact.id));
   const excludedFactIds = existingFacts
     .filter(fact => fact.id && !acceptedIds.has(fact.id))
@@ -1019,6 +1023,8 @@ async function reviseWithQwen(input) {
           "如果现有事实是否定或误识别句，而 instruction 给出了同一事件的正确肯定说法，必须 replace 这条错误事实，不能只 add 正确说法后同时保留错误说法。例如现有‘没有读绘本’，孩子改为‘睡醒后开始读绘本’，应替换原事实。",
           "如果同一个错误事实在 facts 中有多个近似版本，返回对应的 delete 操作一并清除重复项，只保留一条修改后的正确事实。",
           "replace/delete 的 target_fact_id 必须来自 facts，禁止编造 id。",
+          "孩子重新讲了一大段故事时，没再提到的旧事实不等于要删除；只把新信息作为 add，对明确纠正的同一事实作为 replace。",
+          "只有 instruction 明确说‘删掉’‘不要写’‘我没说’或‘不是……’时才能 delete；绝不能为了用新故事取代旧故事而批量 delete。",
           "不能确定目标事实时 operations 返回空数组，不得凭相似词强行修改。",
           "不要把指令措辞写进日记事实，只保留修改后的事实内容。"
         ],
@@ -1048,6 +1054,10 @@ function sharesSpecificBigram(left, right) {
 
 function normalizeRevisionOperations(input, operations) {
   const facts = Array.isArray(input.facts) ? input.facts : [];
+  const instruction = String(input.instruction || "");
+  const compactInstruction = normalizeSemanticText(instruction);
+  const isLongNarration = compactInstruction.length >= 80;
+  const hasDeleteCue = /(删掉|删除|去掉|不要写|别写|我(没有|没)说|这句不对|不是)/u.test(instruction);
   const normalized = [...operations];
   for (let index = 0; index < normalized.length; index += 1) {
     const operation = normalized[index];
@@ -1077,7 +1087,27 @@ function normalizeRevisionOperations(input, operations) {
       normalized.push({ type: "delete", target_fact_id: fact.id, slot: fact.slot, label: fact.label, new_text: "", reason: "清除同一错误事实的重复版本" });
     }
   }
-  return normalized;
+  const safe = [];
+  for (const operation of normalized) {
+    if (!operation || !["replace", "delete", "add"].includes(operation.type)) continue;
+    const target = facts.find(fact => fact.id === operation.target_fact_id);
+    if (operation.type === "delete") {
+      if (!target || !hasDeleteCue || (isLongNarration && !sharesSpecificBigram(instruction, target.text))) continue;
+    }
+    if (operation.type === "replace") {
+      if (!target || !operation.new_text) continue;
+      const correctionCue = /(不是|听错|识别错|说错|改成|应该是|其实是|是.{1,20}不是)/u.test(instruction);
+      const related = sharesSpecificBigram(target.text, operation.new_text) ||
+        sharesSpecificBigram(instruction, target.text) ||
+        semanticSimilarity(target.text, operation.new_text) >= 0.45;
+      if (!related || (isLongNarration && !correctionCue && !sharesSpecificBigram(instruction, target.text))) {
+        safe.push({ ...operation, type: "add", target_fact_id: "" });
+        continue;
+      }
+    }
+    safe.push(operation);
+  }
+  return safe;
 }
 
 function sentenceMatchesRevision(sentence, operation, originalFact) {
@@ -1389,6 +1419,7 @@ async function handleRevise(req, res) {
   });
   sendJson(res, 200, {
     operations,
+    revisionMode: normalizeSemanticText(input.instruction || "").length >= 80 ? "supplemental_narration" : "targeted_edit",
     message: result.message || "",
     provider: qwenConfig().apiKey ? "qwen" : "local"
   });
