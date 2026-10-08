@@ -1149,7 +1149,7 @@ function normalizeRevisionOperations(input, operations) {
         normalizeSemanticText(fact.text) === normalizeSemanticText(operation.new_text) ||
         normalizeSemanticText(fact.text).includes(normalizeSemanticText(operation.new_text)) ||
         normalizeSemanticText(operation.new_text).includes(normalizeSemanticText(fact.text)) ||
-        semanticSimilarity(fact.text, operation.new_text) >= 0.78
+        semanticSimilarity(fact.text, operation.new_text) >= 0.55
       );
       if (duplicatesExisting) continue;
     }
@@ -1352,13 +1352,33 @@ async function reviseLockedCompositionWithQwen(input) {
         : linkedActiveFacts.map(fact => fact.id)
     });
   }
-  const additions = Array.isArray(result.additions) ? result.additions : [];
-  for (const fact of addedFacts) {
-    const generated = additions.find(item => (item.factTexts || []).includes(fact.text));
+  const additions = (Array.isArray(result.additions) ? result.additions : [])
+    .map(item => ({
+      ...item,
+      matchingFacts: addedFacts.filter(fact => (item.factTexts || []).includes(fact.text))
+    }))
+    .filter(item => item.text && item.matchingFacts.length)
+    .sort((left, right) => right.matchingFacts.length - left.matchingFacts.length);
+  const coveredAddedFactIds = new Set();
+  for (const addition of additions) {
+    const uncoveredFacts = addition.matchingFacts.filter(fact => !coveredAddedFactIds.has(fact.id));
+    if (!uncoveredFacts.length) continue;
+    const allFactsAreUncovered = addition.matchingFacts.every(fact => !coveredAddedFactIds.has(fact.id));
+    if (!allFactsAreUncovered) continue;
     revised.push({
       id: `sentence_added_${Date.now()}_${revised.length}`,
-      text: generated?.text || `${fact.text}。`,
-      factTexts: generated?.factTexts?.filter(text => activeFactTexts.has(text)) || [fact.text],
+      text: addition.text,
+      factTexts: addition.matchingFacts.map(fact => fact.text),
+      factIds: addition.matchingFacts.map(fact => fact.id)
+    });
+    addition.matchingFacts.forEach(fact => coveredAddedFactIds.add(fact.id));
+  }
+  for (const fact of addedFacts) {
+    if (coveredAddedFactIds.has(fact.id)) continue;
+    revised.push({
+      id: `sentence_added_${Date.now()}_${revised.length}`,
+      text: `${fact.text}。`,
+      factTexts: [fact.text],
       factIds: [fact.id]
     });
   }
