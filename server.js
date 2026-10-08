@@ -1147,6 +1147,8 @@ function normalizeRevisionOperations(input, operations) {
     if (operation.type === "add") {
       const duplicatesExisting = facts.some(fact =>
         normalizeSemanticText(fact.text) === normalizeSemanticText(operation.new_text) ||
+        normalizeSemanticText(fact.text).includes(normalizeSemanticText(operation.new_text)) ||
+        normalizeSemanticText(operation.new_text).includes(normalizeSemanticText(fact.text)) ||
         semanticSimilarity(fact.text, operation.new_text) >= 0.78
       );
       if (duplicatesExisting) continue;
@@ -1156,6 +1158,8 @@ function normalizeRevisionOperations(input, operations) {
       if (operation.type !== "add" && existing.target_fact_id !== operation.target_fact_id) return false;
       if (!existing.new_text && !operation.new_text) return true;
       return normalizeSemanticText(existing.new_text) === normalizeSemanticText(operation.new_text) ||
+        normalizeSemanticText(existing.new_text).includes(normalizeSemanticText(operation.new_text)) ||
+        normalizeSemanticText(operation.new_text).includes(normalizeSemanticText(existing.new_text)) ||
         semanticSimilarity(existing.new_text, operation.new_text) >= 0.86;
     });
     if (duplicatesOperation) continue;
