@@ -569,12 +569,27 @@ Page({
 
   async composeDiary(options = {}) {
     const facts = this.facts.filter(fact => fact.active !== false);
+    const requiredFacts = Array.isArray(options.requiredFacts) ? options.requiredFacts : [];
+    const requestOptions = { ...options };
+    delete requestOptions.requiredFacts;
     const data = await this.request("/api/compose", {
       facts,
       utterances: this.utterances,
-      ...options
+      ...requestOptions
     });
-    if (Number(options.minimumSentenceCount) > 0 && (data.sentences || []).length < Number(options.minimumSentenceCount)) {
+    const returnedSentences = Array.isArray(data.sentences) ? data.sentences : [];
+    const coveredFactIds = new Set(returnedSentences.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []));
+    const coveredFactTexts = returnedSentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []);
+    const missingFacts = requiredFacts.filter(fact => {
+      if (fact.id && coveredFactIds.has(fact.id)) return false;
+      const factText = String(fact.text || "").trim();
+      if (!factText) return false;
+      return !coveredFactTexts.some(text => {
+        const sourceText = String(text || "").trim();
+        return sourceText && (sourceText === factText || sourceText.includes(factText) || factText.includes(sourceText));
+      });
+    });
+    if (missingFacts.length > 0) {
       throw new Error("这次修改丢失了原文内容，已自动恢复修改前版本。");
     }
     this.applyDiaryResponse(data, false);
@@ -656,11 +671,6 @@ Page({
   async finishRevision() {
     if (!this.revisionTranscript) { this.finalizeStarted = false; this.setData({ isFinishing: false, revisionDisplay: "刚才没有听清，请再说一次。" }); return; }
     try {
-      const revisionBase = this.revisionBaseSnapshot || {
-        title: this.data.diaryTitle,
-        sentences: JSON.parse(JSON.stringify(this.data.diarySentences)),
-        facts: JSON.parse(JSON.stringify(this.facts))
-      };
       const activeFacts = this.facts.filter(fact => fact.active !== false);
       const result = await this.request("/api/revise", { instruction: this.revisionTranscript, facts: activeFacts, diary: this.data.diarySentences.map(item => item.text) });
       let changed = 0;
@@ -682,13 +692,15 @@ Page({
         }
       });
       if (!changed) throw new Error(result.message || "没有找到修改内容");
-      const explicitDeleteCount = appliedOperations.filter(operation => operation.type === "delete").length;
+      const requiredFacts = this.facts
+        .filter(fact => fact.active !== false)
+        .map(fact => ({ id: fact.id, text: fact.text }));
       await this.composeDiary({
         lockedTitle: this.data.diaryTitle,
         lockedDiary: this.data.diarySentences.map(item => ({ id: item.id, text: item.text, factTexts: item.factTexts, factIds: item.factIds })),
         revisionOperations: appliedOperations,
         revisionInstruction: this.revisionTranscript,
-        minimumSentenceCount: Math.max(1, revisionBase.sentences.length - explicitDeleteCount)
+        requiredFacts
       });
       this.revisionBaseSnapshot = null;
       try { wx.removeStorageSync(PENDING_REVISION_KEY); } catch (error) {}
