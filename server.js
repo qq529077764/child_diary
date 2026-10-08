@@ -1024,6 +1024,7 @@ async function reviseWithQwen(input) {
           "如果同一个错误事实在 facts 中有多个近似版本，返回对应的 delete 操作一并清除重复项，只保留一条修改后的正确事实。",
           "replace/delete 的 target_fact_id 必须来自 facts，禁止编造 id。",
           "孩子重新讲了一大段故事时，没再提到的旧事实不等于要删除；只把新信息作为 add，对明确纠正的同一事实作为 replace。",
+          "已经出现在 facts 或 diary 中的人物、地点、活动和句子不得再返回 add；即使孩子在修改时又讲了一遍，也只视为原事实的重述。",
           "只有 instruction 明确说‘删掉’‘不要写’‘我没说’或‘不是……’时才能 delete；绝不能为了用新故事取代旧故事而批量 delete。",
           "不能确定目标事实时 operations 返回空数组，不得凭相似词强行修改。",
           "不要把指令措辞写进日记事实，只保留修改后的事实内容。"
@@ -1105,9 +1106,49 @@ function normalizeRevisionOperations(input, operations) {
         continue;
       }
     }
+    if (operation.type === "add") {
+      const duplicatesExisting = facts.some(fact =>
+        normalizeSemanticText(fact.text) === normalizeSemanticText(operation.new_text) ||
+        semanticSimilarity(fact.text, operation.new_text) >= 0.78
+      );
+      if (duplicatesExisting) continue;
+    }
+    const duplicatesOperation = safe.some(existing => {
+      if (existing.type !== operation.type) return false;
+      if (operation.type !== "add" && existing.target_fact_id !== operation.target_fact_id) return false;
+      if (!existing.new_text && !operation.new_text) return true;
+      return normalizeSemanticText(existing.new_text) === normalizeSemanticText(operation.new_text) ||
+        semanticSimilarity(existing.new_text, operation.new_text) >= 0.86;
+    });
+    if (duplicatesOperation) continue;
     safe.push(operation);
   }
   return safe;
+}
+
+function dedupeRevisedSentences(sentences) {
+  const unique = [];
+  for (const sentence of sentences || []) {
+    if (!sentence?.text) continue;
+    const normalized = normalizeSemanticText(sentence.text);
+    const duplicate = unique.find(existing =>
+      normalizeSemanticText(existing.text) === normalized ||
+      semanticSimilarity(existing.text, sentence.text) >= 0.9
+    );
+    if (!duplicate) {
+      unique.push(sentence);
+      continue;
+    }
+    duplicate.factTexts = [...new Set([
+      ...(Array.isArray(duplicate.factTexts) ? duplicate.factTexts : []),
+      ...(Array.isArray(sentence.factTexts) ? sentence.factTexts : [])
+    ])];
+    duplicate.factIds = [...new Set([
+      ...(Array.isArray(duplicate.factIds) ? duplicate.factIds : []),
+      ...(Array.isArray(sentence.factIds) ? sentence.factIds : [])
+    ])];
+  }
+  return unique;
 }
 
 function sentenceMatchesRevision(sentence, operation, originalFact) {
@@ -1244,7 +1285,7 @@ async function reviseLockedCompositionWithQwen(input) {
   }
   return {
     title,
-    sentences: revised
+    sentences: dedupeRevisedSentences(revised)
   };
 }
 
