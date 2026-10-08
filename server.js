@@ -1160,7 +1160,7 @@ function normalizeRevisionOperations(input, operations) {
       return normalizeSemanticText(existing.new_text) === normalizeSemanticText(operation.new_text) ||
         normalizeSemanticText(existing.new_text).includes(normalizeSemanticText(operation.new_text)) ||
         normalizeSemanticText(operation.new_text).includes(normalizeSemanticText(existing.new_text)) ||
-        semanticSimilarity(existing.new_text, operation.new_text) >= 0.86;
+        semanticSimilarity(existing.new_text, operation.new_text) >= (operation.type === "add" ? 0.76 : 0.86);
     });
     if (duplicatesOperation) continue;
     safe.push(operation);
