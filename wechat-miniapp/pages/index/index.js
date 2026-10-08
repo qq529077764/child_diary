@@ -78,6 +78,8 @@ Page({
     this.latestSegmentText = "";
     this.firstDiarySnapshot = null;
     this.revisionBaseSnapshot = null;
+    this.editingDiaryId = null;
+    this.editingDiarySavedAt = null;
     this.transcriptAnchorSequence = 0;
     this.feedAnchorSequence = 0;
     this.setData({ isRecording: false, isFinishing: false, isSaving: false, bubbles: [], factChips: [], latestText: "", revisionDisplay: "", transcriptAnchorId: "transcript_end_0", feedAnchorId: "feed_end_0" });
@@ -105,16 +107,30 @@ Page({
 
   presentDiary(record, index = 0) {
     const savedAt = Number(record.savedAt) || Date.now();
+    const facts = Array.isArray(record.facts) ? record.facts.map(fact => ({ ...fact, active: fact.active !== false })) : [];
     const sentences = (record.sentences || []).map((sentence, sentenceIndex) => {
       if (typeof sentence === "string") {
         return { id: `stored_${savedAt}_${sentenceIndex}`, text: sentence, sourceText: "" };
       }
-      return { ...sentence, id: sentence.id || `stored_${savedAt}_${sentenceIndex}` };
+      const factTexts = Array.isArray(sentence.factTexts) ? sentence.factTexts : [];
+      const factIds = Array.isArray(sentence.factIds) && sentence.factIds.length
+        ? sentence.factIds
+        : facts
+          .filter(fact => factTexts.some(text => text === fact.text || text.includes(fact.text) || fact.text.includes(text)))
+          .map(fact => fact.id);
+      return {
+        ...sentence,
+        id: sentence.id || `stored_${savedAt}_${sentenceIndex}`,
+        factTexts,
+        factIds,
+        sourceText: sentence.sourceText || factTexts.join("；")
+      };
     });
     return {
       ...record,
       id: record.id || `diary_${savedAt}_${index}`,
       title: record.title || "我的日记",
+      facts,
       savedAt,
       savedLabel: this.formatSavedTime(savedAt),
       sentences,
@@ -290,6 +306,8 @@ Page({
     this.utterances = this.transcript ? [this.transcript] : [];
     this.facts = JSON.parse(JSON.stringify(diary.facts || [])).map(fact => ({ ...fact, active: fact.active !== false }));
     this.firstDiarySnapshot = { title: diary.title || "我的日记", sentences: JSON.parse(JSON.stringify(sentences)) };
+    this.editingDiaryId = diary.id;
+    this.editingDiarySavedAt = diary.savedAt;
     this.setData({
       phase: "diary",
       selectedDiary: null,
@@ -400,6 +418,16 @@ Page({
 
   retryRecording() {
     if (this.data.isRecording || this.data.isFinishing) return;
+    if (this.data.phase === "revise") {
+      this.revisionTranscript = "";
+      this.uploads = [];
+      this.finalizeStarted = false;
+      this.setData({ revisionDisplay: "" });
+      try {
+        const pending = wx.getStorageSync(PENDING_REVISION_KEY) || {};
+        wx.setStorageSync(PENDING_REVISION_KEY, { ...pending, instruction: "", updatedAt: Date.now() });
+      } catch (error) {}
+    }
     this.setData({ statusTitle: "正在打开麦克风", statusHint: "请在微信提示中允许录音。" });
     this.startRecorder(this.segmentKind || "story");
   },
@@ -628,29 +656,11 @@ Page({
 
   async composeDiary(options = {}) {
     const facts = this.facts.filter(fact => fact.active !== false);
-    const requiredFacts = Array.isArray(options.requiredFacts) ? options.requiredFacts : [];
-    const requestOptions = { ...options };
-    delete requestOptions.requiredFacts;
     const data = await this.request("/api/compose", {
       facts,
       utterances: this.utterances,
-      ...requestOptions
+      ...options
     });
-    const returnedSentences = Array.isArray(data.sentences) ? data.sentences : [];
-    const coveredFactIds = new Set(returnedSentences.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []));
-    const coveredFactTexts = returnedSentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []);
-    const missingFacts = requiredFacts.filter(fact => {
-      if (fact.id && coveredFactIds.has(fact.id)) return false;
-      const factText = String(fact.text || "").trim();
-      if (!factText) return false;
-      return !coveredFactTexts.some(text => {
-        const sourceText = String(text || "").trim();
-        return sourceText && (sourceText === factText || sourceText.includes(factText) || factText.includes(sourceText));
-      });
-    });
-    if (missingFacts.length > 0) {
-      throw new Error("这次修改丢失了原文内容，已自动恢复修改前版本。");
-    }
     this.applyDiaryResponse(data, false);
     return data;
   },
@@ -674,9 +684,9 @@ Page({
   async saveDiary() {
     if (this.data.isSaving) return;
     this.setData({ isSaving: true });
-    const savedAt = Date.now();
+    const savedAt = this.editingDiarySavedAt || Date.now();
     const record = {
-      id: `diary_${savedAt}`,
+      id: this.editingDiaryId || `diary_${savedAt}`,
       title: this.data.diaryTitle,
       sentences: JSON.parse(JSON.stringify(this.data.diarySentences)),
       transcript: this.transcript,
@@ -733,7 +743,13 @@ Page({
   async finishRevision() {
     if (!this.revisionTranscript) { this.finalizeStarted = false; this.setData({ isFinishing: false, revisionDisplay: "刚才没有听清，请再说一次。" }); return; }
     try {
-      const activeFacts = this.facts.filter(fact => fact.active !== false);
+      const diaryFactIds = new Set(this.data.diarySentences.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []));
+      const diaryFactTexts = this.data.diarySentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []);
+      const allActiveFacts = this.facts.filter(fact => fact.active !== false);
+      const linkedFacts = allActiveFacts.filter(fact =>
+        diaryFactIds.has(fact.id) || diaryFactTexts.some(text => text === fact.text || text.includes(fact.text) || fact.text.includes(text))
+      );
+      const activeFacts = linkedFacts.length ? linkedFacts : allActiveFacts;
       const result = await this.request("/api/revise", { instruction: this.revisionTranscript, facts: activeFacts, diary: this.data.diarySentences.map(item => item.text) });
       let changed = 0;
       const appliedOperations = [];
@@ -753,27 +769,27 @@ Page({
           changed += 1;
         }
       });
-      if (!changed) throw new Error(result.message || "没有找到修改内容");
+      if (!changed) {
+        this.finalizeStarted = false;
+        this.setData({ isFinishing: false, revisionDisplay: result.message || "还没有找到要修改的地方，请再说清楚一点。" });
+        wx.showModal({
+          title: "还没有修改",
+          content: result.message || "请说清楚要替换、删除或补充的内容。原来的日记没有变化。",
+          showCancel: false
+        });
+        return;
+      }
       const lockedDiary = this.data.diarySentences.map(item => ({
         id: item.id,
         text: item.text,
         factTexts: item.factTexts,
         factIds: item.factIds
       }));
-      const requiredFactIds = new Set(lockedDiary.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []));
-      for (const operation of appliedOperations) {
-        if (operation.type === "delete" && operation.target_fact_id) requiredFactIds.delete(operation.target_fact_id);
-        if (operation.type === "add" && operation.applied_fact_id) requiredFactIds.add(operation.applied_fact_id);
-      }
-      const requiredFacts = this.facts
-        .filter(fact => fact.active !== false && requiredFactIds.has(fact.id))
-        .map(fact => ({ id: fact.id, text: fact.text }));
       await this.composeDiary({
         lockedTitle: this.data.diaryTitle,
         lockedDiary,
         revisionOperations: appliedOperations,
-        revisionInstruction: this.revisionTranscript,
-        requiredFacts
+        revisionInstruction: this.revisionTranscript
       });
       this.revisionBaseSnapshot = null;
       try { wx.removeStorageSync(PENDING_REVISION_KEY); } catch (error) {}
@@ -788,7 +804,7 @@ Page({
       }
       this.finalizeStarted = false;
       this.setData({ isFinishing: false, revisionDisplay: error.message || "修改失败，请重新说一次。" });
-      wx.showModal({ title: "已恢复修改前版本", content: error.message || "这次修改没有应用，请重新说一次。", showCancel: false });
+      wx.showModal({ title: "修改暂时失败", content: `${error.message || "这次修改没有应用，请重新说一次。"}\n原来的日记已完整保留。`, showCancel: false });
     }
   },
 

@@ -1132,8 +1132,7 @@ function dedupeRevisedSentences(sentences) {
     if (!sentence?.text) continue;
     const normalized = normalizeSemanticText(sentence.text);
     const duplicate = unique.find(existing =>
-      normalizeSemanticText(existing.text) === normalized ||
-      semanticSimilarity(existing.text, sentence.text) >= 0.9
+      normalizeSemanticText(existing.text) === normalized
     );
     if (!duplicate) {
       unique.push(sentence);
@@ -1256,7 +1255,8 @@ async function reviseLockedCompositionWithQwen(input) {
     if (!linkedActiveFacts.length) continue;
     const change = changes.get(sentence.id);
     const validFactTexts = (change?.factTexts || []).filter(text => activeFactTexts.has(text));
-    const validChange = validFactTexts.length && revisionChangeIsValid(change, sentenceOperations);
+    const coversLinkedFacts = linkedActiveFacts.every(fact => validFactTexts.includes(fact.text));
+    const validChange = validFactTexts.length && coversLinkedFacts && revisionChangeIsValid(change, sentenceOperations);
     const fallbackText = deterministicRevisionText(sentence, sentenceOperations, linkedActiveFacts);
     revised.push({
       ...sentence,

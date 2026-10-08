@@ -38,6 +38,12 @@ http://127.0.0.1:5178/health
 3. 开发测试阶段关闭合法域名校验。
 4. 手机与电脑连接同一个 Wi-Fi 后生成预览码测试。
 
+修改链路回归测试：
+
+```bash
+node scripts/test-miniapp-revision.js
+```
+
 当前测试 AppID 已写入 `project.config.json`。正式发布前必须改用 HTTPS 服务，并在小程序后台配置合法域名。
 
 ## 配置项
