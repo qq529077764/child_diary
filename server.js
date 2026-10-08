@@ -1064,16 +1064,31 @@ async function extractSupplementalRevisionOperations(input) {
     }
   ];
   const result = await callQwenJson(messages);
+  const existingTexts = [
+    ...(input.facts || []).map(fact => fact?.text),
+    ...(input.diary || []).map(sentence => typeof sentence === "string" ? sentence : sentence?.text)
+  ].filter(Boolean);
+  const removeKnownClauses = text => String(text || "")
+    .split(/[，,。；;]/u)
+    .map(clause => clause.trim())
+    .filter(Boolean)
+    .filter(clause => !existingTexts.some(existing =>
+      semanticSimilarity(existing, clause) >= 0.52 ||
+      (normalizeSemanticText(clause).length >= 5 && normalizeSemanticText(existing).includes(normalizeSemanticText(clause)))
+    ))
+    .join("，");
   return (Array.isArray(result.additions) ? result.additions : [])
     .filter(item => item?.text && item?.quote && quoteAppearsInTranscript(item.quote, input.instruction || ""))
-    .map(item => ({
-      type: "add",
-      target_fact_id: "",
-      slot: ["what", "detail", "feeling", "result"].includes(item.slot) ? item.slot : "detail",
-      label: item.label || "语音补充",
-      new_text: item.text,
-      reason: "孩子在历史日记后继续讲出的新事实"
-    }));
+    .map(item => ({ item, newText: removeKnownClauses(item.text) }))
+    .filter(({ newText }) => newText)
+    .map(({ item, newText }) => ({
+        type: "add",
+        target_fact_id: "",
+        slot: ["what", "detail", "feeling", "result"].includes(item.slot) ? item.slot : "detail",
+        label: item.label || "语音补充",
+        new_text: newText,
+        reason: "孩子在历史日记后继续讲出的新事实"
+      }));
 }
 
 function hasNegation(text) {
