@@ -56,6 +56,7 @@ Page({
   },
 
   resetRuntime() {
+    this.runtimeToken = (this.runtimeToken || 0) + 1;
     clearTimeout(this.segmentTimer);
     this.keepRecording = false;
     this.segmentKind = "story";
@@ -235,6 +236,51 @@ Page({
     this.setData({ phase: "history", selectedDiary: null });
   },
 
+  cancelCurrentFlow() {
+    if (this.data.isFinishing || this.data.isSaving) return;
+    const phase = this.data.phase;
+    const isRevision = phase === "revise";
+    wx.showModal({
+      title: isRevision ? "取消这次修改？" : phase === "diary" ? "暂时不保存吗？" : "退出这次讲述？",
+      content: isRevision ? "已经生成的日记会保留，这次还没提交的修改会取消。" : phase === "diary" ? "退出后，这篇还没有保存的日记会被丢弃。" : "退出后，刚才说的内容不会保存。",
+      confirmText: isRevision ? "取消修改" : "退出",
+      confirmColor: "#d85f3f",
+      success: result => {
+        if (!result.confirm) return;
+        this.runtimeToken = (this.runtimeToken || 0) + 1;
+        this.keepRecording = false;
+        clearTimeout(this.segmentTimer);
+        if (this.segmentActive) {
+          this.discardNextSegment = true;
+          try { this.recorder.stop(); } catch (error) {}
+        }
+        if (isRevision) {
+          const snapshot = this.revisionBaseSnapshot;
+          if (snapshot) {
+            this.facts = JSON.parse(JSON.stringify(snapshot.facts || []));
+            this.setData({
+              phase: "diary",
+              isRecording: false,
+              diaryTitle: snapshot.title,
+              diarySentences: JSON.parse(JSON.stringify(snapshot.sentences || [])),
+              factChips: this.facts.filter(fact => fact.active !== false)
+            });
+          } else {
+            this.setData({ phase: "diary", isRecording: false });
+          }
+          this.revisionTranscript = "";
+          this.uploads = [];
+          this.finalizeStarted = false;
+          this.revisionBaseSnapshot = null;
+          try { wx.removeStorageSync(PENDING_REVISION_KEY); } catch (error) {}
+          return;
+        }
+        this.resetRuntime();
+        this.setData({ phase: "home", diaryTitle: "", diarySentences: [], selectedDiary: null });
+      }
+    });
+  },
+
   restoreDiaryForRevision() {
     const diary = this.data.selectedDiary;
     if (!diary) return;
@@ -373,6 +419,10 @@ Page({
   handleSegmentStop(result) {
     clearTimeout(this.segmentTimer);
     this.segmentActive = false;
+    if (this.discardNextSegment) {
+      this.discardNextSegment = false;
+      return;
+    }
     const kind = this.segmentKind;
     const upload = this.uploadAudio(result.tempFilePath, kind);
     this.uploads.push(upload);
@@ -394,12 +444,14 @@ Page({
   },
 
   uploadAudio(filePath, kind) {
+    const runtimeToken = this.runtimeToken;
     return new Promise(resolve => {
       wx.uploadFile({
         url: `${API_BASE_URL}/api/asr`, filePath, name: "audio",
         header: this.cloudToken ? { Authorization: `Bearer ${this.cloudToken}` } : {},
         formData: { kind, realtime: "1" },
         success: response => {
+          if (runtimeToken !== this.runtimeToken) { resolve(); return; }
           try {
             const data = JSON.parse(response.data || "{}");
             if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -414,7 +466,10 @@ Page({
           }
           resolve();
         },
-        fail: () => { this.showAsrIssue(kind, "这一小段暂时没有转成文字"); resolve(); }
+        fail: () => {
+          if (runtimeToken === this.runtimeToken) this.showAsrIssue(kind, "这一小段暂时没有转成文字");
+          resolve();
+        }
       });
     });
   },
@@ -462,6 +517,7 @@ Page({
   analyzeRealtime() {
     if (this.analysisRunning) { this.analysisPending = true; return this.analysisPromise; }
     this.analysisRunning = true;
+    const runtimeToken = this.runtimeToken;
     const transcriptSnapshot = this.transcript;
     const request = this.request("/api/analyze", {
       text: transcriptSnapshot, recentText: this.latestSegmentText || transcriptSnapshot, realtime: true,
@@ -473,6 +529,7 @@ Page({
       followupCount: this.followupCount,
       maxFollowups: 50
     }).then(data => {
+      if (runtimeToken !== this.runtimeToken) return;
       this.mergeFacts(data.facts || []);
       const decision = data.decision || {};
       const question = String(decision.question || "").trim();
@@ -492,6 +549,7 @@ Page({
         this.currentQuestion = null;
       }
     }).catch(() => {}).finally(() => {
+      if (runtimeToken !== this.runtimeToken) return;
       this.analysisRunning = false;
       if (this.analysisPending) { this.analysisPending = false; this.analyzeRealtime(); }
     });

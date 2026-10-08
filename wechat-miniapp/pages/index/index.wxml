@@ -40,6 +40,7 @@
   </view>
 
   <view wx:elif="{{phase === 'listen'}}" class="screen listen-screen">
+    <view class="page-header flow-header"><button class="icon-button flow-back" disabled="{{isFinishing}}" bindtap="cancelCurrentFlow">‹</button><text class="page-title">讲故事</text><view class="header-spacer"></view></view>
     <view class="topic"><text>今日主题</text><text class="topic-strong">帮助别人</text></view>
     <view class="listen-card {{isRecording ? 'recording' : ''}}">
       <view class="rabbit small">
@@ -66,6 +67,7 @@
   </view>
 
   <view wx:elif="{{phase === 'diary'}}" class="screen diary-screen">
+    <view class="page-header flow-header"><button class="icon-button flow-back" disabled="{{isSaving}}" bindtap="cancelCurrentFlow">‹</button><text class="page-title">预览日记</text><view class="header-spacer"></view></view>
     <scroll-view class="diary-card" scroll-y>
       <text class="eyebrow orange-text">我的日记</text>
       <text class="diary-title">{{diaryTitle}}</text>
@@ -77,6 +79,7 @@
   </view>
 
   <view wx:elif="{{phase === 'revise'}}" class="screen revise-screen">
+    <view class="page-header flow-header"><button class="icon-button flow-back" disabled="{{isFinishing}}" bindtap="cancelCurrentFlow">‹</button><text class="page-title">修改日记</text><view class="header-spacer"></view></view>
     <view class="topic"><text>语音修改</text><text class="topic-strong">不用打字</text></view>
     <view class="listen-card revise-card recording">
       <view class="rabbit small"><view class="ear left"></view><view class="ear right"></view><view class="head"><view class="eye left"></view><view class="eye right"></view><view class="nose"></view></view></view>

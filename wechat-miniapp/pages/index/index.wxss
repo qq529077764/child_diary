@@ -467,6 +467,27 @@
   width: 72rpx;
 }
 
+.flow-header {
+  flex-basis: 64rpx;
+  height: 64rpx;
+  grid-template-columns: 60rpx 1fr 60rpx;
+}
+
+.flow-header .icon-button {
+  width: 60rpx !important;
+  height: 60rpx;
+  min-height: 60rpx;
+  font-size: 48rpx;
+}
+
+.flow-header .page-title {
+  font-size: 34rpx;
+}
+
+.flow-header .header-spacer {
+  width: 60rpx;
+}
+
 .history-list {
   flex: 1;
   min-height: 0;
