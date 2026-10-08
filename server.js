@@ -1009,6 +1009,7 @@ async function reviseWithQwen(input) {
           operations: [{
             type: "replace|delete|add",
             target_fact_id: "replace/delete 必须填写现有事实 id；add 为空",
+            anchor_fact_id: "add 若是对已有事件的补充，填写最相关的现有事实 id；独立新事件为空",
             slot: "what|detail|feeling|result",
             label: "简短中文标签",
             new_text: "replace/add 后的完整事实；delete 为空",
@@ -1025,6 +1026,7 @@ async function reviseWithQwen(input) {
           "replace/delete 的 target_fact_id 必须来自 facts，禁止编造 id。",
           "孩子重新讲了一大段故事时，没再提到的旧事实不等于要删除；只把新信息作为 add，对明确纠正的同一事实作为 replace。",
           "已经出现在 facts 或 diary 中的人物、地点、活动和句子不得再返回 add；即使孩子在修改时又讲了一遍，也只视为原事实的重述。",
+          "add 若补充同一人物、地点或活动的细节，必须填写 anchor_fact_id，让系统合并到原句；只有独立的新事件才留空。",
           "只有 instruction 明确说‘删掉’‘不要写’‘我没说’或‘不是……’时才能 delete；绝不能为了用新故事取代旧故事而批量 delete。",
           "不能确定目标事实时 operations 返回空数组，不得凭相似词强行修改。",
           "不要把指令措辞写进日记事实，只保留修改后的事实内容。"
@@ -1048,12 +1050,13 @@ async function extractSupplementalRevisionOperations(input) {
       role: "user",
       content: JSON.stringify({
         task: "从 supplemental_speech 中找出 existing_facts 和 diary 尚未记录的全部明确事实，每件不同事情单独返回一项。",
-        schema: { additions: [{ slot: "what|detail|feeling|result", label: "简短标签", text: "新增事实", quote: "口述中的原话片段" }] },
+        schema: { additions: [{ slot: "what|detail|feeling|result", label: "简短标签", text: "新增事实", quote: "口述中的原话片段", anchor_fact_id: "与已有事件直接相关时填写 existing_facts id，否则为空" }] },
         rules: [
           "按口述顺序扫描到结尾，人物、地点、活动、结果和感受都不能只取前两项就停止。",
           "text 保留孩子使用的人物关系、动作和形容词，但去掉嗯、然后然后等口头填充词。",
           "quote 必须逐字出现在 supplemental_speech 中；无法找到原话依据的内容不得返回。",
           "与 existing_facts 或 diary 已有内容相同、近似重复或只是换一种说法的内容不要返回。",
+          "新增内容若是已有事件的细节、结果或感受，填写最相关的 anchor_fact_id；独立的新事件才留空。",
           "一句家长追问、操作说明、要求继续说或与故事无关的背景声不要返回。",
           "不要合并互不相同的事件，也不要添加孩子没有说过的原因、时间、地点或感受。"
         ],
@@ -1087,6 +1090,7 @@ async function extractSupplementalRevisionOperations(input) {
         slot: ["what", "detail", "feeling", "result"].includes(item.slot) ? item.slot : "detail",
         label: item.label || "语音补充",
         new_text: newText,
+        anchor_fact_id: (input.facts || []).some(fact => fact.id === item.anchor_fact_id) ? item.anchor_fact_id : "",
         reason: "孩子在历史日记后继续讲出的新事实"
       }));
 }
@@ -1250,9 +1254,10 @@ function dedupeRevisedSentences(sentences) {
   return unique;
 }
 
-function sentenceMatchesRevision(sentence, operation, originalFact) {
+function sentenceMatchesRevision(sentence, operation, originalFact, anchorFact) {
   if (operation.target_fact_id && (sentence.factIds || []).includes(operation.target_fact_id)) return true;
-  const candidates = [operation.old_text, originalFact?.text].filter(Boolean);
+  if (operation.anchor_fact_id && (sentence.factIds || []).includes(operation.anchor_fact_id)) return true;
+  const candidates = [operation.old_text, originalFact?.text, anchorFact?.text].filter(Boolean);
   return candidates.some(text =>
     String(sentence.text || "").includes(text) ||
     (sentence.factTexts || []).some(source => semanticSimilarity(source, text) >= 0.58)
@@ -1297,11 +1302,11 @@ async function reviseLockedCompositionWithQwen(input) {
     }
   }
   const operationsForSentence = sentence => operations.filter(operation =>
-    sentenceMatchesRevision(sentence, operation, originalFacts.get(operation.target_fact_id))
+    sentenceMatchesRevision(sentence, operation, originalFacts.get(operation.target_fact_id), factById.get(operation.anchor_fact_id))
   );
   const affectedSentences = lockedDiary.filter(sentence => operationsForSentence(sentence).length > 0);
   const addedFacts = operations
-    .filter(operation => operation.type === "add" && operation.applied_fact_id)
+    .filter(operation => operation.type === "add" && operation.applied_fact_id && !operation.anchor_fact_id)
     .map(operation => factById.get(operation.applied_fact_id))
     .filter(Boolean);
   const messages = [
@@ -1314,12 +1319,13 @@ async function reviseLockedCompositionWithQwen(input) {
       content: JSON.stringify({
         schema: {
           changes: [{ sentenceId: "受影响的原句 id", text: "修改后完整句子", factTexts: ["本句使用的有效事实 text"] }],
-          additions: [{ text: "新增事实组成的完整句子", factTexts: ["新增事实 text"] }]
+          additions: [{ afterSentenceId: "应插入到哪一句之后；没有上下文关系时为空", text: "新增事实组成的完整句子", factTexts: ["新增事实 text"] }]
         },
         rules: [
           "changes 只能使用 affected_sentences 中的 sentenceId。",
           "replace 要在原句位置替换错误信息；delete 只删除目标事实，保留该句里其他事实。",
           "未受影响的句子不返回，系统会原样保留。",
+          "有 anchor_fact_id 的 add 必须合并进对应 affected_sentence；独立新增事件按时间和语境填写 afterSentenceId。",
           "每个修改后句子要有主语和谓语，不重复动作，不新增事实。",
           "factTexts 只能使用 active_facts 里完整的 text。"
         ],
@@ -1375,28 +1381,44 @@ async function reviseLockedCompositionWithQwen(input) {
     .filter(item => item.text && item.matchingFacts.length)
     .sort((left, right) => right.matchingFacts.length - left.matchingFacts.length);
   const coveredAddedFactIds = new Set();
+  const generatedAdditionSentences = [];
   for (const addition of additions) {
     const uncoveredFacts = addition.matchingFacts.filter(fact => !coveredAddedFactIds.has(fact.id));
     if (!uncoveredFacts.length) continue;
     const allFactsAreUncovered = addition.matchingFacts.every(fact => !coveredAddedFactIds.has(fact.id));
     if (!allFactsAreUncovered) continue;
-    revised.push({
-      id: `sentence_added_${Date.now()}_${revised.length}`,
+    generatedAdditionSentences.push({
+      id: `sentence_added_${Date.now()}_${revised.length + generatedAdditionSentences.length}`,
       text: addition.text,
       factTexts: addition.matchingFacts.map(fact => fact.text),
-      factIds: addition.matchingFacts.map(fact => fact.id)
+      factIds: addition.matchingFacts.map(fact => fact.id),
+      afterSentenceId: lockedDiary.some(sentence => sentence.id === addition.afterSentenceId) ? addition.afterSentenceId : ""
     });
     addition.matchingFacts.forEach(fact => coveredAddedFactIds.add(fact.id));
   }
   for (const fact of addedFacts) {
     if (coveredAddedFactIds.has(fact.id)) continue;
-    revised.push({
-      id: `sentence_added_${Date.now()}_${revised.length}`,
+    generatedAdditionSentences.push({
+      id: `sentence_added_${Date.now()}_${revised.length + generatedAdditionSentences.length}`,
       text: `${fact.text}。`,
       factTexts: [fact.text],
-      factIds: [fact.id]
+      factIds: [fact.id],
+      afterSentenceId: ""
     });
   }
+  const additionsBySentence = new Map();
+  const trailingAdditions = [];
+  for (const addition of generatedAdditionSentences) {
+    const { afterSentenceId, ...sentence } = addition;
+    if (!afterSentenceId) { trailingAdditions.push(sentence); continue; }
+    if (!additionsBySentence.has(afterSentenceId)) additionsBySentence.set(afterSentenceId, []);
+    additionsBySentence.get(afterSentenceId).push(sentence);
+  }
+  const orderedSentences = [];
+  for (const sentence of revised) {
+    orderedSentences.push(sentence, ...(additionsBySentence.get(sentence.id) || []));
+  }
+  orderedSentences.push(...trailingAdditions);
   let title = input.lockedTitle || "我的日记";
   for (const operation of operations) {
     if (operation.type === "replace" && operation.old_text && operation.new_text && title.includes(operation.old_text)) {
@@ -1405,7 +1427,7 @@ async function reviseLockedCompositionWithQwen(input) {
   }
   return {
     title,
-    sentences: dedupeRevisedSentences(revised)
+    sentences: dedupeRevisedSentences(orderedSentences)
   };
 }
 
