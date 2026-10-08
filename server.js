@@ -1572,7 +1572,9 @@ async function handleRevise(req, res) {
   const result = await reviseWithQwen(input);
   const validIds = new Set((input.facts || []).map(fact => fact.id));
   let rawOperations = Array.isArray(result.operations) ? [...result.operations] : [];
-  const isSupplementalNarration = normalizeSemanticText(input.instruction || "").length >= 36;
+  const revisionInstruction = String(input.instruction || "");
+  const hasExplicitEditCue = /不是.{1,160}?(?:而是|应该是|是)|(?:改成|改为|换成|换为|删掉|删除|去掉|不要写)/u.test(revisionInstruction);
+  const isSupplementalNarration = normalizeSemanticText(revisionInstruction).length >= 36 && !hasExplicitEditCue;
   if (isSupplementalNarration) {
     try {
       const supplementalOperations = await extractSupplementalRevisionOperations(input);
