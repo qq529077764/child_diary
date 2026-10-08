@@ -167,6 +167,7 @@ Page({
       url: `${API_BASE_URL}${path}`,
       method,
       data,
+      timeout: path === "/api/finalize" ? 120000 : path === "/api/compose" ? 90000 : 60000,
       header: {
         "content-type": "application/json",
         ...(includeAuth && this.cloudToken ? { Authorization: `Bearer ${this.cloudToken}` } : {})

@@ -777,56 +777,31 @@ function compositionPenalty(draft) {
   return penalty;
 }
 
-async function repairCompositionWithQwen(input, draft, facts, missingFacts) {
+async function refineCompositionWithQwen(input, draft, facts, missingFacts) {
   const messages = [
     {
       role: "system",
-      content: "你是儿童日记的事实覆盖校对老师。把遗漏事实自然合并进现有短日记，不能简单追加重复句，不能新增事实。相同活动的连续动作要合成一个事件；感受放在对应事件之后。只返回 JSON。"
+      content: "你是小学低年级儿童日记的唯一校对老师。一次同时修复事实遗漏、重复、主谓结构、时间顺序和连接词问题。不得新增或改变事实，不得把遗漏内容机械追加到文末。只返回 JSON。"
     },
     {
       role: "user",
       content: JSON.stringify({
         schema: { title: "短标题", sentences: [{ text: "一句日记", factTexts: ["实际使用的事实 text"] }] },
         rules: [
-          "所有 facts 都必须覆盖且每个事实只表达一次。",
+          "所有 facts 都必须覆盖且每个事实只表达一次；missing_facts 要合并回它真实发生的位置。",
           "每个独立句子必须有明确主语和谓语，优先使用孩子事实中的‘我、我们、爸爸、妈妈、老师、哥哥’作为主语；禁止写‘在公园玩了滑滑梯’这类缺主语句，应写‘我在公园玩了滑滑梯’。并列动作可以共用一次主语。",
           "爬上滑梯、从滑梯滑下等同一活动的连续阶段合并成一句或一个紧凑事件，不能拆成重复叙述。",
           "按时间和事件顺序组织：发生了什么、过程或结果、最后感受；感受不得放在对应事情之前。",
           "离开某地点、回家、吃晚饭或睡觉等收尾事件出现后，之前地点的活动绝不能再放到文章末尾。遗漏事实必须合并回它原本发生的位置。",
+          "一句主要表达一件事或一个连续动作，不能用逗号串联过多事件。",
+          "全文‘然后’最多一次，其余按真实先后使用‘接着、后来、最后’或直接分句。",
+          "优先保留孩子原话中的形容词、叠词和人物关系，不擅自替换成义词或添加华丽表达。",
           "忽略并禁止写入记不清、不确定、可能、猜测的内容。",
+          "factTexts 必须使用 facts 中完整的 text，列出该句使用的全部事实。",
           "保持儿童口吻，不写编辑说明，不添加原话没有的信息。"
         ],
         facts,
         missing_facts: missingFacts,
-        current_draft: draft,
-        original_utterances: input.utterances || []
-      })
-    }
-  ];
-  return callQwenJson(messages);
-}
-
-async function polishCompositionWithQwen(input, draft, facts) {
-  const messages = [
-    {
-      role: "system",
-      content: "你是小学低年级句子表达校对老师。只调整已有事实的句子结构、先后顺序和衔接，不新增任何事实。让孩子能从成文中学习完整的主谓宾句子，同时保留孩子自己的形容和口吻。只返回 JSON。"
-    },
-    {
-      role: "user",
-      content: JSON.stringify({
-        schema: { title: "短标题", sentences: [{ text: "完整句子", factTexts: ["实际使用的事实 text"] }] },
-        rules: [
-          "每个独立句子都要有明确主语和谓语，需要宾语的动作必须有宾语。地点或时间可以放句首，但后面仍必须出现主语，例如‘在公园里，我遇到了哥哥’。",
-          "按小学低年级句子表达组织正文：一句主要表达一件事或一个连续动作，句子过长时按事件边界断句，不能把许多事情只用逗号串成一整句。",
-          "同一主语的连续动作可以在一句中共享一次主语；换了人物或另起一句时必须重新写出主语，不能出现无主句和零散短语。",
-          "严格按孩子口述的时间顺序。公园活动全部放在离开公园或回家之前；回家、吃晚饭、洗澡、睡觉等收尾事件之后不能再出现白天或公园活动。",
-          "每个事实只表达一次。已经合并进句子的滑滑梯、荡秋千、比赛等活动不得在末尾再次补写。",
-          "优先原样保留孩子口述中的形容词和有特点的表达，不擅自替换成近义词；禁止新增原话没有的形容词、副词、天气、心情、评价、因果或华丽词语。",
-          "把重复口头禅改成自然衔接，全文‘然后’最多一次，可以按真实先后使用‘……之后、接着、后来、最后’。",
-          "factTexts 必须使用 facts 中的原始 text，列出该句覆盖的全部事实；不得只列一部分而导致系统误判遗漏。"
-        ],
-        facts,
         current_draft: draft,
         original_utterances: input.utterances || []
       })
@@ -881,27 +856,23 @@ async function composeWithQwen(input) {
   let result = await callQwenJson(messages);
   if (!Array.isArray(result.sentences)) result.sentences = [];
   result.sentences = dedupeCompositionSentences(result.sentences);
-  if (compositionPenalty(result) > 0) {
-    try {
-      const polished = await polishCompositionWithQwen(input, result, facts);
-      if (Array.isArray(polished.sentences)) polished.sentences = dedupeCompositionSentences(polished.sentences);
-      if (compositionPenalty(polished) < compositionPenalty(result)) result = polished;
-    } catch (error) {
-      console.error("Optional composition polish failed:", error.message);
-    }
-  }
-  let usedFactTexts = new Set(
+  const usedFactTexts = new Set(
     result.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : [])
   );
-  let missingFacts = facts.filter(fact => !factIsCovered(fact, usedFactTexts, result.sentences));
-  if (missingFacts.length) {
+  const missingFacts = facts.filter(fact => !factIsCovered(fact, usedFactTexts, result.sentences));
+  const initialPenalty = compositionPenalty(result);
+  if (initialPenalty > 0 || missingFacts.length) {
     try {
-      const repaired = await repairCompositionWithQwen(input, result, facts, missingFacts);
-      if (!Array.isArray(repaired.sentences)) repaired.sentences = [];
-      repaired.sentences = dedupeCompositionSentences(repaired.sentences);
-      if (repaired.sentences.length) result = repaired;
+      const refined = await refineCompositionWithQwen(input, result, facts, missingFacts);
+      if (!Array.isArray(refined.sentences)) refined.sentences = [];
+      refined.sentences = dedupeCompositionSentences(refined.sentences);
+      const refinedFactTexts = new Set(refined.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []));
+      const refinedMissingFacts = facts.filter(fact => !factIsCovered(fact, refinedFactTexts, refined.sentences));
+      const improvesCoverage = refinedMissingFacts.length < missingFacts.length;
+      const preservesCoverageAndImprovesWriting = refinedMissingFacts.length === missingFacts.length && compositionPenalty(refined) < initialPenalty;
+      if (refined.sentences.length && (improvesCoverage || preservesCoverageAndImprovesWriting)) result = refined;
     } catch (error) {
-      console.error("Optional composition repair failed:", error.message);
+      console.error("Optional composition refinement failed:", error.message);
     }
   }
   // 不再把模型认为遗漏的事实机械追加到文章末尾。机械追加会破坏时间顺序，
@@ -1625,8 +1596,14 @@ async function handleCompose(req, res) {
 }
 
 async function handleFinalize(req, res) {
+  const startedAt = Date.now();
   const input = await readJson(req);
   const result = await finalizeWithQwen(input);
+  console.log("Finalize completed", {
+    elapsedMs: Date.now() - startedAt,
+    inputFacts: Array.isArray(input.facts) ? input.facts.length : 0,
+    outputSentences: Array.isArray(result.sentences) ? result.sentences.length : 0
+  });
   sendJson(res, 200, { ...result, provider: qwenConfig().apiKey ? "qwen" : "local" });
 }
 
