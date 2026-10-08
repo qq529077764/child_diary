@@ -754,12 +754,23 @@ Page({
         }
       });
       if (!changed) throw new Error(result.message || "没有找到修改内容");
+      const lockedDiary = this.data.diarySentences.map(item => ({
+        id: item.id,
+        text: item.text,
+        factTexts: item.factTexts,
+        factIds: item.factIds
+      }));
+      const requiredFactIds = new Set(lockedDiary.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []));
+      for (const operation of appliedOperations) {
+        if (operation.type === "delete" && operation.target_fact_id) requiredFactIds.delete(operation.target_fact_id);
+        if (operation.type === "add" && operation.applied_fact_id) requiredFactIds.add(operation.applied_fact_id);
+      }
       const requiredFacts = this.facts
-        .filter(fact => fact.active !== false)
+        .filter(fact => fact.active !== false && requiredFactIds.has(fact.id))
         .map(fact => ({ id: fact.id, text: fact.text }));
       await this.composeDiary({
         lockedTitle: this.data.diaryTitle,
-        lockedDiary: this.data.diarySentences.map(item => ({ id: item.id, text: item.text, factTexts: item.factTexts, factIds: item.factIds })),
+        lockedDiary,
         revisionOperations: appliedOperations,
         revisionInstruction: this.revisionTranscript,
         requiredFacts
