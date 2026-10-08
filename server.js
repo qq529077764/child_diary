@@ -698,14 +698,12 @@ async function analyzeWithQwen(input) {
   return { facts, decision, speech_quality: quality, segment_role: segmentRole };
 }
 
-function factIsCovered(fact, usedFactTexts, sentences = []) {
-  if ([...usedFactTexts].some(text =>
-    text === fact.text || String(text).includes(fact.text) || fact.text.includes(String(text)) ||
-    semanticSimilarity(text, fact.text) >= 0.68
-  )) return true;
-  return sentences.some(sentence =>
-    semanticSimilarity(sentence.text, fact.text) >= 0.52 || hasDistinctSharedPhrase(sentence.text, fact.text)
-  );
+function factIsCovered(fact, usedFactTexts) {
+  const expected = normalizeSemanticText(fact?.text);
+  if (!expected) return false;
+  // factTexts 是成文器的事实账本。不再用整句相似度代替覆盖关系，
+  // 否则多个相近活动会被误判为“已经写过”。
+  return [...usedFactTexts].some(text => normalizeSemanticText(text) === expected);
 }
 
 function hasDistinctSharedPhrase(left, right) {
@@ -856,28 +854,41 @@ async function composeWithQwen(input) {
   let result = await callQwenJson(messages);
   if (!Array.isArray(result.sentences)) result.sentences = [];
   result.sentences = dedupeCompositionSentences(result.sentences);
-  const usedFactTexts = new Set(
-    result.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : [])
-  );
-  const missingFacts = facts.filter(fact => !factIsCovered(fact, usedFactTexts, result.sentences));
-  const initialPenalty = compositionPenalty(result);
-  if (initialPenalty > 0 || missingFacts.length) {
+  let currentPenalty = compositionPenalty(result);
+  let usedFactTexts = new Set(result.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []));
+  let missingFacts = facts.filter(fact => !factIsCovered(fact, usedFactTexts));
+  // 第一次同时校对表达与覆盖；如仍有遗漏，再允许一次专门补齐。
+  // 客户端为 finalize 预留 120 秒，不再用跳过覆盖校验换取速度。
+  for (let attempt = 0; attempt < 2 && (currentPenalty > 0 || missingFacts.length); attempt += 1) {
+    if (attempt > 0 && !missingFacts.length) break;
     try {
       const refined = await refineCompositionWithQwen(input, result, facts, missingFacts);
       if (!Array.isArray(refined.sentences)) refined.sentences = [];
       refined.sentences = dedupeCompositionSentences(refined.sentences);
       const refinedFactTexts = new Set(refined.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []));
-      const refinedMissingFacts = facts.filter(fact => !factIsCovered(fact, refinedFactTexts, refined.sentences));
+      const refinedMissingFacts = facts.filter(fact => !factIsCovered(fact, refinedFactTexts));
+      const refinedPenalty = compositionPenalty(refined);
       const improvesCoverage = refinedMissingFacts.length < missingFacts.length;
-      const preservesCoverageAndImprovesWriting = refinedMissingFacts.length === missingFacts.length && compositionPenalty(refined) < initialPenalty;
-      if (refined.sentences.length && (improvesCoverage || preservesCoverageAndImprovesWriting)) result = refined;
+      const preservesCoverageAndImprovesWriting = refinedMissingFacts.length === missingFacts.length && refinedPenalty < currentPenalty;
+      if (!refined.sentences.length || (!improvesCoverage && !preservesCoverageAndImprovesWriting)) break;
+      result = refined;
+      usedFactTexts = refinedFactTexts;
+      missingFacts = refinedMissingFacts;
+      currentPenalty = refinedPenalty;
     } catch (error) {
       console.error("Optional composition refinement failed:", error.message);
+      break;
     }
   }
   // 不再把模型认为遗漏的事实机械追加到文章末尾。机械追加会破坏时间顺序，
   // 也会把已经合并表达过的活动再次写一遍；遗漏只允许通过上面的整体重排修复。
   result.sentences = normalizeRepeatedThen(dedupeCompositionSentences(result.sentences));
+  console.log("Composition validated", {
+    factCount: facts.length,
+    coveredFactCount: facts.length - missingFacts.length,
+    missingFactCount: missingFacts.length,
+    sentenceCount: result.sentences.length
+  });
   return result;
 }
 
