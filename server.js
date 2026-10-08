@@ -1536,11 +1536,15 @@ async function handleRevise(req, res) {
   const input = await readJson(req);
   const result = await reviseWithQwen(input);
   const validIds = new Set((input.facts || []).map(fact => fact.id));
-  const rawOperations = Array.isArray(result.operations) ? [...result.operations] : [];
+  let rawOperations = Array.isArray(result.operations) ? [...result.operations] : [];
   const isSupplementalNarration = normalizeSemanticText(input.instruction || "").length >= 36;
   if (isSupplementalNarration) {
     try {
-      rawOperations.push(...await extractSupplementalRevisionOperations(input));
+      const supplementalOperations = await extractSupplementalRevisionOperations(input);
+      if (supplementalOperations.length) {
+        rawOperations = rawOperations.filter(operation => operation?.type !== "add");
+        rawOperations.push(...supplementalOperations);
+      }
     } catch (error) {
       console.error("Supplemental revision extraction failed:", error.message);
     }
