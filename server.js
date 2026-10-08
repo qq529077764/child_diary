@@ -1038,6 +1038,44 @@ async function reviseWithQwen(input) {
   return callQwenJson(messages);
 }
 
+async function extractSupplementalRevisionOperations(input) {
+  const messages = [
+    {
+      role: "system",
+      content: "你是儿童日记的续讲事实提取器。孩子正在已有日记后继续讲新的事情。逐段提取所有明确的新事件和感受，不重写旧日记，不把修改指令、家长提示、电视声或无意义语句当成事实。只返回 JSON。"
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        task: "从 supplemental_speech 中找出 existing_facts 和 diary 尚未记录的全部明确事实，每件不同事情单独返回一项。",
+        schema: { additions: [{ slot: "what|detail|feeling|result", label: "简短标签", text: "新增事实", quote: "口述中的原话片段" }] },
+        rules: [
+          "按口述顺序扫描到结尾，人物、地点、活动、结果和感受都不能只取前两项就停止。",
+          "text 保留孩子使用的人物关系、动作和形容词，但去掉嗯、然后然后等口头填充词。",
+          "quote 必须逐字出现在 supplemental_speech 中；无法找到原话依据的内容不得返回。",
+          "与 existing_facts 或 diary 已有内容相同、近似重复或只是换一种说法的内容不要返回。",
+          "一句家长追问、操作说明、要求继续说或与故事无关的背景声不要返回。",
+          "不要合并互不相同的事件，也不要添加孩子没有说过的原因、时间、地点或感受。"
+        ],
+        supplemental_speech: input.instruction || "",
+        existing_facts: input.facts || [],
+        diary: input.diary || []
+      })
+    }
+  ];
+  const result = await callQwenJson(messages);
+  return (Array.isArray(result.additions) ? result.additions : [])
+    .filter(item => item?.text && item?.quote && quoteAppearsInTranscript(item.quote, input.instruction || ""))
+    .map(item => ({
+      type: "add",
+      target_fact_id: "",
+      slot: ["what", "detail", "feeling", "result"].includes(item.slot) ? item.slot : "detail",
+      label: item.label || "语音补充",
+      new_text: item.text,
+      reason: "孩子在历史日记后继续讲出的新事实"
+    }));
+}
+
 function hasNegation(text) {
   return /(没有|没能|没去|没做|没看|没读|不是|不再|不会)/u.test(String(text || ""));
 }
@@ -1057,7 +1095,7 @@ function normalizeRevisionOperations(input, operations) {
   const facts = Array.isArray(input.facts) ? input.facts : [];
   const instruction = String(input.instruction || "");
   const compactInstruction = normalizeSemanticText(instruction);
-  const isLongNarration = compactInstruction.length >= 80;
+  const isLongNarration = compactInstruction.length >= 36;
   const hasDeleteCue = /(删掉|删除|去掉|不要写|别写|我(没有|没)说|这句不对|不是)/u.test(instruction);
   const normalized = [...operations];
   for (let index = 0; index < normalized.length; index += 1) {
@@ -1124,6 +1162,49 @@ function normalizeRevisionOperations(input, operations) {
     safe.push(operation);
   }
   return safe;
+}
+
+function fallbackRevisionOperations(input) {
+  const instruction = String(input.instruction || "").trim();
+  const facts = (input.facts || []).filter(fact => fact?.id && fact?.text);
+  const clean = value => String(value || "")
+    .replace(/^[“”'"，,。；;：:\s]+|[“”'"，,。；;：:\s]+$/gu, "")
+    .replace(/^(?:这句|这一句|文章里|日记里)/u, "")
+    .trim();
+  const findTarget = fragment => {
+    const targetText = clean(fragment);
+    if (!targetText) return null;
+    const direct = facts.find(fact => fact.text.includes(targetText) || targetText.includes(fact.text));
+    if (direct) return direct;
+    return facts
+      .map(fact => ({ fact, score: semanticSimilarity(fact.text, targetText) }))
+      .filter(item => item.score >= 0.52)
+      .sort((left, right) => right.score - left.score)[0]?.fact || null;
+  };
+
+  const correction = /不是(.{1,100}?)[，,。；;\s]*(?:而是|应该是|是)(.{1,140})/u.exec(instruction) ||
+    /把(.{1,100}?)(?:改成|改为|换成|换为)(.{1,140})/u.exec(instruction);
+  if (correction) {
+    const target = findTarget(correction[1]);
+    const newText = clean(correction[2]);
+    if (target && newText) {
+      return [{ type: "replace", target_fact_id: target.id, slot: target.slot || "detail", label: target.label || "语音修改", new_text: newText, reason: "按孩子明确说出的替换指令修改" }];
+    }
+  }
+
+  const deletion = /(?:把)?(.{1,120}?)(?:删掉|删除|去掉|不要写)/u.exec(instruction) ||
+    /(?:删掉|删除|去掉|不要写)(.{1,120})/u.exec(instruction);
+  if (deletion) {
+    const target = findTarget(deletion[1]);
+    if (target) return [{ type: "delete", target_fact_id: target.id, slot: target.slot || "detail", label: target.label || "语音修改", new_text: "", reason: "按孩子明确说出的删除指令修改" }];
+  }
+
+  const addition = /(?:加上|补充|还要写|还要加上)(.{1,160})/u.exec(instruction);
+  const newText = clean(addition?.[1]);
+  if (newText && !facts.some(fact => semanticSimilarity(fact.text, newText) >= 0.78)) {
+    return [{ type: "add", target_fact_id: "", slot: "detail", label: "语音补充", new_text: newText, reason: "按孩子明确说出的补充指令增加" }];
+  }
+  return [];
 }
 
 function dedupeRevisedSentences(sentences) {
@@ -1451,16 +1532,26 @@ async function handleRevise(req, res) {
   const input = await readJson(req);
   const result = await reviseWithQwen(input);
   const validIds = new Set((input.facts || []).map(fact => fact.id));
-  const normalizedOperations = normalizeRevisionOperations(input, Array.isArray(result.operations) ? result.operations : []);
+  const rawOperations = Array.isArray(result.operations) ? [...result.operations] : [];
+  const isSupplementalNarration = normalizeSemanticText(input.instruction || "").length >= 36;
+  if (isSupplementalNarration) {
+    try {
+      rawOperations.push(...await extractSupplementalRevisionOperations(input));
+    } catch (error) {
+      console.error("Supplemental revision extraction failed:", error.message);
+    }
+  }
+  let normalizedOperations = normalizeRevisionOperations(input, rawOperations);
+  if (!normalizedOperations.length) normalizedOperations = normalizeRevisionOperations(input, fallbackRevisionOperations(input));
   const operations = normalizedOperations.filter(operation => {
     if (!["replace", "delete", "add"].includes(operation?.type)) return false;
-    if (operation.type === "add") return Boolean(operation.new_text && operation.slot);
+    if (operation.type === "add") return Boolean(operation.new_text);
     if (!validIds.has(operation.target_fact_id)) return false;
     return operation.type === "delete" || Boolean(operation.new_text);
   });
   sendJson(res, 200, {
     operations,
-    revisionMode: normalizeSemanticText(input.instruction || "").length >= 80 ? "supplemental_narration" : "targeted_edit",
+    revisionMode: isSupplementalNarration ? "supplemental_narration" : "targeted_edit",
     message: result.message || "",
     provider: qwenConfig().apiKey ? "qwen" : "local"
   });

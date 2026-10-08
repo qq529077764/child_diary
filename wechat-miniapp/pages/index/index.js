@@ -743,13 +743,8 @@ Page({
   async finishRevision() {
     if (!this.revisionTranscript) { this.finalizeStarted = false; this.setData({ isFinishing: false, revisionDisplay: "刚才没有听清，请再说一次。" }); return; }
     try {
-      const diaryFactIds = new Set(this.data.diarySentences.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []));
-      const diaryFactTexts = this.data.diarySentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []);
-      const allActiveFacts = this.facts.filter(fact => fact.active !== false);
-      const linkedFacts = allActiveFacts.filter(fact =>
-        diaryFactIds.has(fact.id) || diaryFactTexts.some(text => text === fact.text || text.includes(fact.text) || fact.text.includes(text))
-      );
-      const activeFacts = linkedFacts.length ? linkedFacts : allActiveFacts;
+      // 旧版历史日记的句子与事实关联可能不完整，修改时必须提供该篇保存的全部有效事实。
+      const activeFacts = this.facts.filter(fact => fact.active !== false);
       const result = await this.request("/api/revise", { instruction: this.revisionTranscript, facts: activeFacts, diary: this.data.diarySentences.map(item => item.text) });
       let changed = 0;
       const appliedOperations = [];

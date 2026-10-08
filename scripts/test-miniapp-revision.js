@@ -86,6 +86,32 @@ async function run() {
   assert.equal(composeOptions.lockedDiary[0].text, "我去了公园。", "未涉及句子必须锁定");
   assert.equal(composeOptions.revisionOperations[0].old_text, "很开心", "局部成文必须知道被替换的旧事实");
 
+  const supplementalPage = createPage();
+  supplementalPage.data.phase = "revise";
+  supplementalPage.data.diaryTitle = "公园日记";
+  supplementalPage.data.diarySentences = structuredClone(revisionPage.data.diarySentences);
+  supplementalPage.facts = structuredClone(facts);
+  supplementalPage.revisionTranscript = "后来我和哥哥玩了滑滑梯，我们还一起开了粉色的小汽车，回家前我看见了很多小鸟，我特别开心。";
+  supplementalPage.revisionBaseSnapshot = {
+    title: supplementalPage.data.diaryTitle,
+    sentences: structuredClone(supplementalPage.data.diarySentences),
+    facts: structuredClone(supplementalPage.facts)
+  };
+  supplementalPage.request = async () => ({
+    revisionMode: "supplemental_narration",
+    operations: [
+      { type: "add", slot: "what", label: "新活动", new_text: "和哥哥玩了滑滑梯" },
+      { type: "add", slot: "detail", label: "新活动", new_text: "一起开了粉色的小汽车" },
+      { type: "add", slot: "detail", label: "看到", new_text: "回家前看见了很多小鸟" },
+      { type: "add", slot: "feeling", label: "感受", new_text: "特别开心" }
+    ]
+  });
+  let supplementalCompose;
+  supplementalPage.composeDiary = async options => { supplementalCompose = options; };
+  await supplementalPage.finishRevision();
+  assert.equal(supplementalCompose.revisionOperations.length, 4, "长段续讲中的多个新事实必须全部进入局部成文");
+  assert.equal(supplementalPage.facts.filter(fact => fact.id.startsWith("rev_")).length, 4, "长段续讲不能只保留前两项事实");
+
   const unclearPage = createPage();
   unclearPage.data.phase = "revise";
   unclearPage.data.diarySentences = restored.sentences;
