@@ -12,6 +12,7 @@ Page({
     phase: "home",
     isRecording: false,
     isFinishing: false,
+    isSaving: false,
     statusTitle: "正在听你说",
     statusHint: "一直说就好，小耳朵会边听边问。",
     latestText: "",
@@ -78,7 +79,7 @@ Page({
     this.revisionBaseSnapshot = null;
     this.transcriptAnchorSequence = 0;
     this.feedAnchorSequence = 0;
-    this.setData({ isRecording: false, isFinishing: false, bubbles: [], factChips: [], latestText: "", revisionDisplay: "", transcriptAnchorId: "transcript_end_0", feedAnchorId: "feed_end_0" });
+    this.setData({ isRecording: false, isFinishing: false, isSaving: false, bubbles: [], factChips: [], latestText: "", revisionDisplay: "", transcriptAnchorId: "transcript_end_0", feedAnchorId: "feed_end_0" });
   },
 
   readDiaryHistory() {
@@ -613,6 +614,8 @@ Page({
   },
 
   async saveDiary() {
+    if (this.data.isSaving) return;
+    this.setData({ isSaving: true });
     const savedAt = Date.now();
     const record = {
       id: `diary_${savedAt}`,
@@ -628,17 +631,18 @@ Page({
       wx.setStorageSync(DIARY_HISTORY_KEY, history);
       wx.setStorageSync(LATEST_DIARY_KEY, record);
       this.loadDiaryHistory();
+      this.setData({ phase: "success" });
       try {
         await this.ensureCloudSession();
         await this.rawRequest("/api/diaries", "POST", record);
         await this.refreshCloudHistory();
-        this.setData({ phase: "success" });
       } catch (error) {
-        this.setData({ phase: "success" });
         wx.showModal({ title: "手机已保存", content: "云端暂时没有同步，下次打开会自动重试。", showCancel: false });
       }
     } catch (error) {
       wx.showModal({ title: "还没有保存成功", content: "手机存储空间不足，请清理后再试。", showCancel: false });
+    } finally {
+      this.setData({ isSaving: false });
     }
   },
 

@@ -73,7 +73,7 @@
       <view class="source" wx:for="{{diarySentences}}" wx:key="index"><text class="source-sentence">{{item.text}}</text><text class="source-detail">{{item.sourceText}}</text></view>
       <view class="pass">事实校验通过：每句话都来自孩子说过的内容。</view>
     </scroll-view>
-    <view class="actions"><button class="button green" bindtap="saveDiary">就是这样</button><button class="button soft" bindtap="startRevision">我想改一下</button></view>
+    <view class="actions"><button class="button green" disabled="{{isSaving}}" bindtap="saveDiary">{{isSaving ? '正在保存' : '就是这样'}}</button><button class="button soft" disabled="{{isSaving}}" bindtap="startRevision">我想改一下</button></view>
   </view>
 
   <view wx:elif="{{phase === 'revise'}}" class="screen revise-screen">
