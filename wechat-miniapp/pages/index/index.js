@@ -5,7 +5,6 @@ const DIARY_HISTORY_KEY = "diaryHistory";
 const LATEST_DIARY_KEY = "latestDiary";
 const CLOUD_TOKEN_KEY = "cloudSessionToken";
 const INSTALLATION_ID_KEY = "installationId";
-const PENDING_REVISION_KEY = "pendingDiaryRevision";
 
 Page({
   data: {
@@ -28,6 +27,8 @@ Page({
   },
 
   onLoad() {
+    // 旧版曾写入但从未安全恢复的修改草稿，升级后一次性清理。
+    try { wx.removeStorageSync("pendingDiaryRevision"); } catch (error) {}
     this.recorder = wx.getRecorderManager();
     this.recorder.onStart(() => {
       this.segmentActive = true;
@@ -76,7 +77,6 @@ Page({
     this.analysisPending = false;
     this.analysisPromise = null;
     this.latestSegmentText = "";
-    this.firstDiarySnapshot = null;
     this.revisionBaseSnapshot = null;
     this.editingDiaryId = null;
     this.editingDiarySavedAt = null;
@@ -288,7 +288,6 @@ Page({
           this.uploads = [];
           this.finalizeStarted = false;
           this.revisionBaseSnapshot = null;
-          try { wx.removeStorageSync(PENDING_REVISION_KEY); } catch (error) {}
           return;
         }
         this.resetRuntime();
@@ -305,7 +304,6 @@ Page({
     this.transcript = String(diary.transcript || "");
     this.utterances = this.transcript ? [this.transcript] : [];
     this.facts = JSON.parse(JSON.stringify(diary.facts || [])).map(fact => ({ ...fact, active: fact.active !== false }));
-    this.firstDiarySnapshot = { title: diary.title || "我的日记", sentences: JSON.parse(JSON.stringify(sentences)) };
     this.editingDiaryId = diary.id;
     this.editingDiarySavedAt = diary.savedAt;
     this.setData({
@@ -423,10 +421,6 @@ Page({
       this.uploads = [];
       this.finalizeStarted = false;
       this.setData({ revisionDisplay: "" });
-      try {
-        const pending = wx.getStorageSync(PENDING_REVISION_KEY) || {};
-        wx.setStorageSync(PENDING_REVISION_KEY, { ...pending, instruction: "", updatedAt: Date.now() });
-      } catch (error) {}
     }
     this.setData({ statusTitle: "正在打开麦克风", statusHint: "请在微信提示中允许录音。" });
     this.startRecorder(this.segmentKind || "story");
@@ -515,10 +509,6 @@ Page({
   acceptTranscript(text, kind) {
     if (kind === "revision") {
       this.revisionTranscript = this.appendText(this.revisionTranscript, text);
-      try {
-        const pending = wx.getStorageSync(PENDING_REVISION_KEY) || {};
-        wx.setStorageSync(PENDING_REVISION_KEY, { ...pending, instruction: this.revisionTranscript, updatedAt: Date.now() });
-      } catch (error) {}
       this.setData({ revisionDisplay: `我听到：${this.tail(this.revisionTranscript, 72)}` });
       return;
     }
@@ -647,7 +637,7 @@ Page({
         this.setData({ factChips: this.facts.filter(fact => fact.active !== false) });
       }
       this.mergeFacts(data.facts || []);
-      this.applyDiaryResponse(data, true);
+      this.applyDiaryResponse(data);
     } catch (error) {
       this.finalizeStarted = false;
       this.setData({ isFinishing: false, statusTitle: "整理暂时失败", statusHint: error.message || "请稍后再试。" });
@@ -661,11 +651,11 @@ Page({
       utterances: this.utterances,
       ...options
     });
-    this.applyDiaryResponse(data, false);
+    this.applyDiaryResponse(data);
     return data;
   },
 
-  applyDiaryResponse(data, lockFirstVersion) {
+  applyDiaryResponse(data) {
     const sentences = (data.sentences || []).map(sentence => ({
       id: sentence.id || `sentence_${Date.now()}_${Math.random()}`,
       text: sentence.text,
@@ -675,9 +665,6 @@ Page({
         .map(fact => fact.id),
       sourceText: (sentence.factTexts || []).join("；")
     }));
-    if (lockFirstVersion && !this.firstDiarySnapshot) {
-      this.firstDiarySnapshot = { title: data.title || "我的日记", sentences: JSON.parse(JSON.stringify(sentences)) };
-    }
     this.setData({ phase: "diary", isFinishing: false, diaryTitle: data.title || "我的日记", diarySentences: sentences });
   },
 
@@ -721,9 +708,6 @@ Page({
       sentences: JSON.parse(JSON.stringify(this.data.diarySentences)),
       facts: JSON.parse(JSON.stringify(this.facts))
     };
-    try {
-      wx.setStorageSync(PENDING_REVISION_KEY, { ...this.revisionBaseSnapshot, instruction: "", createdAt: Date.now() });
-    } catch (error) {}
     this.setData({ phase: "revise", revisionDisplay: "", isFinishing: false });
     await this.startRecorder("revision");
   },
@@ -787,7 +771,6 @@ Page({
         revisionInstruction: this.revisionTranscript
       });
       this.revisionBaseSnapshot = null;
-      try { wx.removeStorageSync(PENDING_REVISION_KEY); } catch (error) {}
     } catch (error) {
       if (this.revisionBaseSnapshot) {
         this.facts = JSON.parse(JSON.stringify(this.revisionBaseSnapshot.facts));

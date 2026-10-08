@@ -100,10 +100,10 @@ async function run() {
   supplementalPage.request = async () => ({
     revisionMode: "supplemental_narration",
     operations: [
-      { type: "add", slot: "what", label: "新活动", new_text: "和哥哥玩了滑滑梯" },
-      { type: "add", slot: "detail", label: "新活动", new_text: "一起开了粉色的小汽车" },
-      { type: "add", slot: "detail", label: "看到", new_text: "回家前看见了很多小鸟" },
-      { type: "add", slot: "feeling", label: "感受", new_text: "特别开心" }
+      { type: "add", slot: "what", label: "新活动", new_text: "和哥哥玩了滑滑梯", anchor_fact_id: "f1", placement: "after" },
+      { type: "add", slot: "detail", label: "新活动", new_text: "一起开了粉色的小汽车", anchor_fact_id: "f1", placement: "after" },
+      { type: "add", slot: "detail", label: "看到", new_text: "回家前看见了很多小鸟", anchor_fact_id: "f2", placement: "before" },
+      { type: "add", slot: "feeling", label: "感受", new_text: "特别开心", anchor_fact_id: "f2", placement: "merge" }
     ]
   });
   let supplementalCompose;
@@ -111,6 +111,11 @@ async function run() {
   await supplementalPage.finishRevision();
   assert.equal(supplementalCompose.revisionOperations.length, 4, "长段续讲中的多个新事实必须全部进入局部成文");
   assert.equal(supplementalPage.facts.filter(fact => fact.id.startsWith("rev_")).length, 4, "长段续讲不能只保留前两项事实");
+  assert.deepEqual(
+    supplementalCompose.revisionOperations.map(operation => [operation.anchor_fact_id, operation.placement]),
+    [["f1", "after"], ["f1", "after"], ["f2", "before"], ["f2", "merge"]],
+    "客户端必须把事实锚点和插入位置原样交给局部成文器"
+  );
 
   const unclearPage = createPage();
   unclearPage.data.phase = "revise";

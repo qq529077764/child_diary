@@ -1010,6 +1010,7 @@ async function reviseWithQwen(input) {
             type: "replace|delete|add",
             target_fact_id: "replace/delete 必须填写现有事实 id；add 为空",
             anchor_fact_id: "add 若是对已有事件的补充，填写最相关的现有事实 id；独立新事件为空",
+            placement: "add 使用 merge|before|after|independent；其他操作为空",
             slot: "what|detail|feeling|result",
             label: "简短中文标签",
             new_text: "replace/add 后的完整事实；delete 为空",
@@ -1026,7 +1027,8 @@ async function reviseWithQwen(input) {
           "replace/delete 的 target_fact_id 必须来自 facts，禁止编造 id。",
           "孩子重新讲了一大段故事时，没再提到的旧事实不等于要删除；只把新信息作为 add，对明确纠正的同一事实作为 replace。",
           "已经出现在 facts 或 diary 中的人物、地点、活动和句子不得再返回 add；即使孩子在修改时又讲了一遍，也只视为原事实的重述。",
-          "add 若补充同一人物、地点或活动的细节，必须填写 anchor_fact_id，让系统合并到原句；只有独立的新事件才留空。",
+          "add 若补充同一事件内部的细节、结果或感受，填写 anchor_fact_id 且 placement=merge。",
+          "add 若由‘之前、以前、之后、后来’等引入相邻事件，填写 anchor_fact_id 且 placement=before 或 after。独立新事件使用 independent。",
           "只有 instruction 明确说‘删掉’‘不要写’‘我没说’或‘不是……’时才能 delete；绝不能为了用新故事取代旧故事而批量 delete。",
           "不能确定目标事实时 operations 返回空数组，不得凭相似词强行修改。",
           "不要把指令措辞写进日记事实，只保留修改后的事实内容。"
@@ -1050,13 +1052,13 @@ async function extractSupplementalRevisionOperations(input) {
       role: "user",
       content: JSON.stringify({
         task: "从 supplemental_speech 中找出 existing_facts 和 diary 尚未记录的全部明确事实，每件不同事情单独返回一项。",
-        schema: { additions: [{ slot: "what|detail|feeling|result", label: "简短标签", text: "新增事实", quote: "口述中的原话片段", anchor_fact_id: "与已有事件直接相关时填写 existing_facts id，否则为空" }] },
+        schema: { additions: [{ slot: "what|detail|feeling|result", label: "简短标签", text: "新增事实", quote: "口述中的原话片段", anchor_fact_id: "相关 existing_facts id 或空", placement: "merge|before|after|independent" }] },
         rules: [
           "按口述顺序扫描到结尾，人物、地点、活动、结果和感受都不能只取前两项就停止。",
           "text 保留孩子使用的人物关系、动作和形容词，但去掉嗯、然后然后等口头填充词。",
           "quote 必须逐字出现在 supplemental_speech 中；无法找到原话依据的内容不得返回。",
           "与 existing_facts 或 diary 已有内容相同、近似重复或只是换一种说法的内容不要返回。",
-          "新增内容若是已有事件的细节、结果或感受，填写最相关的 anchor_fact_id；独立的新事件才留空。",
+          "同一事件内部补充使用 merge；‘回家前’等发生在锚点事件前的内容用 before；‘之后、后来’用 after；无关系才用 independent。",
           "一句家长追问、操作说明、要求继续说或与故事无关的背景声不要返回。",
           "不要合并互不相同的事件，也不要添加孩子没有说过的原因、时间、地点或感受。"
         ],
@@ -1091,6 +1093,7 @@ async function extractSupplementalRevisionOperations(input) {
         label: item.label || "语音补充",
         new_text: newText,
         anchor_fact_id: (input.facts || []).some(fact => fact.id === item.anchor_fact_id) ? item.anchor_fact_id : "",
+        placement: ["merge", "before", "after", "independent"].includes(item.placement) ? item.placement : "independent",
         reason: "孩子在历史日记后继续讲出的新事实"
       }));
 }
@@ -1146,6 +1149,15 @@ function normalizeRevisionOperations(input, operations) {
     }
   }
   const safe = [];
+  const normalizeAddPlacement = operation => {
+    const anchorExists = facts.some(fact => fact.id === operation.anchor_fact_id);
+    const anchorFactId = anchorExists ? operation.anchor_fact_id : "";
+    let placement = ["merge", "before", "after", "independent"].includes(operation.placement)
+      ? operation.placement
+      : anchorFactId ? "merge" : "independent";
+    if (!anchorFactId && placement !== "independent") placement = "independent";
+    return { ...operation, target_fact_id: "", anchor_fact_id: anchorFactId, placement };
+  };
   for (const operation of normalized) {
     if (!operation || !["replace", "delete", "add"].includes(operation.type)) continue;
     const target = facts.find(fact => fact.id === operation.target_fact_id);
@@ -1159,30 +1171,31 @@ function normalizeRevisionOperations(input, operations) {
         sharesSpecificBigram(instruction, target.text) ||
         semanticSimilarity(target.text, operation.new_text) >= 0.45;
       if (!related || (isLongNarration && !correctionCue && !sharesSpecificBigram(instruction, target.text))) {
-        safe.push({ ...operation, type: "add", target_fact_id: "" });
+        safe.push(normalizeAddPlacement({ ...operation, type: "add", target_fact_id: "" }));
         continue;
       }
     }
-    if (operation.type === "add") {
+    const safeOperation = operation.type === "add" ? normalizeAddPlacement(operation) : operation;
+    if (safeOperation.type === "add") {
       const duplicatesExisting = facts.some(fact =>
-        normalizeSemanticText(fact.text) === normalizeSemanticText(operation.new_text) ||
-        normalizeSemanticText(fact.text).includes(normalizeSemanticText(operation.new_text)) ||
-        normalizeSemanticText(operation.new_text).includes(normalizeSemanticText(fact.text)) ||
-        semanticSimilarity(fact.text, operation.new_text) >= 0.55
+        normalizeSemanticText(fact.text) === normalizeSemanticText(safeOperation.new_text) ||
+        normalizeSemanticText(fact.text).includes(normalizeSemanticText(safeOperation.new_text)) ||
+        normalizeSemanticText(safeOperation.new_text).includes(normalizeSemanticText(fact.text)) ||
+        semanticSimilarity(fact.text, safeOperation.new_text) >= 0.55
       );
       if (duplicatesExisting) continue;
     }
     const duplicatesOperation = safe.some(existing => {
-      if (existing.type !== operation.type) return false;
-      if (operation.type !== "add" && existing.target_fact_id !== operation.target_fact_id) return false;
-      if (!existing.new_text && !operation.new_text) return true;
-      return normalizeSemanticText(existing.new_text) === normalizeSemanticText(operation.new_text) ||
-        normalizeSemanticText(existing.new_text).includes(normalizeSemanticText(operation.new_text)) ||
-        normalizeSemanticText(operation.new_text).includes(normalizeSemanticText(existing.new_text)) ||
-        semanticSimilarity(existing.new_text, operation.new_text) >= (operation.type === "add" ? 0.76 : 0.86);
+      if (existing.type !== safeOperation.type) return false;
+      if (safeOperation.type !== "add" && existing.target_fact_id !== safeOperation.target_fact_id) return false;
+      if (!existing.new_text && !safeOperation.new_text) return true;
+      return normalizeSemanticText(existing.new_text) === normalizeSemanticText(safeOperation.new_text) ||
+        normalizeSemanticText(existing.new_text).includes(normalizeSemanticText(safeOperation.new_text)) ||
+        normalizeSemanticText(safeOperation.new_text).includes(normalizeSemanticText(existing.new_text)) ||
+        semanticSimilarity(existing.new_text, safeOperation.new_text) >= (safeOperation.type === "add" ? 0.76 : 0.86);
     });
     if (duplicatesOperation) continue;
-    safe.push(operation);
+    safe.push(safeOperation);
   }
   return safe;
 }
@@ -1225,7 +1238,7 @@ function fallbackRevisionOperations(input) {
   const addition = /(?:加上|补充|还要写|还要加上)(.{1,160})/u.exec(instruction);
   const newText = clean(addition?.[1]);
   if (newText && !facts.some(fact => semanticSimilarity(fact.text, newText) >= 0.78)) {
-    return [{ type: "add", target_fact_id: "", slot: "detail", label: "语音补充", new_text: newText, reason: "按孩子明确说出的补充指令增加" }];
+    return [{ type: "add", target_fact_id: "", anchor_fact_id: "", placement: "independent", slot: "detail", label: "语音补充", new_text: newText, reason: "按孩子明确说出的补充指令增加" }];
   }
   return [];
 }
@@ -1256,8 +1269,12 @@ function dedupeRevisedSentences(sentences) {
 
 function sentenceMatchesRevision(sentence, operation, originalFact, anchorFact) {
   if (operation.target_fact_id && (sentence.factIds || []).includes(operation.target_fact_id)) return true;
-  if (operation.anchor_fact_id && (sentence.factIds || []).includes(operation.anchor_fact_id)) return true;
-  const candidates = [operation.old_text, originalFact?.text, anchorFact?.text].filter(Boolean);
+  if (operation.type === "add" && operation.placement === "merge" && operation.anchor_fact_id && (sentence.factIds || []).includes(operation.anchor_fact_id)) return true;
+  const candidates = [
+    operation.old_text,
+    originalFact?.text,
+    operation.type === "add" && operation.placement === "merge" ? anchorFact?.text : ""
+  ].filter(Boolean);
   return candidates.some(text =>
     String(sentence.text || "").includes(text) ||
     (sentence.factTexts || []).some(source => semanticSimilarity(source, text) >= 0.58)
@@ -1306,7 +1323,7 @@ async function reviseLockedCompositionWithQwen(input) {
   );
   const affectedSentences = lockedDiary.filter(sentence => operationsForSentence(sentence).length > 0);
   const addedFacts = operations
-    .filter(operation => operation.type === "add" && operation.applied_fact_id && !operation.anchor_fact_id)
+    .filter(operation => operation.type === "add" && operation.applied_fact_id && !(operation.anchor_fact_id && operation.placement === "merge"))
     .map(operation => factById.get(operation.applied_fact_id))
     .filter(Boolean);
   const messages = [
@@ -1319,13 +1336,14 @@ async function reviseLockedCompositionWithQwen(input) {
       content: JSON.stringify({
         schema: {
           changes: [{ sentenceId: "受影响的原句 id", text: "修改后完整句子", factTexts: ["本句使用的有效事实 text"] }],
-          additions: [{ afterSentenceId: "应插入到哪一句之后；没有上下文关系时为空", text: "新增事实组成的完整句子", factTexts: ["新增事实 text"] }]
+          additions: [{ anchorSentenceId: "相关原句 id 或空", position: "before|after|end", text: "新增事实组成的完整句子", factTexts: ["新增事实 text"] }]
         },
         rules: [
           "changes 只能使用 affected_sentences 中的 sentenceId。",
           "replace 要在原句位置替换错误信息；delete 只删除目标事实，保留该句里其他事实。",
           "未受影响的句子不返回，系统会原样保留。",
-          "有 anchor_fact_id 的 add 必须合并进对应 affected_sentence；独立新增事件按时间和语境填写 afterSentenceId。",
+          "placement=merge 的 add 必须合并进对应 affected_sentence。before/after 按 operation 的 anchor_fact_id 找到原句并设置位置。",
+          "独立新增事件按时间和语境选择相邻原句；无法判断时 position=end。",
           "每个修改后句子要有主语和谓语，不重复动作，不新增事实。",
           "factTexts 只能使用 active_facts 里完整的 text。"
         ],
@@ -1382,41 +1400,64 @@ async function reviseLockedCompositionWithQwen(input) {
     .sort((left, right) => right.matchingFacts.length - left.matchingFacts.length);
   const coveredAddedFactIds = new Set();
   const generatedAdditionSentences = [];
+  const placementForFact = fact => {
+    const operation = operations.find(item => item.type === "add" && item.applied_fact_id === fact.id);
+    const anchorSentence = operation?.anchor_fact_id
+      ? lockedDiary.find(sentence => (sentence.factIds || []).includes(operation.anchor_fact_id))
+      : null;
+    return {
+      anchorSentenceId: anchorSentence?.id || "",
+      position: ["before", "after"].includes(operation?.placement) ? operation.placement : ""
+    };
+  };
   for (const addition of additions) {
     const uncoveredFacts = addition.matchingFacts.filter(fact => !coveredAddedFactIds.has(fact.id));
     if (!uncoveredFacts.length) continue;
     const allFactsAreUncovered = addition.matchingFacts.every(fact => !coveredAddedFactIds.has(fact.id));
     if (!allFactsAreUncovered) continue;
+    const factPlacements = addition.matchingFacts.map(placementForFact);
+    const operationPlacement = factPlacements[0];
+    const hasMixedPlacement = factPlacements.some(placement =>
+      placement.anchorSentenceId !== operationPlacement.anchorSentenceId || placement.position !== operationPlacement.position
+    );
+    if (hasMixedPlacement) continue;
+    const anchorSentenceId = operationPlacement.anchorSentenceId || (lockedDiary.some(sentence => sentence.id === addition.anchorSentenceId) ? addition.anchorSentenceId : "");
+    const position = operationPlacement.position || (["before", "after", "end"].includes(addition.position) ? addition.position : "end");
     generatedAdditionSentences.push({
       id: `sentence_added_${Date.now()}_${revised.length + generatedAdditionSentences.length}`,
       text: addition.text,
       factTexts: addition.matchingFacts.map(fact => fact.text),
       factIds: addition.matchingFacts.map(fact => fact.id),
-      afterSentenceId: lockedDiary.some(sentence => sentence.id === addition.afterSentenceId) ? addition.afterSentenceId : ""
+      anchorSentenceId,
+      position
     });
     addition.matchingFacts.forEach(fact => coveredAddedFactIds.add(fact.id));
   }
   for (const fact of addedFacts) {
     if (coveredAddedFactIds.has(fact.id)) continue;
+    const placement = placementForFact(fact);
     generatedAdditionSentences.push({
       id: `sentence_added_${Date.now()}_${revised.length + generatedAdditionSentences.length}`,
       text: `${fact.text}。`,
       factTexts: [fact.text],
       factIds: [fact.id],
-      afterSentenceId: ""
+      ...placement,
+      position: placement.position || "end"
     });
   }
-  const additionsBySentence = new Map();
+  const additionsBeforeSentence = new Map();
+  const additionsAfterSentence = new Map();
   const trailingAdditions = [];
   for (const addition of generatedAdditionSentences) {
-    const { afterSentenceId, ...sentence } = addition;
-    if (!afterSentenceId) { trailingAdditions.push(sentence); continue; }
-    if (!additionsBySentence.has(afterSentenceId)) additionsBySentence.set(afterSentenceId, []);
-    additionsBySentence.get(afterSentenceId).push(sentence);
+    const { anchorSentenceId, position, ...sentence } = addition;
+    if (!anchorSentenceId || position === "end") { trailingAdditions.push(sentence); continue; }
+    const target = position === "before" ? additionsBeforeSentence : additionsAfterSentence;
+    if (!target.has(anchorSentenceId)) target.set(anchorSentenceId, []);
+    target.get(anchorSentenceId).push(sentence);
   }
   const orderedSentences = [];
   for (const sentence of revised) {
-    orderedSentences.push(sentence, ...(additionsBySentence.get(sentence.id) || []));
+    orderedSentences.push(...(additionsBeforeSentence.get(sentence.id) || []), sentence, ...(additionsAfterSentence.get(sentence.id) || []));
   }
   orderedSentences.push(...trailingAdditions);
   let title = input.lockedTitle || "我的日记";
