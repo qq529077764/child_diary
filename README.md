@@ -11,6 +11,7 @@
 - `wechat-miniapp/`：原生微信小程序源码
 - `server.js`：腾讯 ASR 与通义千问接口服务
 - `mvp-product-spec.md`：当前 MVP 产品与开发说明书
+- `regression-cases/`：与生产逻辑隔离的匿名回归案例库
 - `.env.example`：后端配置模板
 
 仓库已移除旧网页版原型、未引用图片、演示事实规则和未启用的模型兼容层，只保留当前小程序实际使用的链路。
@@ -43,6 +44,14 @@ http://127.0.0.1:5178/health
 ```bash
 node scripts/test-miniapp-revision.js
 ```
+
+正式提示词通用性检查：
+
+```bash
+node scripts/test-prompt-generality.js
+```
+
+生产提示词不得叠加单次测试的人名、地点、活动或原句。测试问题先记录到案例库，确认属于可复现的共性或违反核心事实约束后，再抽象为通用规则。
 
 当前测试 AppID 已写入 `project.config.json`。正式发布前必须改用 HTTPS 服务，并在小程序后台配置合法域名。
 

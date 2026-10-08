@@ -1,0 +1,52 @@
+[
+  {
+    "id": "case-orphan-claim-001",
+    "capturedAt": "2026-10-08",
+    "stage": "first_draft",
+    "status": "generalized",
+    "minimalInput": "原始转写中专有名称被截断，事实池没有对应事实，但正文写入了截断名称。",
+    "symptom": "正文出现没有 factTexts 来源的内容，后续语音修改无法定位。",
+    "invariant": "正文只能使用审核后的事实池，每一句都必须可追溯。",
+    "generalRule": "第一版和校对模型只接收有效事实及其对应的孩子原话片段，不接收未经审核的整段录音。"
+  },
+  {
+    "id": "case-fragmented-order-001",
+    "capturedAt": "2026-10-08",
+    "stage": "fact_audit",
+    "status": "observed",
+    "minimalInput": "孩子先说出一个不完整顺序，随后立即自我纠正事件先后。",
+    "symptom": "事实池采用了较早的碎片，导致文章事件顺序反转。",
+    "invariant": "明确的自我纠正优先，时间关系不得被反转。",
+    "generalRule": "待不同内容复现后再决定是否增加结构化关系字段。"
+  },
+  {
+    "id": "case-revision-double-consumption-001",
+    "capturedAt": "2026-10-08",
+    "stage": "revision_compose",
+    "status": "generalized",
+    "minimalInput": "修改时补充一条与原事件相关的新事实。",
+    "symptom": "同一新事实既合并进原句，又生成一条独立句子。",
+    "invariant": "每个事实在正文中只表达一次。",
+    "generalRule": "修改句的 factTexts 必须与其应保留事实完全一致，每个新增事实只能被一个结果消费。"
+  },
+  {
+    "id": "case-revision-unrelated-loss-001",
+    "capturedAt": "2026-10-08",
+    "stage": "revision_compose",
+    "status": "generalized",
+    "minimalInput": "只纠正一个已有事实，文章还包含多个未提及事件。",
+    "symptom": "修改后未提及事件被删除或重写。",
+    "invariant": "语音修改必须基于锁定第一版，未涉及句子保持不变。",
+    "generalRule": "只返回和替换受影响句子，禁止重新生成整篇。"
+  },
+  {
+    "id": "case-first-draft-coverage-001",
+    "capturedAt": "2026-10-08",
+    "stage": "first_draft",
+    "status": "generalized",
+    "minimalInput": "一次口述包含较多互不重复的有效事实。",
+    "symptom": "第一版只保留少量事实，第二次相同流程又能完整生成。",
+    "invariant": "所有审核通过的事实必须进入第一版且只表达一次。",
+    "generalRule": "使用精确 factTexts 账本检查覆盖；未完整覆盖时拒绝结果并统一校对。"
+  }
+]

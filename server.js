@@ -363,7 +363,7 @@ async function callQwenJson(messages) {
 function looksLikeNoise(text) {
   const normalized = String(text || "").replace(/[\s，。！？、,.!?]/g, "");
   if (!normalized) return false;
-  const hasStorySignal = /(今天|昨天|明天|后来|然后|因为|觉得|去了|看到|遇到|一起|玩了|做了|帮助|博物馆|公园|学校)/.test(normalized);
+  const hasStorySignal = /(今天|昨天|明天|后来|然后|因为|觉得|去了|来到|看到|遇到|一起|玩了|做了|帮助|参观|吃了|喝了|回家|上学|放学)/.test(normalized);
   const latinNoise = (normalized.match(/[A-Za-z]/g) || []).length >= 6;
   const repeatedNoise = /(.)\1{3,}|(哈哈){3,}|(呵呵){3,}|(嘿嘿){3,}/.test(normalized);
   return !hasStorySignal && (latinNoise || repeatedNoise);
@@ -473,7 +473,7 @@ async function refineFollowupWithQwen(input, rejectedQuestion, facts) {
   const messages = [
     {
       role: "system",
-      content: "你是儿童口述日记的引导老师。当前问题可能太琐碎、重复了已问事实，或 target_key 过于笼统。请改问另一个尚未引导的具体事实或新事件；target_key 必须是‘玩滑滑梯’这样的具体事件，不能只写‘感受’‘细节’‘结果’。优先原因、关键过程、结果或感受；禁止问外貌、衣服、颜色、大小、名字。若没有高价值缺口就结束引导。只返回 JSON。"
+      content: "你是儿童口述日记的引导老师。当前问题可能太琐碎、重复了已问事实，或 target_key 过于笼统。请改问另一个尚未引导的具体事实或新事件；target_key 必须指向口述中可识别的具体事件，不能只写‘感受’‘细节’‘结果’等抽象维度。优先原因、关键过程、结果或感受；禁止问外貌、衣服、颜色、大小、名字。若没有高价值缺口就结束引导。只返回 JSON。"
     },
     {
       role: "user",
@@ -511,7 +511,7 @@ async function analyzeWithQwen(input) {
             action: "ask_followup|suggest_finish|redirect",
             reason: "missing_what|missing_detail|missing_feeling|missing_result|complete",
             question: "如果需要追问，只问一个适合5-9岁孩子的问题",
-            target_key: "本次问题针对的事实或事件简称，例如：玩滑滑梯",
+            target_key: "本次问题针对的具体事实或事件简称",
             question_status: "answered|invalidated|skipped|pending|none"
           },
           speech_quality: "coherent|unclear|nonsense|unsafe",
@@ -707,7 +707,7 @@ function factIsCovered(fact, usedFactTexts) {
 }
 
 function hasDistinctSharedPhrase(left, right) {
-  const generic = new Set(["今天我", "我们一", "们一起", "在公园", "公园里", "然后我", "后来我", "最后我", "回家后", "的时候"]);
+  const generic = new Set(["今天我", "我们一", "们一起", "然后我", "后来我", "最后我", "回家后", "的时候"]);
   const a = normalizeSemanticText(left);
   const b = normalizeSemanticText(right);
   const shorter = a.length <= b.length ? a : b;
@@ -715,7 +715,7 @@ function hasDistinctSharedPhrase(left, right) {
   for (let size = Math.min(5, shorter.length); size >= 3; size -= 1) {
     for (let index = 0; index <= shorter.length - size; index += 1) {
       const phrase = shorter.slice(index, index + size);
-      if (generic.has(phrase) || /^(今天|我们|一起|然后|后来|最后|公园)/u.test(phrase)) continue;
+      if (generic.has(phrase) || /^(今天|我们|一起|然后|后来|最后)/u.test(phrase)) continue;
       if (longer.includes(phrase)) return true;
     }
   }
@@ -776,6 +776,7 @@ function compositionPenalty(draft) {
 }
 
 async function refineCompositionWithQwen(input, draft, facts, missingFacts) {
+  const sourceUtterances = [...new Set(facts.map(fact => String(fact.quote || "").trim()).filter(Boolean))];
   const messages = [
     {
       role: "system",
@@ -787,21 +788,23 @@ async function refineCompositionWithQwen(input, draft, facts, missingFacts) {
         schema: { title: "短标题", sentences: [{ text: "一句日记", factTexts: ["实际使用的事实 text"] }] },
         rules: [
           "所有 facts 都必须覆盖且每个事实只表达一次；missing_facts 要合并回它真实发生的位置。",
-          "每个独立句子必须有明确主语和谓语，优先使用孩子事实中的‘我、我们、爸爸、妈妈、老师、哥哥’作为主语；禁止写‘在公园玩了滑滑梯’这类缺主语句，应写‘我在公园玩了滑滑梯’。并列动作可以共用一次主语。",
-          "爬上滑梯、从滑梯滑下等同一活动的连续阶段合并成一句或一个紧凑事件，不能拆成重复叙述。",
+          "每个独立句子必须有明确主语和谓语，主语只能来自事实；时间或地点作状语时也不能省略必要主语，并列动作可以共用一次主语。",
+          "同一活动的连续阶段合并成一句或一个紧凑事件，不能拆成重复叙述。",
           "按时间和事件顺序组织：发生了什么、过程或结果、最后感受；感受不得放在对应事情之前。",
-          "离开某地点、回家、吃晚饭或睡觉等收尾事件出现后，之前地点的活动绝不能再放到文章末尾。遗漏事实必须合并回它原本发生的位置。",
+          "明确的结束、离开、返回或休息等收尾事件出现后，之前发生的活动不能再放到文章末尾。遗漏事实必须合并回它真实发生的位置。",
           "一句主要表达一件事或一个连续动作，不能用逗号串联过多事件。",
           "全文‘然后’最多一次，其余按真实先后使用‘接着、后来、最后’或直接分句。",
           "优先保留孩子原话中的形容词、叠词和人物关系，不擅自替换成义词或添加华丽表达。",
+          "accepted_child_utterances 是审核后的孩子原话片段，是措辞和细节的唯一来源；facts 只用于确定哪些内容有效并检查覆盖。",
           "忽略并禁止写入记不清、不确定、可能、猜测的内容。",
           "factTexts 必须使用 facts 中完整的 text，列出该句使用的全部事实。",
-          "保持儿童口吻，不写编辑说明，不添加原话没有的信息。"
+          "孩子明确表达的时间先后、因果、转折、条件、约定和自我纠正必须整体保留，不能拆散、反转或删除。",
+          "保持儿童口吻，不写编辑说明，不添加事实池没有的信息。"
         ],
         facts,
+        accepted_child_utterances: sourceUtterances,
         missing_facts: missingFacts,
-        current_draft: draft,
-        original_utterances: input.utterances || []
+        current_draft: draft
       })
     }
   ];
@@ -812,6 +815,7 @@ async function composeWithQwen(input) {
   const facts = dedupeSemanticFacts((input.facts || [])
     .filter(fact => ["what", "detail", "result", "feeling"].includes(fact.slot))
     .filter(isUsableDiaryFact));
+  const sourceUtterances = [...new Set(facts.map(fact => String(fact.quote || "").trim()).filter(Boolean))];
   const messages = [
     {
       role: "system",
@@ -820,34 +824,36 @@ async function composeWithQwen(input) {
     {
       role: "user",
       content: JSON.stringify({
-        task: "参考孩子完整口述，把事实池整理成句子完整、顺序清楚、适合5-9岁孩子学习表达的短日记。",
+        task: "以审核后的孩子原话为主要语言来源，用事实池约束内容边界，整理成句子完整、顺序清楚、适合5-9岁孩子学习表达的短日记。",
         schema: {
           title: "短标题",
           sentences: [{ text: "一句日记", factTexts: ["这句话使用到的事实 text"] }]
         },
         rules: [
           "每一句只能表达 facts 中已有的事实，factTexts 必须逐项列出该句实际使用的事实 text。",
+          "accepted_child_utterances 是已经去除家长引导、背景声和无效内容的孩子原话片段。正文用词、形容和细节优先从这里取，不得根据事实标签自行扩写。",
           "可以调整语序、主语和谓语位置，合并相邻事实，去掉口头重复和无意义语气词。",
-          "每个独立句子必须符合小学低年级可学习的完整表达：有明确主语和谓语，需要宾语时写清宾语。地点或时间放句首后仍要写主语，例如‘在公园里，我遇到了哥哥’，不能写成‘在公园遇到了哥哥’。",
+          "每个独立句子必须符合小学低年级可学习的完整表达：有明确主语和谓语，需要宾语时写清宾语。地点或时间放句首后仍要保留必要主语。",
           "一句主要表达一件事或一个连续动作；一个句子包含多个不同事件时，按事件边界用句号断开，不能只用逗号一直串联。连续动作仍应合并，不能为了断句重复同一活动。",
           "优先原样保留孩子收音中使用的形容词、叠词和有特点的说法，不擅自替换成更成人化的近义词，也不新增原话没有的形容词或副词。",
           "不要逐句照抄口头禅。孩子反复说‘然后’时，按真实先后关系自然改成‘……之后、接着、后来、最后’或直接分句；全文‘然后’最多出现一次。",
           "连接词只用于孩子已经明确表达的时间先后，不得为了文采新增因果、感受或场景。语言要比口述完整，但仍像孩子自己的日记，不使用成人化华丽词语。",
           "按真实时间顺序写：先写事件，再写过程和结果，最后写与该事件对应的感受；不能把感受放到事情发生之前。",
-          "离开公园、回家、吃晚饭、洗澡或睡觉属于收尾节点；这些节点之后禁止再出现此前的公园或白天活动。",
-          "同一个活动只叙述一次。连续动作属于同一事件时要合并，例如‘一起爬上滑梯’和‘再一起滑下来’应组成一个完整事件，不能拆成两次滑滑梯。",
-          "严禁为了衔接而重复同一动作，不能写出‘吃完之后就只吃完’这类前后同义、缺少新信息的病句。",
+          "明确的结束、离开、返回或休息等收尾节点之后，禁止再出现此前已经结束的活动。",
+          "同一个活动只叙述一次。连续动作属于同一事件时要合并成一个完整事件，不能拆成多次重复叙述。",
+          "严禁为了衔接而重复同一动作或写出前后同义、缺少新信息的病句。",
           "可以使用‘今天、然后、后来、但是、所以’等连接词，但不能用连接词暗示孩子没有说过的因果。",
           "不要逐条照抄事实；要把零散短语组织成主谓完整、前后连贯的句子。",
-          "人物、地点、物品和属性必须保持原绑定关系，禁止把‘公园里人多’改写成‘滑滑梯上人多’之类主体转移。",
-          "同一主体的事实直接冲突时，只有原口述明确出现纠正关系才能采用较后的纠正；否则省略不确定冲突，不要自行判断。",
+          "人物、地点、物品、动作和属性必须保持原绑定关系，禁止把一个主体的描述转移到另一个主体。",
+          "同一主体的事实直接冲突时，只有事实池明确记录纠正关系才能采用纠正后的内容；否则省略不确定冲突，不要自行判断。",
+          "孩子明确表达的时间先后、因果、转折、条件和约定必须完整保留，不能反转顺序、改变关系或遗漏结论。",
           "正文禁止出现‘与之前矛盾、保留原话、事实冲突’等编辑说明或括号注释。",
           "孩子说记不清、不知道、不确定、可能、猜测的内容不属于事实，禁止写入正文，也不能把猜测改成确定描述。",
           "保持儿童口吻，不使用成人作文腔，不扩写、不编细节。",
           "如果没有 feeling，不要写心情。"
         ],
         facts,
-        original_utterances: input.utterances || []
+        accepted_child_utterances: sourceUtterances
       })
     }
   ];
@@ -966,7 +972,7 @@ async function finalizeWithQwen(input) {
     .filter(fact => quoteAppearsInTranscript(fact.quote, transcript))
     .filter(fact => !acceptedExistingFacts.some(existing => semanticSimilarity(existing.text, fact.text) >= 0.72)));
   const allFacts = dedupeSemanticFacts([...acceptedExistingFacts, ...newFacts]);
-  const result = await composeWithQwen({ facts: allFacts, utterances: [transcript] });
+  const result = await composeWithQwen({ facts: allFacts });
   return {
     facts: newFacts,
     acceptedFactIds: [...acceptedIds],
@@ -1004,14 +1010,14 @@ async function reviseWithQwen(input) {
           "‘不是A，是B’通常是 replace，只修改包含A且语义对应的事实。",
           "‘我没有说A/删掉A’通常是 delete，只删除明确对应的事实。",
           "‘还要加上A/我还想说A’通常是 add，A必须是孩子明确说出的事实。",
-          "如果现有事实是否定或误识别句，而 instruction 给出了同一事件的正确肯定说法，必须 replace 这条错误事实，不能只 add 正确说法后同时保留错误说法。例如现有‘没有读绘本’，孩子改为‘睡醒后开始读绘本’，应替换原事实。",
+          "如果 instruction 对同一人物、对象、事件或关系给出明确更正，必须 replace 对应错误事实，不能只 add 正确信息后同时保留错误信息。",
           "如果同一个错误事实在 facts 中有多个近似版本，返回对应的 delete 操作一并清除重复项，只保留一条修改后的正确事实。",
           "replace/delete 的 target_fact_id 必须来自 facts，禁止编造 id。",
           "孩子重新讲了一大段故事时，没再提到的旧事实不等于要删除；只把新信息作为 add，对明确纠正的同一事实作为 replace。",
           "已经出现在 facts 或 diary 中的人物、地点、活动和句子不得再返回 add；即使孩子在修改时又讲了一遍，也只视为原事实的重述。",
           "add 若补充同一事件内部的细节、结果或感受，填写 anchor_fact_id 且 placement=merge。",
           "add 若由‘之前、以前、之后、后来’等引入相邻事件，填写 anchor_fact_id 且 placement=before 或 after。独立新事件使用 independent。",
-          "只有 instruction 明确说‘删掉’‘不要写’‘我没说’或‘不是……’时才能 delete；绝不能为了用新故事取代旧故事而批量 delete。",
+          "只有 instruction 明确说‘删掉’‘不要写’或‘我没说’时才能 delete；‘不是A，是B’属于 replace，不能拆成 delete 和 add。绝不能为了用新故事取代旧故事而批量 delete。",
           "不能确定目标事实时 operations 返回空数组，不得凭相似词强行修改。",
           "不要把指令措辞写进日记事实，只保留修改后的事实内容。"
         ],
@@ -1327,6 +1333,9 @@ async function reviseLockedCompositionWithQwen(input) {
           "placement=merge 的 add 必须合并进对应 affected_sentence。before/after 按 operation 的 anchor_fact_id 找到原句并设置位置。",
           "独立新增事件按时间和语境选择相邻原句；无法判断时 position=end。",
           "每个修改后句子要有主语和谓语，不重复动作，不新增事实。",
+          "changes 的 factTexts 必须与该原句修改后仍有效的事实完全一致，不能顺手带入其他 active_facts。",
+          "每个新增事实只能出现在一条 change 或 addition 中，不能既合并进旧句又单独生成新句。",
+          "明确的时间顺序、因果、条件、转折或约定属于事实关系，修改局部内容时必须保留。",
           "factTexts 只能使用 active_facts 里完整的 text。"
         ],
         instruction: input.revisionInstruction || "",
@@ -1361,8 +1370,10 @@ async function reviseLockedCompositionWithQwen(input) {
     if (!linkedActiveFacts.length) continue;
     const change = changes.get(sentence.id);
     const validFactTexts = (change?.factTexts || []).filter(text => activeFactTexts.has(text));
-    const coversLinkedFacts = linkedActiveFacts.every(fact => validFactTexts.includes(fact.text));
-    const validChange = validFactTexts.length && coversLinkedFacts && revisionChangeIsValid(change, sentenceOperations);
+    const linkedFactTexts = linkedActiveFacts.map(fact => fact.text);
+    const hasExactLinkedFacts = validFactTexts.length === linkedFactTexts.length &&
+      linkedFactTexts.every(text => validFactTexts.includes(text));
+    const validChange = validFactTexts.length && hasExactLinkedFacts && revisionChangeIsValid(change, sentenceOperations);
     const fallbackText = deterministicRevisionText(sentence, sentenceOperations, linkedActiveFacts);
     revised.push({
       ...sentence,
