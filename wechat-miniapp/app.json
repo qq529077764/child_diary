@@ -9,11 +9,7 @@
     "backgroundColor": "#fff8ec",
     "backgroundTextStyle": "light"
   },
-  "permission": {
-    "scope.record": {
-      "desc": "用于听孩子讲故事并整理成日记"
-    }
-  },
+  "lazyCodeLoading": "requiredComponents",
   "style": "v2",
   "sitemapLocation": "sitemap.json"
 }
