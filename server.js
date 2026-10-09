@@ -783,9 +783,16 @@ function normalizeRepeatedThen(sentences) {
 function compositionPenalty(draft) {
   const sentences = Array.isArray(draft?.sentences) ? draft.sentences : [];
   let penalty = sentences.length ? 0 : 100;
-  const thenCount = (sentences.map(sentence => String(sentence?.text || "")).join("").match(/然后/gu) || []).length;
+  const joinedText = sentences.map(sentence => String(sentence?.text || "")).join("");
+  const thenCount = (joinedText.match(/然后/gu) || []).length;
+  const repeatedChildSubjectCount = (joinedText.match(/我们|我/gu) || []).length;
   const factUseCounts = new Map();
   if (thenCount > 1) penalty += (thenCount - 1) * 10;
+  // 每个句子出现一次主体通常已经足够。更高频率往往说明模型把连续动作
+  // 机械拆开并反复补写“我/我们”，会让整理后的文字比孩子原话更啰嗦。
+  if (repeatedChildSubjectCount > sentences.length + 1) {
+    penalty += (repeatedChildSubjectCount - sentences.length - 1) * 6;
+  }
   for (const sentence of sentences) {
     const text = String(sentence?.text || "").trim();
     for (const factText of Array.isArray(sentence?.factTexts) ? sentence.factTexts : []) {
@@ -901,10 +908,11 @@ async function refineCompositionWithQwen(input, draft, facts, missingFacts, hard
           "所有 facts 的有效含义都必须覆盖且只表达一次；missing_facts 要合并回它真实发生的位置。",
           "facts 是来源账本，不是逐条照抄清单。同一场景中重复、包含或前后补全的事实要绑定到同一句完整表达，factTexts 可同时列出这些来源，但正文不得把每条 fact text 再说一遍。",
           "孩子停顿后补出的半句、指代词或单独的‘去了、进去了、做完了’若没有新增独立信息，要并入上下文或省略，不能原样留成病句。",
-          "每个独立句子必须有明确主语和谓语，主语只能来自事实；时间或地点作状语时也不能省略必要主语，并列动作可以共用一次主语。",
-          "同一活动的连续阶段合并成一句或一个紧凑事件，不能拆成重复叙述。",
+          "每个句号结束的独立句子要有清楚的主语和谓语，主语只能来自事实；同一主体的连续动作可以共用一次主语，不要在相邻分句里反复补写‘我’或‘我们’。",
+          "同一活动或同一段时间里的连续阶段要合并成紧凑表达，不能把每个动作扩成一句，也不能为了显得完整而增加原文没有的信息。",
+          "整理后的文字应当比口述更清楚、同样简洁或更精炼。只补理解句意必需的语法成分，不得无故增加句子数量和篇幅。",
           "事实中的否定关系必须原样保留。‘没有、没、不、不是、不能、不会’不得省略或改成肯定。",
-          "‘吃完、做完、玩完、看完’等完成动作如果引出下一件事，要写成‘……后，主语就……’，不能在完成动作后误用句号。",
+          "‘吃完、做完、玩完、看完’等完成动作如果引出下一件事，要自然连接为‘……后，……’，不能在完成动作后误用句号；主体清楚时不必再次补写主语。",
           "句子不得直接以‘就、才、再、又’开头却省略主语；需要承接前句时应合并重整相邻句子。",
           "按时间和事件顺序组织：发生了什么、过程或结果、最后感受；感受不得放在对应事情之前。",
           "明确的结束、离开、返回或休息等收尾事件出现后，之前发生的活动不能再放到文章末尾。遗漏事实必须合并回它真实发生的位置。",
@@ -952,8 +960,9 @@ async function composeWithQwen(input) {
           "可以调整语序、主语和谓语位置，合并相邻事实，去掉口头重复和无意义语气词。",
           "facts 是来源账本，不是要求逐条照抄的句子。同一场景中重复、包含、前后补全或指向同一动作的事实，应共同绑定到一条通顺表达，正文只说一次。",
           "孩子停顿后补出的半句、指代词或单独的‘去了、进去了、做完了’如果没有增加独立信息，要结合上下文并入完整动作或省略，不能原样留在句尾。",
-          "每个独立句子必须符合小学低年级可学习的完整表达：有明确主语和谓语，需要宾语时写清宾语。地点或时间放句首后仍要保留必要主语。",
-          "一句主要表达一件事或一个连续动作；一个句子包含多个不同事件时，按事件边界用句号断开，不能只用逗号一直串联。连续动作仍应合并，不能为了断句重复同一活动。",
+          "每个句号结束的独立句子必须符合小学低年级可学习的完整表达：主谓关系清楚，需要宾语时写清宾语。地点或时间放句首后要避免歧义，但同一主体的连续动作可以共用一次主语。",
+          "按语义关系而不是事实条数断句。同一主体、时间连续且关系紧密的动作要紧凑合并；事件明显转换时再用句号。不能把每个动作扩成一句，也不能为了断句重复同一活动。",
+          "整理目标是去掉语气词、重复和口语倒装，让表达更清楚、更精炼，不是把事实逐项展开。除补全必要语法成分外，正文不应比有效口述明显变长，也不要在相邻分句反复写‘我’或‘我们’。",
           "优先原样保留孩子收音中使用的形容词、叠词和有特点的说法，不擅自替换成更成人化的近义词，也不新增原话没有的形容词或副词。",
           "不要逐句照抄口头禅。孩子反复说‘然后’时，按真实先后关系自然改成‘……之后、接着、后来、最后’或直接分句；全文‘然后’最多出现一次。",
           "连接词只用于孩子已经明确表达的时间先后，不得为了文采新增因果、感受或场景。语言要比口述完整，但仍像孩子自己的日记，不使用成人化华丽词语。",
@@ -961,7 +970,7 @@ async function composeWithQwen(input) {
           "明确的结束、离开、返回或休息等收尾节点之后，禁止再出现此前已经结束的活动。",
           "同一个活动只叙述一次。连续动作属于同一事件时要合并成一个完整事件；较完整事实已经包含较短事实时，只表达完整含义，并把两条来源都列入 factTexts。",
           "事实中的否定关系必须保留，不得省略‘没有、没、不、不是、不能、不会’或把否定事实改成肯定。",
-          "完成动作与它引出的后续结果必须正确连接，不得用句号将两者断开。应使用‘……后，主语就……’并写清主语。",
+          "完成动作与它引出的后续结果必须正确连接，不得用句号将两者断开。可使用‘……后，……’自然承接；主体已经清楚时不要机械重复主语。",
           "严禁为了衔接而重复同一动作或写出前后同义、缺少新信息的病句。",
           "可以使用‘今天、然后、后来、但是、所以’等连接词，但不能用连接词暗示孩子没有说过的因果。",
           "不要逐条照抄事实；要把零散短语组织成主谓完整、前后连贯的句子。",
@@ -1624,7 +1633,7 @@ function revisionOrderIsValid(sentences, operations, factById) {
   });
 }
 
-function revisionWritingViolations(sentences) {
+function revisionWritingViolations(sentences, context = {}) {
   const violations = [];
   for (const [index, sentence] of (sentences || []).entries()) {
     const text = String(sentence?.text || "").trim();
@@ -1643,12 +1652,25 @@ function revisionWritingViolations(sentences) {
     if (text.length < 5 || !/[。！？!?]$/u.test(text)) {
       violations.push({ type: "incomplete_sentence", sentenceIndex: index, text });
     }
-    if ((sentence?.factTexts || []).length > 3) {
-      violations.push({ type: "too_many_facts_in_sentence", sentenceIndex: index, text });
-    }
   }
   const thenCount = ((sentences || []).map(sentence => String(sentence?.text || "")).join("").match(/然后/gu) || []).length;
   if (thenCount > 1) violations.push({ type: "repeated_then", count: thenCount });
+  const operations = Array.isArray(context.operations) ? context.operations : [];
+  const originalSentences = Array.isArray(context.originalSentences) ? context.originalSentences : [];
+  const onlyReordersExistingFacts = operations.length > 0 && operations.every(operation => operation.type === "reorder");
+  if (onlyReordersExistingFacts && originalSentences.length) {
+    const revisedText = (sentences || []).map(sentence => String(sentence?.text || "")).join("");
+    const originalText = originalSentences.map(sentence => String(sentence?.text || "")).join("");
+    const revisedLength = normalizeSemanticText(revisedText).length;
+    const originalLength = normalizeSemanticText(originalText).length;
+    const revisedSubjectCount = (revisedText.match(/我们|我/gu) || []).length;
+    const originalSubjectCount = (originalText.match(/我们|我/gu) || []).length;
+    const lengthExpanded = revisedLength > Math.max(originalLength + 12, Math.ceil(originalLength * 1.3));
+    const subjectRepeated = revisedSubjectCount > originalSubjectCount + 1;
+    if (lengthExpanded && subjectRepeated) {
+      violations.push({ type: "overexpanded_reorder", revisedLength, originalLength });
+    }
+  }
   return violations;
 }
 
@@ -1724,15 +1746,16 @@ async function reviseLockedCompositionWithQwen(input) {
           "未受影响的句子不返回，系统会原样保留。",
           "placement=merge 的 add 必须融入对应场景。before/after 按 operation 的 anchor_fact_id 找到原句并设置位置。",
           "独立新增事件按时间和语境选择相邻原句；无法判断时 position=end。",
-          "每个修改后句子要有明确主语和谓语，需要时写清宾语；一句主要表达一件事或一组连续动作，不重复动作，不新增事实。",
+          "每个句号结束的独立句子要有清楚的主谓关系，需要时写清宾语；同一主体的一组连续动作可以共用一次主语，不要在相邻分句反复写‘我’或‘我们’。",
           "孩子停顿后补出的半句、指代词或没有独立信息的动作残片要并入完整表达或省略，不能原样留成病句。",
           "每个 affected_scene 的全部 expected_facts 必须各绑定一次；factTexts 使用完整 text。同一场景正文可以只表达一次重叠含义，但来源账本仍需全部绑定。",
           "每个新增事实只能出现在一个 scene 或一条 addition 中，不能既合并进旧场景又单独生成新句。",
           "明确的时间顺序、因果、条件、转折或约定属于事实关系，修改局部内容时必须保留。",
           "reorder 的 ordered_fact_ids 是唯一有效的先后约束。必须按该顺序组织相应事实，可以合并连续动作，但不得反转、遗漏或重复。",
           "修改操作已经提取完毕，不要复述孩子如何提出修改，也不要把口语填充词、指令语气或‘先做的某事、才吃的某物’这类口语倒装原样写进日记。",
-          "请真正重新组织句子：按小学低年级主谓宾结构写成‘主语+动作+对象’，再用‘……后、接着、后来、最后’连接先后；不得为了省事照抄某条长事实。",
-          "一个句子最多绑定三个不同事实；顺序约束包含四个或更多事实时必须按事件边界拆成至少两句，不能只用逗号把整段行程串成一句。",
+          "请真正重新组织句子：去掉口语填充、重复和倒装，把关系写清楚；不得为了省事照抄某条长事实。只在句意需要时补主语、宾语和连接词。",
+          "按语义关系而不是事实数量断句。同一主体、时间连续且关系紧密的动作可以紧凑地写在一句里；事件明显转换时再用句号。不要把每个事实扩成一句流水账。",
+          "修改后的场景应当比修改口述更清楚，并尽量与原场景同样简洁或更精炼。重排已有事实不得无故增加句子数量、重复主语或扩写篇幅。",
           "整个局部场景中的‘然后’最多出现一次，其余先后关系用‘……后、接着、后来、最后’或直接分句表达。",
           "优先保留孩子原有形容词、叠词和儿童化说法，不擅自增加成人化词语、原因、评价、情绪或细节。",
           "factTexts 只能使用对应场景 expected_facts 或 added_facts 里完整的 text。"
@@ -1783,7 +1806,10 @@ async function reviseLockedCompositionWithQwen(input) {
     const joinedText = candidateSentences.map(sentence => sentence.text).join("");
     const changeValid = revisionChangeIsValid(joinedText, group.operations, factById);
     const orderValid = revisionOrderIsValid(candidateSentences, group.operations, factById);
-    const writingViolations = revisionWritingViolations(candidateSentences);
+    const writingViolations = revisionWritingViolations(candidateSentences, {
+      originalSentences: group.sentences,
+      operations: group.operations
+    });
     const valid = candidateSentences.length > 0 && exactCoverage && changeValid && orderValid && writingViolations.length === 0;
     return {
       candidateSentences,
@@ -1817,7 +1843,7 @@ async function reviseLockedCompositionWithQwen(input) {
             invalid_scene_ids: invalidSceneIds,
             required_fixes: [
               "按小学低年级主谓宾结构真正重写，不得照抄口语倒装或修改指令",
-              "每句话最多绑定三个事实，事件较多时用句号自然分句",
+              "按语义关系紧凑断句，不按事实数量机械拆句，不重复主语或无故扩写",
               "factTexts 必须完整、唯一，并严格遵守 order_constraints"
             ]
           })

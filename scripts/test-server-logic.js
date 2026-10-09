@@ -133,6 +133,21 @@ assert.equal(revisionWritingViolations([
   { text: "吃完午饭后，我们睡午觉。", factTexts: ["睡午觉"] },
   { text: "睡醒之后，我们吃了水果，然后就放学了。", factTexts: ["吃水果", "放学"] }
 ]).length, 0, "按主谓宾和事件边界重整后的句子应通过修改质量校验");
+assert.equal(revisionWritingViolations([
+  { text: "吃完早餐，我们去户外玩，回来后吃午饭，再睡午觉。", factTexts: ["吃早餐", "去户外玩", "吃午饭", "睡午觉"] },
+  { text: "睡醒后，我们吃了水果，就放学了。", factTexts: ["吃水果", "放学"] }
+]).length, 0, "同一主体的连续动作可以紧凑合并，不能按事实数量机械拆句");
+assert.equal(revisionWritingViolations([
+  { text: "吃完早餐，我们就去户外玩了。", factTexts: ["吃早餐", "去户外玩"] },
+  { text: "玩完户外回来，我们吃了午饭。", factTexts: ["吃午饭"] },
+  { text: "吃完午饭，我们睡午觉。", factTexts: ["睡午觉"] },
+  { text: "睡醒之后，我们一起吃了水果，然后就放学了。", factTexts: ["吃水果", "放学"] }
+], {
+  originalSentences: [
+    { text: "吃完早餐出去玩，回来先吃午饭，然后睡午觉，睡醒才吃水果，就放学了。" }
+  ],
+  operations: [{ type: "reorder" }]
+}).some(item => item.type === "overexpanded_reorder"), true, "顺序修改不能通过重复主语和拆句把简洁原文扩成流水账");
 
 const oneTargetOnce = normalizeRevisionOperations({ instruction: "不是原来的说法，我重新说", facts, diary }, [
   { type: "replace", target_fact_id: "f1", new_text: "我进教室吃早餐" },
