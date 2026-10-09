@@ -112,6 +112,7 @@ Page({
     this.transcript = "";
     this.revisionTranscript = "";
     this.facts = [];
+    this.storyModel = null;
     this.utterances = [];
     this.questions = [];
     this.questionKeys = [];
@@ -178,6 +179,9 @@ Page({
       return {
         ...sentence,
         id: sentence.id || `stored_${savedAt}_${sentenceIndex}`,
+        sceneId: sentence.sceneId || "",
+        eventIds: Array.isArray(sentence.eventIds) ? sentence.eventIds : [],
+        sourceSpanIds: Array.isArray(sentence.sourceSpanIds) ? sentence.sourceSpanIds : [],
         factTexts,
         factIds,
         sourceText: sentence.sourceText || factTexts.join("；")
@@ -188,6 +192,7 @@ Page({
       id: record.id || `diary_${savedAt}_${index}`,
       title: record.title || "我的日记",
       facts,
+      story: record.story && record.story.schemaVersion === 2 ? record.story : null,
       savedAt,
       savedLabel: this.formatSavedTime(savedAt),
       sentences,
@@ -330,7 +335,7 @@ Page({
       url: `${API_BASE_URL}${path}`,
       method,
       data,
-      timeout: path === "/api/finalize" ? 120000 : path === "/api/compose" ? 90000 : 60000,
+      timeout: ["/api/finalize", "/api/revise"].includes(path) ? 150000 : 60000,
       header: {
         "content-type": "application/json",
         ...(includeAuth && this.cloudToken ? { Authorization: `Bearer ${this.cloudToken}` } : {})
@@ -485,6 +490,7 @@ Page({
           const snapshot = this.revisionBaseSnapshot;
           if (snapshot) {
             this.facts = JSON.parse(JSON.stringify(snapshot.facts || []));
+            this.storyModel = snapshot.story ? JSON.parse(JSON.stringify(snapshot.story)) : null;
             this.setData({
               phase: "diary",
               isRecording: false,
@@ -515,6 +521,7 @@ Page({
     this.transcript = String(diary.transcript || "");
     this.utterances = this.transcript ? [this.transcript] : [];
     this.facts = JSON.parse(JSON.stringify(diary.facts || [])).map(fact => ({ ...fact, active: fact.active !== false }));
+    this.storyModel = diary.story ? JSON.parse(JSON.stringify(diary.story)) : null;
     this.editingDiaryId = diary.id;
     this.editingDiarySavedAt = diary.savedAt;
     this.setData({
@@ -845,14 +852,6 @@ Page({
         facts: this.facts.filter(fact => fact.active !== false),
         previousQuestions: this.questions
       });
-      if (Array.isArray(data.acceptedFactIds)) {
-        const acceptedIds = new Set(data.acceptedFactIds);
-        this.facts.forEach(fact => {
-          if (fact.id && !acceptedIds.has(fact.id)) fact.active = false;
-        });
-        this.setData({ factChips: this.facts.filter(fact => fact.active !== false) });
-      }
-      this.mergeFacts(data.facts || []);
       this.applyDiaryResponse(data);
     } catch (error) {
       this.finalizeStarted = false;
@@ -860,71 +859,18 @@ Page({
     }
   },
 
-  async composeDiary(options = {}) {
-    const { applyResult = true, ...requestOptions } = options;
-    const facts = this.facts.filter(fact => fact.active !== false);
-    const data = await this.request("/api/compose", {
-      facts,
-      utterances: this.utterances,
-      ...requestOptions
-    });
-    if (applyResult) this.applyDiaryResponse(data);
-    return data;
-  },
-
-  validateRevisionComposition(lockedDiary, operations, data) {
-    const revisedSentences = Array.isArray(data?.sentences) ? data.sentences : [];
-    const changedSentenceIds = new Set(Array.isArray(data?.changedSentenceIds) ? data.changedSentenceIds : []);
-    if (!revisedSentences.length) throw new Error("修改结果没有完整句子");
-    if (!Array.isArray(data?.changedSentenceIds)) throw new Error("修改结果缺少局部校验信息");
-
-    const revisedById = new Map(revisedSentences.filter(sentence => sentence?.id).map(sentence => [sentence.id, sentence]));
-    for (const original of lockedDiary) {
-      if (changedSentenceIds.has(original.id)) continue;
-      const preserved = revisedById.get(original.id);
-      if (!preserved || preserved.text !== original.text) {
-        throw new Error("这次修改影响了无关内容");
-      }
-    }
-
-    const revisedFactIds = new Set(revisedSentences.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []));
-    const revisedFactOrder = revisedSentences.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []);
-    const revisedText = revisedSentences.map(sentence => sentence.text || "").join("");
-    for (const operation of operations) {
-      if (operation.type === "add" && operation.applied_fact_id && !revisedFactIds.has(operation.applied_fact_id)) {
-        throw new Error("新补充的内容没有写进日记");
-      }
-      if (operation.type === "replace" && operation.target_fact_id && !revisedFactIds.has(operation.target_fact_id)) {
-        throw new Error("要修改的事情在结果中丢失了");
-      }
-      if (operation.type === "delete" && operation.target_fact_id && revisedFactIds.has(operation.target_fact_id)) {
-        throw new Error("要删除的内容仍然存在");
-      }
-      if (operation.type === "remove_phrase" && operation.old_text && revisedText.includes(operation.old_text)) {
-        throw new Error("要去掉的话仍然存在");
-      }
-      if (operation.type === "reorder") {
-        let cursor = -1;
-        for (const factId of operation.ordered_fact_ids || []) {
-          const nextIndex = revisedFactOrder.findIndex((id, index) => index > cursor && id === factId);
-          if (nextIndex < 0) throw new Error("事情的先后顺序还没有调整正确");
-          cursor = nextIndex;
-        }
-      }
-    }
-    return true;
-  },
-
   applyDiaryResponse(data) {
     const sentences = (data.sentences || []).map(sentence => ({
       id: sentence.id || `sentence_${Date.now()}_${Math.random()}`,
+      sceneId: sentence.sceneId || "",
       text: sentence.text,
-      factTexts: sentence.factTexts || [],
-      factIds: sentence.factIds || this.facts
-        .filter(fact => (sentence.factTexts || []).some(text => text === fact.text || text.includes(fact.text) || fact.text.includes(text)))
-        .map(fact => fact.id),
-      sourceText: (sentence.factTexts || []).join("；")
+      eventIds: Array.isArray(sentence.eventIds) ? sentence.eventIds : [],
+      sourceSpanIds: Array.isArray(sentence.sourceSpanIds) ? sentence.sourceSpanIds : [],
+      factTexts: [],
+      factIds: [],
+      sourceText: ""
     }));
+    if (data.story?.schemaVersion === 2) this.storyModel = JSON.parse(JSON.stringify(data.story));
     this.setData({ phase: "diary", isFinishing: false, diaryTitle: data.title || "我的日记", diarySentences: sentences });
   },
 
@@ -938,6 +884,7 @@ Page({
       sentences: JSON.parse(JSON.stringify(this.data.diarySentences)),
       transcript: this.transcript,
       facts: JSON.parse(JSON.stringify(this.facts.filter(fact => fact.active !== false))),
+      story: this.storyModel ? JSON.parse(JSON.stringify(this.storyModel)) : null,
       savedAt
     };
     try {
@@ -966,7 +913,8 @@ Page({
     this.revisionBaseSnapshot = {
       title: this.data.diaryTitle,
       sentences: JSON.parse(JSON.stringify(this.data.diarySentences)),
-      facts: JSON.parse(JSON.stringify(this.facts))
+      facts: JSON.parse(JSON.stringify(this.facts)),
+      story: this.storyModel ? JSON.parse(JSON.stringify(this.storyModel)) : null
     };
     this.setData({ phase: "revise", revisionDisplay: "", isFinishing: false });
     await this.startRecorder("revision");
@@ -986,44 +934,26 @@ Page({
 
   async finishRevision() {
     if (!this.revisionTranscript) { this.finalizeStarted = false; this.setData({ isFinishing: false, revisionDisplay: "刚才没有听清，请再说一次。" }); return; }
+    if (!this.storyModel) {
+      this.finalizeStarted = false;
+      this.setData({ isFinishing: false, revisionDisplay: "这篇旧日记需要先用新版重新口述后才能修改。" });
+      wx.showModal({ title: "旧日记暂不修改", content: "这篇日记没有新版语义事件账本。为避免改错，原文已完整保留。新录制的日记可以直接语音修改。", showCancel: false });
+      return;
+    }
     try {
-      // 旧版历史日记的句子与事实关联可能不完整，修改时必须提供该篇保存的全部有效事实。
-      const activeFacts = this.facts.filter(fact => fact.active !== false);
-      const revisionDiary = this.data.diarySentences.map(item => ({
-        id: item.id,
-        text: item.text,
-        factTexts: item.factTexts || [],
-        factIds: item.factIds || []
-      }));
-      const result = await this.request("/api/revise", { instruction: this.revisionTranscript, facts: activeFacts, diary: revisionDiary });
-      let changed = 0;
-      const appliedOperations = [];
-      (result.operations || []).forEach(operation => {
-        const target = this.facts.find(fact => fact.active !== false && fact.id === operation.target_fact_id);
-        if (operation.type === "replace" && target && operation.new_text) {
-          const oldText = target.text;
-          target.text = operation.new_text; target.quote = this.revisionTranscript; target.source = "语音修改"; changed += 1; appliedOperations.push({ ...operation, old_text: oldText });
-        }
-        if (operation.type === "delete" && target) {
-          target.active = false; changed += 1; appliedOperations.push({ ...operation, old_text: target.text });
-        }
-        if (operation.type === "add" && operation.new_text) {
-          const id = `rev_${Date.now()}_${changed}`;
-          this.facts.push({ id, slot: operation.slot, label: operation.label || "语音修改", text: operation.new_text, quote: this.revisionTranscript, source: "语音修改", active: true });
-          appliedOperations.push({ ...operation, applied_fact_id: id });
-          changed += 1;
-        }
-        if (operation.type === "remove_phrase" && operation.target_sentence_id && operation.old_text) {
-          changed += 1;
-          appliedOperations.push(operation);
-        }
-        if (operation.type === "reorder" && Array.isArray(operation.ordered_fact_ids) && operation.ordered_fact_ids.length >= 2 &&
-          operation.ordered_fact_ids.every(id => this.facts.some(fact => fact.active !== false && fact.id === id))) {
-          changed += 1;
-          appliedOperations.push(operation);
-        }
+      const result = await this.request("/api/revise", {
+        instruction: this.revisionTranscript,
+        title: this.data.diaryTitle,
+        sentences: this.data.diarySentences.map(item => ({
+          id: item.id,
+          sceneId: item.sceneId,
+          text: item.text,
+          eventIds: item.eventIds || [],
+          sourceSpanIds: item.sourceSpanIds || []
+        })),
+        story: this.storyModel
       });
-      if (!changed) {
+      if (!result.changed) {
         this.finalizeStarted = false;
         this.setData({ isFinishing: false, revisionDisplay: result.message || "还没有找到要修改的地方，请再说清楚一点。" });
         wx.showModal({
@@ -1033,26 +963,12 @@ Page({
         });
         return;
       }
-      const lockedDiary = this.data.diarySentences.map(item => ({
-        id: item.id,
-        text: item.text,
-        factTexts: item.factTexts,
-        factIds: item.factIds
-      }));
-      const composition = await this.composeDiary({
-        applyResult: false,
-        lockedTitle: this.data.diaryTitle,
-        lockedDiary,
-        revisionOperations: appliedOperations,
-        revisionInstruction: this.revisionTranscript,
-        revisionMode: result.revisionMode || ""
-      });
-      this.validateRevisionComposition(lockedDiary, appliedOperations, composition);
-      this.applyDiaryResponse(composition);
+      this.applyDiaryResponse(result);
       this.revisionBaseSnapshot = null;
     } catch (error) {
       if (this.revisionBaseSnapshot) {
         this.facts = JSON.parse(JSON.stringify(this.revisionBaseSnapshot.facts));
+        this.storyModel = this.revisionBaseSnapshot.story ? JSON.parse(JSON.stringify(this.revisionBaseSnapshot.story)) : null;
         this.setData({
           phase: "diary",
           diaryTitle: this.revisionBaseSnapshot.title,
