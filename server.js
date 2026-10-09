@@ -1733,6 +1733,7 @@ async function reviseLockedCompositionWithQwen(input) {
           "修改操作已经提取完毕，不要复述孩子如何提出修改，也不要把口语填充词、指令语气或‘先做的某事、才吃的某物’这类口语倒装原样写进日记。",
           "请真正重新组织句子：按小学低年级主谓宾结构写成‘主语+动作+对象’，再用‘……后、接着、后来、最后’连接先后；不得为了省事照抄某条长事实。",
           "一个句子最多绑定三个不同事实；顺序约束包含四个或更多事实时必须按事件边界拆成至少两句，不能只用逗号把整段行程串成一句。",
+          "整个局部场景中的‘然后’最多出现一次，其余先后关系用‘……后、接着、后来、最后’或直接分句表达。",
           "优先保留孩子原有形容词、叠词和儿童化说法，不擅自增加成人化词语、原因、评价、情绪或细节。",
           "factTexts 只能使用对应场景 expected_facts 或 added_facts 里完整的 text。"
         ],
@@ -1780,15 +1781,31 @@ async function reviseLockedCompositionWithQwen(input) {
       expectedTexts.every(text => useCounts.get(text) === 1) &&
       usedTexts.every(text => expectedTextSet.has(text));
     const joinedText = candidateSentences.map(sentence => sentence.text).join("");
-    const valid = candidateSentences.length > 0 && exactCoverage &&
-      revisionChangeIsValid(joinedText, group.operations, factById) &&
-      revisionOrderIsValid(candidateSentences, group.operations, factById) &&
-      revisionWritingViolations(candidateSentences).length === 0;
-    return { candidateSentences, valid };
+    const changeValid = revisionChangeIsValid(joinedText, group.operations, factById);
+    const orderValid = revisionOrderIsValid(candidateSentences, group.operations, factById);
+    const writingViolations = revisionWritingViolations(candidateSentences);
+    const valid = candidateSentences.length > 0 && exactCoverage && changeValid && orderValid && writingViolations.length === 0;
+    return {
+      candidateSentences,
+      valid,
+      diagnostics: {
+        sceneId: group.id,
+        sentenceCount: candidateSentences.length,
+        factCounts: candidateSentences.map(sentence => (sentence.factTexts || []).length),
+        expectedFactCount: expectedTexts.length,
+        usedFactCount: usedTexts.length,
+        exactCoverage,
+        changeValid,
+        orderValid,
+        writingViolationTypes: writingViolations.map(item => item.type)
+      }
+    };
   };
   let sceneResults = new Map((Array.isArray(result.scenes) ? result.scenes : []).map(scene => [scene.sceneId, scene]));
-  const invalidSceneIds = sceneGroups.filter(group => !candidateForGroup(sceneResults, group).valid).map(group => group.id);
+  const initialCandidates = sceneGroups.map(group => candidateForGroup(sceneResults, group));
+  const invalidSceneIds = initialCandidates.filter(candidate => !candidate.valid).map(candidate => candidate.diagnostics.sceneId);
   if (invalidSceneIds.length) {
+    console.error("Revision scene refinement requested", initialCandidates.filter(candidate => !candidate.valid).map(candidate => candidate.diagnostics));
     try {
       result = await callQwenJson([
         ...messages,
@@ -1815,7 +1832,7 @@ async function reviseLockedCompositionWithQwen(input) {
   const replacementAnchorIds = new Map();
   const removedSceneIndexes = new Set();
   for (const group of sceneGroups) {
-    const { candidateSentences, valid: validCandidate } = candidateForGroup(sceneResults, group);
+    const { candidateSentences, valid: validCandidate, diagnostics } = candidateForGroup(sceneResults, group);
     let replacements;
     if (validCandidate) {
       replacements = candidateSentences.map((sentence, index) => ({
@@ -1830,6 +1847,7 @@ async function reviseLockedCompositionWithQwen(input) {
         operation.old_text && group.sentences.some(sentence => String(sentence?.text || "").includes(operation.old_text))
       );
       if (!deterministicFallbackAllowed) {
+        console.error("Revision scene rejected", diagnostics);
         throw new Error("修改后的句子还没有整理通顺，原日记已保留");
       }
       const fallbackClaimedIds = new Set();
