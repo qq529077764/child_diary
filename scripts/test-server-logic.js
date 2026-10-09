@@ -7,7 +7,8 @@ const {
   deterministicRevisionText,
   fallbackRevisionOperations,
   normalizeRevisionOperations,
-  revisionChangeIsValid
+  revisionChangeIsValid,
+  revisionWritingViolations
 } = require("../server");
 
 const reversedNegation = compositionHardViolations({
@@ -126,6 +127,12 @@ const sequenceAssignments = assignRevisionOperationsToSentences(
 );
 assert.deepEqual([...sequenceAssignments.assignments.keys()], [0, 1, 2], "顺序修正必须锁定第一个到最后一个相关句子的完整局部场景");
 assert.equal(sequenceAssignments.unmatched.length, 0, "可定位的顺序修正不能掉入未匹配状态");
+assert.equal(revisionWritingViolations([{ text: "玩完回来，我们先吃的午饭，然后睡午觉，睡醒后才吃的水果。", factTexts: ["去户外玩", "吃午饭", "睡午觉", "吃水果"] }]).length > 0, true, "照抄修改口述的倒装长句必须被拒绝");
+assert.equal(revisionWritingViolations([
+  { text: "玩完回来，我们吃了午饭。", factTexts: ["去户外玩", "吃午饭"] },
+  { text: "吃完午饭后，我们睡午觉。", factTexts: ["睡午觉"] },
+  { text: "睡醒之后，我们吃了水果，然后就放学了。", factTexts: ["吃水果", "放学"] }
+]).length, 0, "按主谓宾和事件边界重整后的句子应通过修改质量校验");
 
 const oneTargetOnce = normalizeRevisionOperations({ instruction: "不是原来的说法，我重新说", facts, diary }, [
   { type: "replace", target_fact_id: "f1", new_text: "我进教室吃早餐" },

@@ -1643,6 +1643,9 @@ function revisionWritingViolations(sentences) {
     if (text.length < 5 || !/[。！？!?]$/u.test(text)) {
       violations.push({ type: "incomplete_sentence", sentenceIndex: index, text });
     }
+    if ((sentence?.factTexts || []).length > 3) {
+      violations.push({ type: "too_many_facts_in_sentence", sentenceIndex: index, text });
+    }
   }
   const thenCount = ((sentences || []).map(sentence => String(sentence?.text || "")).join("").match(/然后/gu) || []).length;
   if (thenCount > 1) violations.push({ type: "repeated_then", count: thenCount });
@@ -1729,6 +1732,7 @@ async function reviseLockedCompositionWithQwen(input) {
           "reorder 的 ordered_fact_ids 是唯一有效的先后约束。必须按该顺序组织相应事实，可以合并连续动作，但不得反转、遗漏或重复。",
           "修改操作已经提取完毕，不要复述孩子如何提出修改，也不要把口语填充词、指令语气或‘先做的某事、才吃的某物’这类口语倒装原样写进日记。",
           "请真正重新组织句子：按小学低年级主谓宾结构写成‘主语+动作+对象’，再用‘……后、接着、后来、最后’连接先后；不得为了省事照抄某条长事实。",
+          "一个句子最多绑定三个不同事实；顺序约束包含四个或更多事实时必须按事件边界拆成至少两句，不能只用逗号把整段行程串成一句。",
           "优先保留孩子原有形容词、叠词和儿童化说法，不擅自增加成人化词语、原因、评价、情绪或细节。",
           "factTexts 只能使用对应场景 expected_facts 或 added_facts 里完整的 text。"
         ],
@@ -1765,11 +1769,7 @@ async function reviseLockedCompositionWithQwen(input) {
   } catch (error) {
     throw new Error(`修改内容暂时没有整理成功：${error.message}`);
   }
-  const sceneResults = new Map((Array.isArray(result.scenes) ? result.scenes : []).map(scene => [scene.sceneId, scene]));
-  const sceneReplacementAtIndex = new Map();
-  const replacementAnchorIds = new Map();
-  const removedSceneIndexes = new Set();
-  for (const group of sceneGroups) {
+  const candidateForGroup = (sceneResults, group) => {
     const expectedTexts = [...new Set(group.activeFacts.map(fact => fact.text))];
     const expectedTextSet = new Set(expectedTexts);
     const candidate = sceneResults.get(group.id);
@@ -1780,17 +1780,49 @@ async function reviseLockedCompositionWithQwen(input) {
       expectedTexts.every(text => useCounts.get(text) === 1) &&
       usedTexts.every(text => expectedTextSet.has(text));
     const joinedText = candidateSentences.map(sentence => sentence.text).join("");
-    const validCandidate = candidateSentences.length > 0 && exactCoverage &&
+    const valid = candidateSentences.length > 0 && exactCoverage &&
       revisionChangeIsValid(joinedText, group.operations, factById) &&
       revisionOrderIsValid(candidateSentences, group.operations, factById) &&
       revisionWritingViolations(candidateSentences).length === 0;
+    return { candidateSentences, valid };
+  };
+  let sceneResults = new Map((Array.isArray(result.scenes) ? result.scenes : []).map(scene => [scene.sceneId, scene]));
+  const invalidSceneIds = sceneGroups.filter(group => !candidateForGroup(sceneResults, group).valid).map(group => group.id);
+  if (invalidSceneIds.length) {
+    try {
+      result = await callQwenJson([
+        ...messages,
+        { role: "assistant", content: JSON.stringify(result) },
+        {
+          role: "user",
+          content: JSON.stringify({
+            task: "上一版局部成文未通过质量校验。请保持事实和顺序不变，重新返回完整 JSON。",
+            invalid_scene_ids: invalidSceneIds,
+            required_fixes: [
+              "按小学低年级主谓宾结构真正重写，不得照抄口语倒装或修改指令",
+              "每句话最多绑定三个事实，事件较多时用句号自然分句",
+              "factTexts 必须完整、唯一，并严格遵守 order_constraints"
+            ]
+          })
+        }
+      ]);
+      sceneResults = new Map((Array.isArray(result.scenes) ? result.scenes : []).map(scene => [scene.sceneId, scene]));
+    } catch (error) {
+      console.error("Optional revision scene refinement failed:", error.message);
+    }
+  }
+  const sceneReplacementAtIndex = new Map();
+  const replacementAnchorIds = new Map();
+  const removedSceneIndexes = new Set();
+  for (const group of sceneGroups) {
+    const { candidateSentences, valid: validCandidate } = candidateForGroup(sceneResults, group);
     let replacements;
     if (validCandidate) {
       replacements = candidateSentences.map((sentence, index) => ({
         id: index === 0 ? group.sentences[0].id : `sentence_revised_${Date.now()}_${group.indexes[0]}_${index}`,
         text: sentence.text,
         factTexts: sentence.factTexts,
-        factIds: group.activeFacts.filter(fact => sentence.factTexts.includes(fact.text)).map(fact => fact.id)
+        factIds: sentence.factTexts.map(text => group.activeFacts.find(fact => fact.text === text)?.id).filter(Boolean)
       }));
     } else {
       const deterministicFallbackAllowed = group.operations.length > 0 && group.operations.every(operation =>
@@ -2292,5 +2324,6 @@ module.exports = {
   assignRevisionOperationsToSentences,
   revisionOperationSentenceIndex,
   revisionChangeIsValid,
+  revisionWritingViolations,
   semanticSimilarity
 };
