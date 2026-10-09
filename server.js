@@ -1056,6 +1056,7 @@ async function reviseWithQwen(input) {
           "孩子重新讲了一大段相关场景时，没再提到的旧事实不等于要删除；只覆盖明确冲突，保留其余兼容事实。",
           "已经出现在 facts 或 diary 中的人物、地点、活动和句子不得再返回 add；即使孩子在修改时又讲了一遍，也只视为原事实的重述。",
           "add 若补充同一事件内部的细节、结果或感受，填写 anchor_fact_id 且 placement=merge。",
+          "同一次口述中的一个新含义只能返回一个操作。不要把‘活动+新细节’和‘新细节’拆成两条近义 add；选择最贴近孩子原话、信息边界最准确的一条。",
           "add 若由‘之前、以前、之后、后来’等引入相邻事件，填写 anchor_fact_id 且 placement=before 或 after。独立新事件使用 independent。",
           "‘不是A，是B’属于 replace，不能拆成 delete 和 add。绝不能为了用新说法取代整个旧故事而批量 delete。",
           "不能确定目标事实时 operations 返回空数组，不得凭相似词强行修改。",
@@ -1199,7 +1200,30 @@ function normalizeRevisionOperations(input, operations) {
     if (duplicatesOperation) continue;
     safe.push(safeOperation);
   }
-  return safe;
+  const deduped = [];
+  for (const operation of safe) {
+    if (operation.type !== "add" || !operation.new_text) {
+      deduped.push(operation);
+      continue;
+    }
+    const duplicateIndex = deduped.findIndex(existing => {
+      if (existing.type !== "add" || !existing.new_text) return false;
+      if (semanticSimilarity(existing.new_text, operation.new_text) < 0.52) return false;
+      const existingGrounding = semanticSimilarity(instruction, existing.new_text);
+      const currentGrounding = semanticSimilarity(instruction, operation.new_text);
+      return Math.max(existingGrounding, currentGrounding) >= 0.82 &&
+        Math.abs(existingGrounding - currentGrounding) >= 0.18;
+    });
+    if (duplicateIndex < 0) {
+      deduped.push(operation);
+      continue;
+    }
+    const existing = deduped[duplicateIndex];
+    if (semanticSimilarity(instruction, operation.new_text) > semanticSimilarity(instruction, existing.new_text)) {
+      deduped[duplicateIndex] = operation;
+    }
+  }
+  return deduped;
 }
 
 function fallbackRevisionOperations(input) {
@@ -1268,19 +1292,63 @@ function fallbackRevisionOperations(input) {
   return [];
 }
 
-function sentenceMatchesRevision(sentence, operation, originalFact, anchorFact) {
-  if (operation.target_sentence_id && sentence.id === operation.target_sentence_id) return true;
-  if (operation.target_fact_id && (sentence.factIds || []).includes(operation.target_fact_id)) return true;
-  if (operation.type === "add" && operation.placement === "merge" && operation.anchor_fact_id && (sentence.factIds || []).includes(operation.anchor_fact_id)) return true;
-  const candidates = [
+function revisionOperationSentenceIndex(lockedDiary, operation, originalFact, anchorFact) {
+  if (!Array.isArray(lockedDiary) || !operation) return -1;
+  if (operation.type === "add" && operation.placement !== "merge") return -1;
+  if (operation.target_sentence_id) {
+    const directSentenceIndex = lockedDiary.findIndex(sentence => sentence?.id === operation.target_sentence_id);
+    if (directSentenceIndex >= 0) return directSentenceIndex;
+  }
+  const targetFactId = operation.type === "add" ? operation.anchor_fact_id : operation.target_fact_id;
+  if (targetFactId) {
+    const directFactIndex = lockedDiary.findIndex(sentence => (sentence?.factIds || []).includes(targetFactId));
+    if (directFactIndex >= 0) return directFactIndex;
+  }
+  const references = [
     operation.old_text,
     originalFact?.text,
-    operation.type === "add" && operation.placement === "merge" ? anchorFact?.text : ""
+    operation.type === "add" ? anchorFact?.text : ""
   ].filter(Boolean);
-  return candidates.some(text =>
-    String(sentence.text || "").includes(text) ||
-    (sentence.factTexts || []).some(source => semanticSimilarity(source, text) >= 0.58)
-  );
+  if (!references.length) return -1;
+  let bestIndex = -1;
+  let bestScore = 0;
+  lockedDiary.forEach((sentence, index) => {
+    const sources = [sentence?.text, ...(sentence?.factTexts || [])].filter(Boolean);
+    let score = 0;
+    for (const reference of references) {
+      for (const source of sources) {
+        if (String(source).includes(reference) || String(reference).includes(source)) score = Math.max(score, 1);
+        else if (hasDistinctSharedPhrase(source, reference)) score = Math.max(score, 0.72);
+        else score = Math.max(score, semanticSimilarity(source, reference));
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  });
+  return bestScore >= 0.22 ? bestIndex : -1;
+}
+
+function assignRevisionOperationsToSentences(lockedDiary, operations, factById, originalFacts) {
+  const assignments = new Map();
+  const unmatched = [];
+  for (const operation of operations) {
+    if (operation.type === "add" && operation.placement !== "merge") continue;
+    const index = revisionOperationSentenceIndex(
+      lockedDiary,
+      operation,
+      originalFacts.get(operation.target_fact_id),
+      factById.get(operation.anchor_fact_id)
+    );
+    if (index < 0) {
+      unmatched.push(operation);
+      continue;
+    }
+    if (!assignments.has(index)) assignments.set(index, []);
+    assignments.get(index).push(operation);
+  }
+  return { assignments, unmatched };
 }
 
 function deterministicRevisionText(sentence, operations, linkedFacts) {
@@ -1311,7 +1379,7 @@ function deterministicRevisionText(sentence, operations, linkedFacts) {
   return String(sentence.text || "");
 }
 
-function revisionChangeIsValid(text, operations) {
+function revisionChangeIsValid(text, operations, factById = new Map()) {
   if (!text) return false;
   return operations.every(operation => {
     if (operation.type === "remove_phrase" || operation.type === "delete") {
@@ -1322,8 +1390,19 @@ function revisionChangeIsValid(text, operations) {
         String(text).includes(operation.new_text) ||
         semanticSimilarity(text, operation.new_text) >= 0.48
       );
-      const keepsOld = operation.old_text && String(text).includes(operation.old_text);
-      return includesNew && !keepsOld;
+      const oldIsPartOfNew = operation.old_text && normalizeSemanticText(operation.new_text).includes(normalizeSemanticText(operation.old_text));
+      const keepsConflictingOld = operation.conflict === true && !oldIsPartOfNew && operation.old_text && String(text).includes(operation.old_text);
+      if (!includesNew || keepsConflictingOld) return false;
+      const oldGrams = semanticBigrams(operation.old_text || "");
+      const changedGrams = [...semanticBigrams(operation.new_text || "")].filter(gram => !oldGrams.has(gram));
+      return !changedGrams.length || changedGrams.some(gram => semanticBigrams(text).has(gram));
+    }
+    if (operation.type === "add") {
+      const anchorText = factById.get(operation.anchor_fact_id)?.text || "";
+      const anchorGrams = semanticBigrams(anchorText);
+      const changedGrams = [...semanticBigrams(operation.new_text || "")].filter(gram => !anchorGrams.has(gram));
+      if (changedGrams.length) return changedGrams.some(gram => semanticBigrams(text).has(gram));
+      return semanticSimilarity(text, operation.new_text) >= 0.3;
     }
     return true;
   });
@@ -1340,12 +1419,13 @@ async function reviseLockedCompositionWithQwen(input) {
       originalFacts.set(operation.target_fact_id, { id: operation.target_fact_id, text: operation.old_text });
     }
   }
-  const operationsForSentence = sentence => operations.filter(operation =>
-    sentenceMatchesRevision(sentence, operation, originalFacts.get(operation.target_fact_id), factById.get(operation.anchor_fact_id))
-  );
-  const affectedIndexes = lockedDiary
-    .map((sentence, index) => operationsForSentence(sentence).length ? index : -1)
-    .filter(index => index >= 0);
+  const operationAssignment = assignRevisionOperationsToSentences(lockedDiary, operations, factById, originalFacts);
+  const unmatchedBlockingOperations = operationAssignment.unmatched.filter(operation => operation.type !== "add");
+  if (unmatchedBlockingOperations.length) {
+    throw new Error("修改内容没有找到对应的原句，原日记已保留");
+  }
+  const operationsForIndex = index => operationAssignment.assignments.get(index) || [];
+  const affectedIndexes = [...operationAssignment.assignments.keys()].sort((left, right) => left - right);
   const sceneGroups = [];
   for (const index of affectedIndexes) {
     const previous = sceneGroups[sceneGroups.length - 1];
@@ -1358,12 +1438,11 @@ async function reviseLockedCompositionWithQwen(input) {
   const claimedFactIds = new Set();
   for (const group of sceneGroups) {
     const sentences = group.indexes.map(index => lockedDiary[index]);
-    const groupOperations = operations.filter(operation => sentences.some(sentence =>
-      sentenceMatchesRevision(sentence, operation, originalFacts.get(operation.target_fact_id), factById.get(operation.anchor_fact_id))
-    ));
+    const groupOperations = group.indexes.flatMap(index => operationsForIndex(index));
     const linkedIds = new Set(sentences.flatMap(sentence => sentence.factIds || []));
     for (const operation of groupOperations) {
       if (operation.target_fact_id) linkedIds.add(operation.target_fact_id);
+      if (operation.anchor_fact_id) linkedIds.add(operation.anchor_fact_id);
       if (operation.applied_fact_id) linkedIds.add(operation.applied_fact_id);
     }
     group.sentences = sentences;
@@ -1375,7 +1454,9 @@ async function reviseLockedCompositionWithQwen(input) {
     group.activeFacts.forEach(fact => claimedFactIds.add(fact.id));
   }
   const addedFacts = operations
-    .filter(operation => operation.type === "add" && operation.applied_fact_id && !(operation.anchor_fact_id && operation.placement === "merge"))
+    .filter(operation => operation.type === "add" && operation.applied_fact_id && (
+      !(operation.anchor_fact_id && operation.placement === "merge") || operationAssignment.unmatched.includes(operation)
+    ))
     .map(operation => factById.get(operation.applied_fact_id))
     .filter(Boolean);
   const messages = [
@@ -1448,7 +1529,7 @@ async function reviseLockedCompositionWithQwen(input) {
       expectedTexts.every(text => useCounts.get(text) === 1) &&
       usedTexts.every(text => expectedTextSet.has(text));
     const joinedText = candidateSentences.map(sentence => sentence.text).join("");
-    const validCandidate = candidateSentences.length > 0 && exactCoverage && revisionChangeIsValid(joinedText, group.operations);
+    const validCandidate = candidateSentences.length > 0 && exactCoverage && revisionChangeIsValid(joinedText, group.operations, factById);
     let replacements;
     if (validCandidate) {
       replacements = candidateSentences.map((sentence, index) => ({
@@ -1459,8 +1540,8 @@ async function reviseLockedCompositionWithQwen(input) {
       }));
     } else {
       const fallbackClaimedIds = new Set();
-      replacements = group.sentences.map(sentence => {
-        const sentenceOperations = operationsForSentence(sentence);
+      replacements = group.sentences.map((sentence, offset) => {
+        const sentenceOperations = operationsForIndex(group.indexes[offset]);
         const activeSentenceFacts = (sentence.factIds || [])
           .filter(id => !fallbackClaimedIds.has(id))
           .map(id => factById.get(id))
@@ -1476,6 +1557,19 @@ async function reviseLockedCompositionWithQwen(input) {
         };
       }).filter(sentence => sentence.text && (sentence.factIds.length || sentence.hasPhraseOnlyEdit))
         .map(({ hasPhraseOnlyEdit, ...sentence }) => sentence);
+      const coveredFallbackIds = new Set(replacements.flatMap(sentence => sentence.factIds || []));
+      for (const operation of group.operations) {
+        if (operation.type !== "add" || !operation.applied_fact_id || coveredFallbackIds.has(operation.applied_fact_id)) continue;
+        const fact = factById.get(operation.applied_fact_id);
+        if (!fact) continue;
+        replacements.push({
+          id: `sentence_revised_fallback_${Date.now()}_${group.indexes[0]}_${replacements.length}`,
+          text: /[。！？!?]$/u.test(fact.text) ? fact.text : `${fact.text}。`,
+          factTexts: [fact.text],
+          factIds: [fact.id]
+        });
+        coveredFallbackIds.add(fact.id);
+      }
     }
     sceneReplacementAtIndex.set(group.indexes[0], replacements);
     const replacementId = replacements[0]?.id || "";
@@ -1498,9 +1592,18 @@ async function reviseLockedCompositionWithQwen(input) {
   const generatedAdditionSentences = [];
   const placementForFact = fact => {
     const operation = operations.find(item => item.type === "add" && item.applied_fact_id === fact.id);
-    const anchorSentence = operation?.anchor_fact_id
+    let anchorSentence = operation?.anchor_fact_id
       ? lockedDiary.find(sentence => (sentence.factIds || []).includes(operation.anchor_fact_id))
       : null;
+    if (!anchorSentence && operation?.anchor_fact_id) {
+      const fallbackIndex = revisionOperationSentenceIndex(
+        lockedDiary,
+        { ...operation, placement: "merge" },
+        null,
+        factById.get(operation.anchor_fact_id)
+      );
+      anchorSentence = fallbackIndex >= 0 ? lockedDiary[fallbackIndex] : null;
+    }
     return {
       anchorSentenceId: replacementAnchorIds.get(anchorSentence?.id) || anchorSentence?.id || "",
       position: ["before", "after"].includes(operation?.placement) ? operation.placement : ""
@@ -1564,7 +1667,8 @@ async function reviseLockedCompositionWithQwen(input) {
   }
   return {
     title,
-    sentences: orderedSentences
+    sentences: orderedSentences,
+    changedSentenceIds: [...new Set(sceneGroups.flatMap(group => group.sentences.map(sentence => sentence.id)).filter(Boolean))]
   };
 }
 
@@ -1929,6 +2033,8 @@ module.exports = {
   deterministicRevisionText,
   fallbackRevisionOperations,
   normalizeRevisionOperations,
+  assignRevisionOperationsToSentences,
+  revisionOperationSentenceIndex,
   revisionChangeIsValid,
   semanticSimilarity
 };

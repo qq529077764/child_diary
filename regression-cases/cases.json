@@ -78,5 +78,15 @@
     "symptom": "事实级修改找不到目标，重复提示没有修改。",
     "invariant": "成文阶段产生的句内冗余也必须可以被明确删除。",
     "generalRule": "支持带句子 ID 的 remove_phrase 操作，同时保持该句其他事实来源不变。"
+  },
+  {
+    "id": "case-revision-detail-disappears-001",
+    "capturedAt": "2026-10-09",
+    "stage": "revision_compose",
+    "status": "generalized",
+    "minimalInput": "孩子只补全原场景中一个被截断的物品名称，识别模型把同一句话拆成两条近义新增事实。",
+    "symptom": "修改后无关句子被重写，新增细节没有进入正文，并在事实池留下重复记录。",
+    "invariant": "一条修改最多命中一个相关场景；同义修改只保留最贴近原话的一条；正文必须实际出现修改后的区别信息。",
+    "generalRule": "先按原话贴合度合并同义操作，再把每条操作唯一分配给最相关原句；无法定位的替换拒绝应用，可定位的场景只做局部重整。"
   }
 ]

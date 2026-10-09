@@ -7,15 +7,6 @@ const CLOUD_TOKEN_KEY = "cloudSessionToken";
 const INSTALLATION_ID_KEY = "installationId";
 const GUARDIAN_CONSENT_KEY = "guardianConsent";
 const CHILD_PRIVACY_VERSION = "2026-10-09-v1";
-const PRIVATE_STORAGE_KEYS = [
-  DIARY_HISTORY_KEY,
-  LATEST_DIARY_KEY,
-  CLOUD_TOKEN_KEY,
-  INSTALLATION_ID_KEY,
-  GUARDIAN_CONSENT_KEY,
-  "pendingDiaryRevision"
-];
-
 const CHILD_PRIVACY_SECTIONS = [
   {
     title: "我们会使用什么信息",
@@ -31,11 +22,11 @@ const CHILD_PRIVACY_SECTIONS = [
   },
   {
     title: "保存、删除和撤回",
-    text: "确认保存的日记会保存在服务器，直到监护人主动删除。删除单篇日记会立即从正在使用的数据库中删除；备份副本与线上服务隔离，并在最长30天内自动到期。监护人也可以撤回同意并删除全部日记和账户标识。"
+    text: "确认保存的日记会保存在服务器，直到监护人主动删除。删除单篇日记会立即从正在使用的数据库中删除；备份副本与线上服务隔离，并在最长30天内自动到期。如需撤回同意或删除全部数据，请联系 529077764@qq.com。"
   },
   {
     title: "监护人的权利",
-    text: "监护人可以查看和删除日记、撤回同意并删除全部数据。拒绝或撤回不会产生额外费用，但语音整理、云端保存和日记查询功能将不能继续使用。需要帮助可联系 529077764@qq.com。"
+    text: "监护人可以查看和删除单篇日记，也可以通过 529077764@qq.com 联系管理员，申请撤回同意、更正信息或删除全部数据。拒绝或撤回不会产生额外费用，但相关功能将不能继续使用。"
   }
 ];
 
@@ -318,56 +309,6 @@ Page({
     });
   },
 
-  clearPrivateLocalData() {
-    PRIVATE_STORAGE_KEYS.forEach(key => {
-      try { wx.removeStorageSync(key); } catch (error) {}
-    });
-    this.cloudToken = "";
-    this.authPromise = null;
-    this.authError = null;
-    this.guardianConsentServerSynced = false;
-    this.cloudHistoryInitialized = false;
-    this.pendingProtectedAction = "";
-    this.loadDiaryHistory();
-  },
-
-  withdrawGuardianConsent() {
-    if (!this.hasGuardianConsent()) {
-      this.clearPrivateLocalData();
-      this.resetRuntime();
-      this.setData({ phase: "home", guardianConsentRecorded: false, selectedDiary: null });
-      return;
-    }
-    wx.showModal({
-      title: "撤回同意并删除全部数据？",
-      content: "服务器中的全部日记和账户标识都会删除，手机里的日记副本也会清除。此操作不能恢复。",
-      confirmText: "全部删除",
-      confirmColor: "#d85f3f",
-      success: async result => {
-        if (!result.confirm) return;
-        wx.showLoading({ title: "正在删除", mask: true });
-        try {
-          await this.ensureAccountSessionForDeletion();
-          await this.rawRequest("/api/account", "DELETE");
-          this.clearPrivateLocalData();
-          this.resetRuntime();
-          this.setData({
-            phase: "home",
-            guardianConsentRecorded: false,
-            selectedDiary: null,
-            diaryTitle: "",
-            diarySentences: []
-          });
-          wx.showModal({ title: "已经删除", content: "监护人同意、云端日记和手机副本都已删除。", showCancel: false });
-        } catch (error) {
-          wx.showModal({ title: "还没有删除成功", content: error.message || "请检查网络后再试。", showCancel: false });
-        } finally {
-          wx.hideLoading();
-        }
-      }
-    });
-  },
-
   installationId() {
     let id = wx.getStorageSync(INSTALLATION_ID_KEY);
     if (!id) {
@@ -431,10 +372,6 @@ Page({
     this.authError = null;
     wx.setStorageSync(CLOUD_TOKEN_KEY, auth.token);
     return auth.token;
-  },
-
-  async ensureAccountSessionForDeletion() {
-    return this.authenticateCloudSession();
   },
 
   startCloudInitialization() {
@@ -924,14 +861,49 @@ Page({
   },
 
   async composeDiary(options = {}) {
+    const { applyResult = true, ...requestOptions } = options;
     const facts = this.facts.filter(fact => fact.active !== false);
     const data = await this.request("/api/compose", {
       facts,
       utterances: this.utterances,
-      ...options
+      ...requestOptions
     });
-    this.applyDiaryResponse(data);
+    if (applyResult) this.applyDiaryResponse(data);
     return data;
+  },
+
+  validateRevisionComposition(lockedDiary, operations, data) {
+    const revisedSentences = Array.isArray(data?.sentences) ? data.sentences : [];
+    const changedSentenceIds = new Set(Array.isArray(data?.changedSentenceIds) ? data.changedSentenceIds : []);
+    if (!revisedSentences.length) throw new Error("修改结果没有完整句子");
+    if (!Array.isArray(data?.changedSentenceIds)) throw new Error("修改结果缺少局部校验信息");
+
+    const revisedById = new Map(revisedSentences.filter(sentence => sentence?.id).map(sentence => [sentence.id, sentence]));
+    for (const original of lockedDiary) {
+      if (changedSentenceIds.has(original.id)) continue;
+      const preserved = revisedById.get(original.id);
+      if (!preserved || preserved.text !== original.text) {
+        throw new Error("这次修改影响了无关内容");
+      }
+    }
+
+    const revisedFactIds = new Set(revisedSentences.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []));
+    const revisedText = revisedSentences.map(sentence => sentence.text || "").join("");
+    for (const operation of operations) {
+      if (operation.type === "add" && operation.applied_fact_id && !revisedFactIds.has(operation.applied_fact_id)) {
+        throw new Error("新补充的内容没有写进日记");
+      }
+      if (operation.type === "replace" && operation.target_fact_id && !revisedFactIds.has(operation.target_fact_id)) {
+        throw new Error("要修改的事情在结果中丢失了");
+      }
+      if (operation.type === "delete" && operation.target_fact_id && revisedFactIds.has(operation.target_fact_id)) {
+        throw new Error("要删除的内容仍然存在");
+      }
+      if (operation.type === "remove_phrase" && operation.old_text && revisedText.includes(operation.old_text)) {
+        throw new Error("要去掉的话仍然存在");
+      }
+    }
+    return true;
   },
 
   applyDiaryResponse(data) {
@@ -1053,13 +1025,16 @@ Page({
         factTexts: item.factTexts,
         factIds: item.factIds
       }));
-      await this.composeDiary({
+      const composition = await this.composeDiary({
+        applyResult: false,
         lockedTitle: this.data.diaryTitle,
         lockedDiary,
         revisionOperations: appliedOperations,
         revisionInstruction: this.revisionTranscript,
         revisionMode: result.revisionMode || ""
       });
+      this.validateRevisionComposition(lockedDiary, appliedOperations, composition);
+      this.applyDiaryResponse(composition);
       this.revisionBaseSnapshot = null;
     } catch (error) {
       if (this.revisionBaseSnapshot) {

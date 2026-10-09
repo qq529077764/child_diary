@@ -1,10 +1,12 @@
 const assert = require("node:assert/strict");
 const {
+  assignRevisionOperationsToSentences,
   compositionPenalty,
   dedupeSemanticFacts,
   deterministicRevisionText,
   fallbackRevisionOperations,
-  normalizeRevisionOperations
+  normalizeRevisionOperations,
+  revisionChangeIsValid
 } = require("../server");
 
 const diary = [{
@@ -55,6 +57,49 @@ const oneTargetOnce = normalizeRevisionOperations({ instruction: "不是原来�
 ]);
 assert.equal(oneTargetOnce.length, 1, "同一事实一次修改只能保留一个最终操作");
 assert.equal(oneTargetOnce[0].new_text, "检查结束以后，我进教室吃早餐", "同一事实应保留信息更完整的修改");
+
+const readingFacts = [
+  { id: "book", slot: "what", text: "跟老师一起读绘本", active: true },
+  { id: "outside", slot: "what", text: "去户外骑自行车", active: true }
+];
+const readingDiary = [
+  { id: "school", text: "我到了学校。", factIds: [], factTexts: ["到学校"] },
+  { id: "reading", text: "吃完早餐后，我和老师一起读了绘本。", factIds: [], factTexts: ["跟老师一起读绘本"] },
+  { id: "outside", text: "接着我去户外骑了自行车。", factIds: ["outside"], factTexts: ["去户外骑自行车"] }
+];
+const readingInstruction = "绘本是三只小猪的故事";
+const normalizedReadingDetail = normalizeRevisionOperations({
+  instruction: readingInstruction,
+  facts: readingFacts,
+  diary: readingDiary,
+  revisionIntent: "related_addition"
+}, [
+  { type: "add", anchor_fact_id: "book", placement: "merge", new_text: "绘本是三只小猪的故事" },
+  { type: "add", anchor_fact_id: "book", placement: "merge", new_text: "读了三只小猪的绘本" }
+]);
+assert.equal(normalizedReadingDetail.length, 1, "同一次修改拆出的同义新增事实只能保留一条");
+assert.equal(normalizedReadingDetail[0].new_text, readingInstruction, "同义新增事实应保留最贴近孩子原话的一条");
+
+const readingFactMap = new Map(readingFacts.map(fact => [fact.id, fact]));
+const readingOperation = { ...normalizedReadingDetail[0], applied_fact_id: "book-detail" };
+const readingAssignments = assignRevisionOperationsToSentences(
+  readingDiary,
+  [readingOperation],
+  readingFactMap,
+  new Map()
+);
+assert.deepEqual([...readingAssignments.assignments.keys()], [1], "事实编号缺失时也应只锁定语义最相关的原句");
+assert.equal(readingAssignments.unmatched.length, 0, "可定位的局部修改不能掉入未消费状态");
+assert.equal(
+  revisionChangeIsValid("吃完早餐后，我和老师一起读了绘本。", [readingOperation], readingFactMap),
+  false,
+  "正文没有写入新增细节时不能仅凭 factTexts 判定修改成功"
+);
+assert.equal(
+  revisionChangeIsValid("吃完早餐后，我和老师一起读了三只小猪的故事。", [readingOperation], readingFactMap),
+  true,
+  "正文真正写入新增细节后应通过局部修改校验"
+);
 
 const relatedFacts = dedupeSemanticFacts([
   { id: "a", slot: "what", text: "我和哥哥一起玩滑梯" },

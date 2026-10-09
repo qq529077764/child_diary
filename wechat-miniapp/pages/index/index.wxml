@@ -9,7 +9,7 @@
       <text class="muted">开始以后一直说就好，中间不需要点按钮。</text>
     </view>
     <view class="theme-card">
-      <view class="theme-meta"><text class="eyebrow">今日主题</text><button class="privacy-inline" bindtap="openPrivacyCenter">家长与隐私</button></view>
+      <text class="eyebrow">今日主题</text>
       <text class="theme">今天你帮助别人做了什么？</text>
     </view>
     <view class="home-actions">
@@ -29,6 +29,7 @@
       </view>
     </scroll-view>
     <button class="button primary" bindtap="startStory">讲一个新故事</button>
+    <button class="history-privacy" bindtap="openPrivacyCenter">家长与隐私</button>
   </view>
 
   <view wx:elif="{{phase === 'historyDetail'}}" class="screen history-detail-screen">
@@ -105,14 +106,13 @@
       </view>
       <view class="privacy-summary">
         <text class="privacy-heading">我们怎样保护孩子的信息</text>
-        <text class="privacy-paragraph">录音只用于语音转文字，本服务不会长期保存录音文件。确认后的日记会保存在服务器，监护人可以删除单篇日记，也可以撤回同意并删除全部数据。</text>
+        <text class="privacy-paragraph">录音只用于语音转文字，本服务不会长期保存录音文件。确认后的日记会保存在服务器，监护人可以删除单篇日记；如需撤回同意或删除全部数据，请联系 529077764@qq.com。</text>
         <text class="privacy-paragraph">我们不会把孩子的信息用于广告、用户画像或公开展示。</text>
       </view>
       <button class="settings-row" bindtap="openChildPrivacyRules"><text>儿童个人信息保护规则</text><text>›</text></button>
       <button class="settings-row" bindtap="openWechatPrivacyContract"><text>小程序隐私保护指引</text><text>›</text></button>
       <view class="contact-row"><text>联系邮箱</text><text>529077764@qq.com</text></view>
     </scroll-view>
-    <button wx:if="{{guardianConsentRecorded}}" class="danger-outline" bindtap="withdrawGuardianConsent">撤回同意并删除全部数据</button>
   </view>
 
   <view wx:else class="screen success">
@@ -125,7 +125,7 @@
       <text class="guardian-kicker">请家长阅读</text>
       <text class="guardian-title">监护人同意后再开始</text>
       <text class="guardian-copy">童心日记面向儿童使用。我们会处理孩子的录音片段、转写文字和日记内容，用于语音识别、问题引导、日记整理与保存。</text>
-      <text class="guardian-copy">录音不会在日记服务器长期保存；日记可随时删除，也可撤回同意并删除全部数据。</text>
+      <text class="guardian-copy">录音不会在日记服务器长期保存；日记可随时删除。如需撤回同意或删除全部数据，请联系 529077764@qq.com。</text>
       <view class="guardian-links">
         <button class="text-link" bindtap="openChildPrivacyRules">儿童个人信息保护规则</button>
         <button class="text-link" bindtap="openWechatPrivacyContract">小程序隐私保护指引</button>
