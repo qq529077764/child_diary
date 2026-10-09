@@ -198,6 +198,24 @@ assert.equal(
   true,
   "正文真正写入新增细节后应通过局部修改校验"
 );
+assert.equal(
+  revisionChangeIsValid(
+    [{ text: "检查结束后，我到教室吃了早餐。", factIds: ["f1"] }],
+    [{ type: "replace", target_fact_id: "f1", old_text: "我就进教室里面吃早餐，进去了", new_text: "检查结束后进教室吃早餐", conflict: false }],
+    new Map([["f1", { id: "f1", text: "检查结束后进教室吃早餐" }]])
+  ),
+  true,
+  "事实编号已绑定时应允许模型重组病句，不能要求正文复现修改口述字词"
+);
+assert.equal(
+  revisionChangeIsValid(
+    [{ text: "我没有带玩具，后来参加了分享活动。", factIds: ["toy"] }],
+    [{ type: "replace", target_fact_id: "toy", old_text: "没有带玩具", new_text: "带了玩具", conflict: true }],
+    new Map([["toy", { id: "toy", text: "带了玩具" }]])
+  ),
+  false,
+  "事实编号不能掩盖仍然保留的明确冲突旧事实"
+);
 
 const relatedFacts = dedupeSemanticFacts([
   { id: "a", slot: "what", text: "我和哥哥一起玩滑梯" },

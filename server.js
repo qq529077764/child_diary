@@ -944,7 +944,7 @@ async function composeWithQwen(input) {
   const messages = [
     {
       role: "system",
-      content: "你是帮助5-9岁儿童学习完整表达的口述日记整理老师。必须事实约束生成：不得添加孩子没说过的人物、地点、时间、天气、颜色、数量、动作、因果、评价或情绪。你可以调整语序、合并重复片段、补充必要的语法成分和连接词，让每句话完整、自然，前后有清楚的事件顺序，同时尽量保留孩子原本的词语和口吻。只返回 JSON。"
+      content: "你是帮助5-9岁儿童学习完整表达的口述日记整理老师。孩子的口述本来就可能零碎、重复、倒装或不通顺，你的核心工作是理解意思后重新组织语言，而不是修补或照抄原句。必须事实约束生成：不得添加孩子没说过的人物、地点、时间、天气、颜色、数量、动作、因果、评价或情绪。事实和关系必须忠实，句式和语序可以充分重写；保留孩子有特点的用词与口吻。只返回 JSON。"
     },
     {
       role: "user",
@@ -957,6 +957,7 @@ async function composeWithQwen(input) {
         rules: [
           "每一句只能表达 facts 中已有的有效含义，factTexts 必须逐项列出该句覆盖的事实 text。",
           "accepted_child_utterances 是已经去除家长引导、背景声和无效内容的孩子原话片段。正文用词、形容和细节优先从这里取，不得根据事实标签自行扩写。",
+          "孩子原话和 facts 可能是半句、倒装句或不通顺的短语。它们是事实证据，不是正文模板；忠于它们的意思、人物和关系即可，不需要保留原句结构或相同字词。",
           "可以调整语序、主语和谓语位置，合并相邻事实，去掉口头重复和无意义语气词。",
           "facts 是来源账本，不是要求逐条照抄的句子。同一场景中重复、包含、前后补全或指向同一动作的事实，应共同绑定到一条通顺表达，正文只说一次。",
           "孩子停顿后补出的半句、指代词或单独的‘去了、进去了、做完了’如果没有增加独立信息，要结合上下文并入完整动作或省略，不能原样留在句尾。",
@@ -1589,29 +1590,30 @@ function deterministicRevisionText(sentence, operations, linkedFacts) {
   return String(sentence.text || "");
 }
 
-function revisionChangeIsValid(text, operations, factById = new Map()) {
+function revisionChangeIsValid(candidate, operations, factById = new Map()) {
+  const sentences = Array.isArray(candidate)
+    ? candidate
+    : [{ text: String(candidate || ""), factIds: [] }];
+  const text = sentences.map(sentence => String(sentence?.text || "")).join("");
+  const usedFactIds = new Set(sentences.flatMap(sentence => Array.isArray(sentence?.factIds) ? sentence.factIds : []));
   if (!text) return false;
   return operations.every(operation => {
     if (operation.type === "remove_phrase" || operation.type === "delete") {
       return !operation.old_text || !String(text).includes(operation.old_text);
     }
     if (operation.type === "replace") {
-      const includesNew = operation.new_text && (
-        String(text).includes(operation.new_text) ||
-        semanticSimilarity(text, operation.new_text) >= 0.48
-      );
       const oldIsPartOfNew = operation.old_text && normalizeSemanticText(operation.new_text).includes(normalizeSemanticText(operation.old_text));
       const keepsConflictingOld = operation.conflict === true && !oldIsPartOfNew && operation.old_text && String(text).includes(operation.old_text);
-      if (!includesNew || keepsConflictingOld) return false;
-      const oldGrams = semanticBigrams(operation.old_text || "");
-      const changedGrams = [...semanticBigrams(operation.new_text || "")].filter(gram => !oldGrams.has(gram));
-      return !changedGrams.length || changedGrams.some(gram => semanticBigrams(text).has(gram));
+      if (keepsConflictingOld) return false;
+      // 局部成文以事实编号证明修改后的事实已被使用。正文允许彻底重组语序，
+      // 不能再用孩子不通顺的修改口述做字面相似度门槛。
+      if (operation.target_fact_id && usedFactIds.size) return usedFactIds.has(operation.target_fact_id);
+      return Boolean(operation.new_text) && (
+        String(text).includes(operation.new_text) || semanticSimilarity(text, operation.new_text) >= 0.3
+      );
     }
     if (operation.type === "add") {
-      const anchorText = factById.get(operation.anchor_fact_id)?.text || "";
-      const anchorGrams = semanticBigrams(anchorText);
-      const changedGrams = [...semanticBigrams(operation.new_text || "")].filter(gram => !anchorGrams.has(gram));
-      if (changedGrams.length) return changedGrams.some(gram => semanticBigrams(text).has(gram));
+      if (operation.applied_fact_id && usedFactIds.size) return usedFactIds.has(operation.applied_fact_id);
       return semanticSimilarity(text, operation.new_text) >= 0.3;
     }
     return true;
@@ -1619,13 +1621,14 @@ function revisionChangeIsValid(text, operations, factById = new Map()) {
 }
 
 function revisionOrderIsValid(sentences, operations, factById) {
+  const usedFactIds = (sentences || []).flatMap(sentence => Array.isArray(sentence?.factIds) ? sentence.factIds : []);
   const usedTexts = (sentences || []).flatMap(sentence => Array.isArray(sentence?.factTexts) ? sentence.factTexts : []);
   return (operations || []).filter(operation => operation.type === "reorder").every(operation => {
     let cursor = -1;
     for (const factId of operation.ordered_fact_ids || []) {
-      const factText = factById.get(factId)?.text;
-      if (!factText) return false;
-      const nextIndex = usedTexts.findIndex((text, index) => index > cursor && text === factText);
+      const nextIndex = usedFactIds.length
+        ? usedFactIds.findIndex((id, index) => index > cursor && id === factId)
+        : usedTexts.findIndex((text, index) => index > cursor && text === factById.get(factId)?.text);
       if (nextIndex < 0) return false;
       cursor = nextIndex;
     }
@@ -1729,14 +1732,14 @@ async function reviseLockedCompositionWithQwen(input) {
   const messages = [
     {
       role: "system",
-      content: "你是儿童日记的局部场景修改器。第一版日记已锁定，只重整本次修改涉及的相邻场景，其他句子由系统逐字保留。规则用于限制事实边界；你要综合同一场景的零碎、重复和前后补充，把它们重新组织成自然完整的低年级句子。不得重新生成整篇，不得加入修改口述之外的新信息。只返回 JSON。"
+      content: "你是儿童日记的局部场景修改器。第一版日记已锁定，只重整本次修改涉及的相邻场景，其他句子由系统逐字保留。孩子的修改口述和事实 text 可能零碎、倒装或不通顺，它们只限定事实意思，不限定最终措辞。你要理解相关事实后重新组织成自然、简洁的低年级句子，不得修补式照抄病句。不得重新生成整篇，不得加入修改口述之外的新信息。只返回 JSON。"
     },
     {
       role: "user",
       content: JSON.stringify({
         schema: {
-          scenes: [{ sceneId: "affected_scenes 中的 id", sentences: [{ text: "局部重整后的完整句子", factTexts: ["本句覆盖的有效事实 text"] }] }],
-          additions: [{ anchorSentenceId: "相关原句 id 或空", position: "before|after|end", text: "新增事实组成的完整句子", factTexts: ["新增事实 text"] }]
+          scenes: [{ sceneId: "affected_scenes 中的 id", sentences: [{ text: "局部重整后的完整句子", factIds: ["本句实际使用的事实 id"] }] }],
+          additions: [{ anchorSentenceId: "相关原句 id 或空", position: "before|after|end", text: "新增事实组成的完整句子", factIds: ["本句实际使用的新增事实 id"] }]
         },
         rules: [
           "scenes 只能使用 affected_scenes 中的 sceneId；每个场景可以输出一句或多句，系统会把它们放回原场景位置。",
@@ -1748,7 +1751,7 @@ async function reviseLockedCompositionWithQwen(input) {
           "独立新增事件按时间和语境选择相邻原句；无法判断时 position=end。",
           "每个句号结束的独立句子要有清楚的主谓关系，需要时写清宾语；同一主体的一组连续动作可以共用一次主语，不要在相邻分句反复写‘我’或‘我们’。",
           "孩子停顿后补出的半句、指代词或没有独立信息的动作残片要并入完整表达或省略，不能原样留成病句。",
-          "每个 affected_scene 的全部 expected_facts 必须各绑定一次；factTexts 使用完整 text。同一场景正文可以只表达一次重叠含义，但来源账本仍需全部绑定。",
+          "每个 affected_scene 的全部 expected_facts 必须各绑定一次；只在 factIds 中填写事实 id，不要复制事实原句。事实原句可能不通顺，它只限定意思，不限定最终句式。",
           "每个新增事实只能出现在一个 scene 或一条 addition 中，不能既合并进旧场景又单独生成新句。",
           "明确的时间顺序、因果、条件、转折或约定属于事实关系，修改局部内容时必须保留。",
           "reorder 的 ordered_fact_ids 是唯一有效的先后约束。必须按该顺序组织相应事实，可以合并连续动作，但不得反转、遗漏或重复。",
@@ -1758,7 +1761,7 @@ async function reviseLockedCompositionWithQwen(input) {
           "修改后的场景应当比修改口述更清楚，并尽量与原场景同样简洁或更精炼。重排已有事实不得无故增加句子数量、重复主语或扩写篇幅。",
           "整个局部场景中的‘然后’最多出现一次，其余先后关系用‘……后、接着、后来、最后’或直接分句表达。",
           "优先保留孩子原有形容词、叠词和儿童化说法，不擅自增加成人化词语、原因、评价、情绪或细节。",
-          "factTexts 只能使用对应场景 expected_facts 或 added_facts 里完整的 text。"
+          "factIds 只能使用对应场景 expected_facts 或 added_facts 里的 id。正文必须重新组织语言，不能因为要绑定来源而照抄事实 text。"
         ],
         intent: input.revisionMode || "",
         operations: operations.map(operation => ({
@@ -1794,17 +1797,32 @@ async function reviseLockedCompositionWithQwen(input) {
     throw new Error(`修改内容暂时没有整理成功：${error.message}`);
   }
   const candidateForGroup = (sceneResults, group) => {
-    const expectedTexts = [...new Set(group.activeFacts.map(fact => fact.text))];
-    const expectedTextSet = new Set(expectedTexts);
+    const expectedIds = [...new Set(group.activeFacts.map(fact => fact.id))];
+    const expectedIdSet = new Set(expectedIds);
     const candidate = sceneResults.get(group.id);
-    const candidateSentences = Array.isArray(candidate?.sentences) ? candidate.sentences.filter(sentence => sentence?.text) : [];
-    const usedTexts = candidateSentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []);
-    const useCounts = usedTexts.reduce((counts, text) => counts.set(text, (counts.get(text) || 0) + 1), new Map());
-    const exactCoverage = usedTexts.length === expectedTexts.length &&
-      expectedTexts.every(text => useCounts.get(text) === 1) &&
-      usedTexts.every(text => expectedTextSet.has(text));
+    let sourceIdsValid = true;
+    const candidateSentences = (Array.isArray(candidate?.sentences) ? candidate.sentences : [])
+      .filter(sentence => sentence?.text)
+      .map(sentence => {
+        const legacyFactIds = (sentence.factTexts || [])
+          .map(text => group.activeFacts.find(fact => fact.text === text)?.id)
+          .filter(Boolean);
+        const reportedFactIds = Array.isArray(sentence.factIds) && sentence.factIds.length ? sentence.factIds : legacyFactIds;
+        if (reportedFactIds.some(id => !expectedIdSet.has(id))) sourceIdsValid = false;
+        const factIds = [...new Set(reportedFactIds.filter(id => expectedIdSet.has(id)))];
+        return {
+          text: sentence.text,
+          factIds,
+          factTexts: factIds.map(id => factById.get(id)?.text).filter(Boolean)
+        };
+      });
+    const usedFactIds = candidateSentences.flatMap(sentence => sentence.factIds);
+    const useCounts = usedFactIds.reduce((counts, id) => counts.set(id, (counts.get(id) || 0) + 1), new Map());
+    const exactCoverage = sourceIdsValid && usedFactIds.length === expectedIds.length &&
+      expectedIds.every(id => useCounts.get(id) === 1) &&
+      usedFactIds.every(id => expectedIdSet.has(id));
     const joinedText = candidateSentences.map(sentence => sentence.text).join("");
-    const changeValid = revisionChangeIsValid(joinedText, group.operations, factById);
+    const changeValid = revisionChangeIsValid(candidateSentences, group.operations, factById);
     const orderValid = revisionOrderIsValid(candidateSentences, group.operations, factById);
     const writingViolations = revisionWritingViolations(candidateSentences, {
       originalSentences: group.sentences,
@@ -1818,8 +1836,9 @@ async function reviseLockedCompositionWithQwen(input) {
         sceneId: group.id,
         sentenceCount: candidateSentences.length,
         factCounts: candidateSentences.map(sentence => (sentence.factTexts || []).length),
-        expectedFactCount: expectedTexts.length,
-        usedFactCount: usedTexts.length,
+        expectedFactCount: expectedIds.length,
+        usedFactCount: usedFactIds.length,
+        sourceIdsValid,
         exactCoverage,
         changeValid,
         orderValid,
@@ -1844,7 +1863,7 @@ async function reviseLockedCompositionWithQwen(input) {
             required_fixes: [
               "按小学低年级主谓宾结构真正重写，不得照抄口语倒装或修改指令",
               "按语义关系紧凑断句，不按事实数量机械拆句，不重复主语或无故扩写",
-              "factTexts 必须完整、唯一，并严格遵守 order_constraints"
+              "factIds 必须完整、唯一，并严格遵守 order_constraints；事实原句只限定意思，不得照抄病句"
             ]
           })
         }
@@ -1865,7 +1884,7 @@ async function reviseLockedCompositionWithQwen(input) {
         id: index === 0 ? group.sentences[0].id : `sentence_revised_${Date.now()}_${group.indexes[0]}_${index}`,
         text: sentence.text,
         factTexts: sentence.factTexts,
-        factIds: sentence.factTexts.map(text => group.activeFacts.find(fact => fact.text === text)?.id).filter(Boolean)
+        factIds: sentence.factIds
       }));
     } else {
       const deterministicFallbackAllowed = group.operations.length > 0 && group.operations.every(operation =>
@@ -1874,6 +1893,9 @@ async function reviseLockedCompositionWithQwen(input) {
       );
       if (!deterministicFallbackAllowed) {
         console.error("Revision scene rejected", diagnostics);
+        if (!diagnostics.exactCoverage) throw new Error("修改后的内容没有完整保留相关事情，原日记已保留");
+        if (!diagnostics.changeValid) throw new Error("要修改的内容还没有正确写入，原日记已保留");
+        if (!diagnostics.orderValid) throw new Error("事情的先后顺序还没有调整正确，原日记已保留");
         throw new Error("修改后的句子还没有整理通顺，原日记已保留");
       }
       const fallbackClaimedIds = new Set();
@@ -1908,7 +1930,9 @@ async function reviseLockedCompositionWithQwen(input) {
   const additions = (Array.isArray(result.additions) ? result.additions : [])
     .map(item => ({
       ...item,
-      matchingFacts: addedFacts.filter(fact => (item.factTexts || []).includes(fact.text))
+      matchingFacts: addedFacts.filter(fact =>
+        (item.factIds || []).includes(fact.id) || (item.factTexts || []).includes(fact.text)
+      )
     }))
     .filter(item => item.text && item.matchingFacts.length)
     .sort((left, right) => right.matchingFacts.length - left.matchingFacts.length);
