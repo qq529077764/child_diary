@@ -888,6 +888,7 @@ Page({
     }
 
     const revisedFactIds = new Set(revisedSentences.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []));
+    const revisedFactOrder = revisedSentences.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []);
     const revisedText = revisedSentences.map(sentence => sentence.text || "").join("");
     for (const operation of operations) {
       if (operation.type === "add" && operation.applied_fact_id && !revisedFactIds.has(operation.applied_fact_id)) {
@@ -901,6 +902,14 @@ Page({
       }
       if (operation.type === "remove_phrase" && operation.old_text && revisedText.includes(operation.old_text)) {
         throw new Error("要去掉的话仍然存在");
+      }
+      if (operation.type === "reorder") {
+        let cursor = -1;
+        for (const factId of operation.ordered_fact_ids || []) {
+          const nextIndex = revisedFactOrder.findIndex((id, index) => index > cursor && id === factId);
+          if (nextIndex < 0) throw new Error("事情的先后顺序还没有调整正确");
+          cursor = nextIndex;
+        }
       }
     }
     return true;
@@ -1005,6 +1014,11 @@ Page({
           changed += 1;
         }
         if (operation.type === "remove_phrase" && operation.target_sentence_id && operation.old_text) {
+          changed += 1;
+          appliedOperations.push(operation);
+        }
+        if (operation.type === "reorder" && Array.isArray(operation.ordered_fact_ids) && operation.ordered_fact_ids.length >= 2 &&
+          operation.ordered_fact_ids.every(id => this.facts.some(fact => fact.active !== false && fact.id === id))) {
           changed += 1;
           appliedOperations.push(operation);
         }

@@ -90,6 +90,43 @@ const stylisticRestatement = normalizeRevisionOperations({ instruction: longRest
 }]);
 assert.equal(stylisticRestatement.length, 0, "自然重说中的同义或语气变化不能覆盖原事实");
 
+const sequenceFacts = [
+  { id: "breakfast", slot: "what", text: "吃早餐", active: true },
+  { id: "outside", slot: "what", text: "去户外玩", active: true },
+  { id: "lunch", slot: "what", text: "吃午饭", active: true },
+  { id: "lunch-duplicate", slot: "what", text: "然后就吃午饭", active: true },
+  { id: "nap", slot: "what", text: "睡午觉", active: true },
+  { id: "fruit", slot: "what", text: "吃水果", active: true },
+  { id: "finish", slot: "what", text: "放学", active: true }
+];
+const sequenceInstruction = "顺序不对，吃完早餐后去户外玩，回来先吃午饭，再睡午觉，睡醒后吃水果，最后放学。";
+const sequenceFallback = fallbackRevisionOperations({ instruction: sequenceInstruction, facts: sequenceFacts, diary: [] });
+assert.equal(sequenceFallback[0]?.type, "reorder", "纠正多个已有事件的顺序时必须生成结构化重排操作");
+assert.deepEqual(sequenceFallback[0]?.ordered_fact_ids, ["breakfast", "outside", "lunch", "nap", "fruit", "finish"], "重排事实编号必须遵循孩子重新讲述的顺序");
+const normalizedSequence = normalizeRevisionOperations({
+  instruction: sequenceInstruction,
+  facts: sequenceFacts,
+  diary: [],
+  revisionIntent: "related_restatement"
+}, [
+  { type: "replace", target_fact_id: "fruit", new_text: "吃水果", conflict: true },
+  sequenceFallback[0]
+]);
+assert.deepEqual(normalizedSequence.map(operation => operation.type), ["reorder"], "同文替换不能冒充修改，顺序修正只保留重排操作");
+const sequenceDiary = [
+  { id: "morning", text: "吃完早餐后，我们去户外玩。", factIds: ["breakfast", "outside"], factTexts: ["吃早餐", "去户外玩"] },
+  { id: "noon", text: "回来以后，我们吃午饭，再睡午觉。", factIds: ["lunch", "nap"], factTexts: ["吃午饭", "睡午觉"] },
+  { id: "afternoon", text: "睡醒后我们吃水果，然后放学。", factIds: ["fruit", "finish"], factTexts: ["吃水果", "放学"] }
+];
+const sequenceAssignments = assignRevisionOperationsToSentences(
+  sequenceDiary,
+  normalizedSequence,
+  new Map(sequenceFacts.map(fact => [fact.id, fact])),
+  new Map()
+);
+assert.deepEqual([...sequenceAssignments.assignments.keys()], [0, 1, 2], "顺序修正必须锁定第一个到最后一个相关句子的完整局部场景");
+assert.equal(sequenceAssignments.unmatched.length, 0, "可定位的顺序修正不能掉入未匹配状态");
+
 const oneTargetOnce = normalizeRevisionOperations({ instruction: "不是原来的说法，我重新说", facts, diary }, [
   { type: "replace", target_fact_id: "f1", new_text: "我进教室吃早餐" },
   { type: "replace", target_fact_id: "f1", new_text: "检查结束以后，我进教室吃早餐" }

@@ -230,6 +230,52 @@ async function run() {
     ]
   }), true, "局部补充落文且无关句保留时应通过");
 
+  const reorderPage = createPage();
+  reorderPage.data.phase = "revise";
+  reorderPage.data.diaryTitle = "上学日记";
+  reorderPage.data.diarySentences = [
+    { id: "morning", text: "吃完早餐后，我们去户外玩。", factIds: ["breakfast", "outside"], factTexts: ["吃早餐", "去户外玩"] },
+    { id: "noon", text: "回来以后，我们睡午觉，再吃午饭。", factIds: ["nap", "lunch"], factTexts: ["睡午觉", "吃午饭"] },
+    { id: "afternoon", text: "睡醒后我们吃水果，然后放学。", factIds: ["fruit", "finish"], factTexts: ["吃水果", "放学"] }
+  ];
+  reorderPage.facts = [
+    { id: "breakfast", text: "吃早餐", slot: "what", active: true },
+    { id: "outside", text: "去户外玩", slot: "what", active: true },
+    { id: "lunch", text: "吃午饭", slot: "what", active: true },
+    { id: "nap", text: "睡午觉", slot: "what", active: true },
+    { id: "fruit", text: "吃水果", slot: "what", active: true },
+    { id: "finish", text: "放学", slot: "what", active: true }
+  ];
+  reorderPage.revisionTranscript = "顺序不对，先吃午饭，再睡午觉，睡醒后吃水果，最后放学。";
+  reorderPage.revisionBaseSnapshot = {
+    title: reorderPage.data.diaryTitle,
+    sentences: structuredClone(reorderPage.data.diarySentences),
+    facts: structuredClone(reorderPage.facts)
+  };
+  const orderedFactIds = ["breakfast", "outside", "lunch", "nap", "fruit", "finish"];
+  reorderPage.request = async () => ({
+    revisionMode: "related_restatement",
+    operations: [{ type: "reorder", ordered_fact_ids: orderedFactIds }]
+  });
+  let reorderCompose;
+  reorderPage.composeDiary = async options => {
+    reorderCompose = options;
+    return {
+      title: "上学日记",
+      changedSentenceIds: ["morning", "noon", "afternoon"],
+      sentences: [
+        { id: "morning", text: "吃完早餐后，我们去户外玩。", factIds: ["breakfast", "outside"], factTexts: ["吃早餐", "去户外玩"] },
+        { id: "noon", text: "玩完回来，我们吃了午饭。吃完午饭后，我们睡午觉。", factIds: ["lunch", "nap"], factTexts: ["吃午饭", "睡午觉"] },
+        { id: "afternoon", text: "睡醒之后，我们吃了水果，然后就放学了。", factIds: ["fruit", "finish"], factTexts: ["吃水果", "放学"] }
+      ]
+    };
+  };
+  await reorderPage.finishRevision();
+  assert.equal(reorderCompose.revisionOperations[0].type, "reorder", "客户端必须把顺序约束交给局部成文器");
+  assert.deepEqual(reorderCompose.revisionOperations[0].ordered_fact_ids, orderedFactIds, "客户端不得改写结构化事实顺序");
+  assert.equal(reorderPage.facts.length, 6, "顺序修正不能新增一条包含整段口述的长事实");
+  assert.equal(reorderPage.data.diarySentences[1].text.includes("先吃的午饭"), false, "修改结果不能照抄口语倒装");
+
   const unclearPage = createPage();
   unclearPage.data.phase = "revise";
   unclearPage.data.diarySentences = restored.sentences;

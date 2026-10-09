@@ -1129,12 +1129,13 @@ async function reviseWithQwen(input) {
         schema: {
           intent: "explicit_edit|related_restatement|related_addition|new_event|unclear",
           operations: [{
-            type: "replace|delete|add|remove_phrase",
+            type: "replace|delete|add|remove_phrase|reorder",
             target_fact_id: "replace/delete 必须填写现有事实 id；add/remove_phrase 为空",
             target_sentence_id: "remove_phrase 必须填写现有句子 id；其他操作为空",
             old_text: "remove_phrase 填写要从原句去掉的原文；其他操作可为空",
             anchor_fact_id: "add 若是对已有事件的补充，填写最相关的现有事实 id；独立新事件为空",
             placement: "add 使用 merge|before|after|independent；其他操作为空",
+            ordered_fact_ids: "reorder 必须按孩子纠正后的先后顺序填写至少两个现有事实 id；其他操作为空数组",
             conflict: "replace 时填写 true/false；只有新旧内容不能同时成立才是 true",
             slot: "what|detail|feeling|result",
             label: "简短中文标签",
@@ -1154,13 +1155,15 @@ async function reviseWithQwen(input) {
           "如果同一个错误事实在 facts 中有多个近似版本，返回 delete 一并清除被替代或被包含的重复项，只保留完整事实。",
           "replace/delete 的 target_fact_id 必须来自 facts，禁止编造 id。",
           "孩子重新讲了一大段相关场景时，没再提到的旧事实不等于要删除；只覆盖明确冲突，保留其余兼容事实。",
+          "孩子指出原文顺序不对，并按正确先后重新讲述多个已有事件时，只返回一条 reorder；ordered_fact_ids 按正确顺序填写已有事实 id。不得把整段修改口述作为 replace 或 add 的 new_text。",
+          "reorder 只调整相关事件的先后和句子组织，不改变事实内容；如果同时补充了真正的新事件，再另外返回一条简短、原子化的 add。",
           "已经出现在 facts 或 diary 中的人物、地点、活动和句子不得再返回 add；即使孩子在修改时又讲了一遍，也只视为原事实的重述。",
           "add 若补充同一事件内部的细节、结果或感受，填写 anchor_fact_id 且 placement=merge。",
           "同一次口述中的一个新含义只能返回一个操作。不要把‘活动+新细节’和‘新细节’拆成两条近义 add；选择最贴近孩子原话、信息边界最准确的一条。",
           "add 若由‘之前、以前、之后、后来’等引入相邻事件，填写 anchor_fact_id 且 placement=before 或 after。独立新事件使用 independent。",
           "‘不是A，是B’属于 replace，不能拆成 delete 和 add。绝不能为了用新说法取代整个旧故事而批量 delete。",
           "不能确定目标事实时 operations 返回空数组，不得凭相似词强行修改。",
-          "不要把指令措辞写进日记事实，只保留修改后的事实内容。"
+          "不要把‘顺序不对、应该是、我是说、我的意思是’等指令措辞和嗯、呃、那个等口语填充词写进 new_text；new_text 只能是简短、明确的事实内容。"
         ],
         instruction: input.instruction || "",
         facts: (input.facts || []).map(fact => ({ id: fact.id, slot: fact.slot, label: fact.label, text: fact.text })),
@@ -1186,6 +1189,49 @@ function sharesSpecificBigram(left, right) {
     if (!ignored.has(gram) && rightGrams.has(gram)) return true;
   }
   return false;
+}
+
+const REVISION_ORDER_CUE_PATTERN = /(顺序|先.{1,100}(?:再|然后|接着|后来|最后)|(?:再|然后|接着|后来|最后).{1,100}(?:再|然后|接着|后来|最后))/u;
+
+function inferOrderedFactIds(instruction, facts) {
+  const source = normalizeSemanticText(instruction);
+  if (!source || !REVISION_ORDER_CUE_PATTERN.test(String(instruction || ""))) return [];
+  const ignoredBigrams = new Set(["今天", "我们", "然后", "后来", "接着", "最后", "之后", "时候", "开始", "一起"]);
+  const mentions = [];
+  for (const fact of facts || []) {
+    if (!fact?.id || !fact?.text) continue;
+    const target = normalizeSemanticText(fact.text);
+    if (target.length < 2) continue;
+    const directIndex = source.indexOf(target);
+    if (directIndex >= 0) {
+      mentions.push({ id: fact.id, text: target, index: directIndex, confidence: 2, length: target.length });
+      continue;
+    }
+    const matches = [...semanticBigrams(target)]
+      .filter(gram => !ignoredBigrams.has(gram))
+      .map(gram => source.indexOf(gram))
+      .filter(index => index >= 0);
+    if (!matches.length) continue;
+    mentions.push({
+      id: fact.id,
+      text: target,
+      index: Math.min(...matches),
+      confidence: matches.length / Math.max(1, semanticBigrams(target).size),
+      length: target.length
+    });
+  }
+  mentions.sort((left, right) => left.index - right.index || right.confidence - left.confidence || right.length - left.length);
+  const ordered = [];
+  const seenIds = new Set();
+  const chosenTexts = [];
+  for (const mention of mentions) {
+    if (seenIds.has(mention.id)) continue;
+    if (chosenTexts.some(text => text.includes(mention.text) || mention.text.includes(text) || semanticSimilarity(text, mention.text) >= 0.72)) continue;
+    seenIds.add(mention.id);
+    ordered.push(mention.id);
+    chosenTexts.push(mention.text);
+  }
+  return ordered.length >= 2 ? ordered : [];
 }
 
 function normalizeRevisionOperations(input, operations) {
@@ -1227,7 +1273,27 @@ function normalizeRevisionOperations(input, operations) {
   };
   const replacementOperations = normalized.filter(operation => operation?.type === "replace" && operation.new_text);
   for (const operation of normalized) {
-    if (!operation || !["replace", "delete", "add", "remove_phrase"].includes(operation.type)) continue;
+    if (!operation || !["replace", "delete", "add", "remove_phrase", "reorder"].includes(operation.type)) continue;
+    if (operation.type === "reorder") {
+      const orderedFactIds = [...new Set((Array.isArray(operation.ordered_fact_ids) ? operation.ordered_fact_ids : [])
+        .filter(id => facts.some(fact => fact.id === id)))];
+      if (orderedFactIds.length < 2) continue;
+      const safeOperation = {
+        ...operation,
+        target_fact_id: "",
+        target_sentence_id: "",
+        anchor_fact_id: "",
+        new_text: "",
+        ordered_fact_ids: orderedFactIds
+      };
+      const existingIndex = safe.findIndex(existing => existing.type === "reorder");
+      if (existingIndex >= 0) {
+        if (safeOperation.ordered_fact_ids.length > safe[existingIndex].ordered_fact_ids.length) safe[existingIndex] = safeOperation;
+      } else {
+        safe.push(safeOperation);
+      }
+      continue;
+    }
     if (operation.type === "remove_phrase") {
       const sentence = diary.find(item => item?.id === operation.target_sentence_id);
       const oldText = String(operation.old_text || "").trim();
@@ -1254,6 +1320,7 @@ function normalizeRevisionOperations(input, operations) {
     }
     if (operation.type === "replace") {
       if (!target || !operation.new_text) continue;
+      if (normalizeSemanticText(target.text) === normalizeSemanticText(operation.new_text)) continue;
       if (input.revisionIntent === "related_restatement" && !hasExplicitReplaceCue && operation.conflict !== true) continue;
       const related = sharesSpecificBigram(target.text, operation.new_text) ||
         sharesSpecificBigram(instruction, target.text) ||
@@ -1347,6 +1414,15 @@ function fallbackRevisionOperations(input) {
       .sort((left, right) => right.score - left.score)[0]?.fact || null;
   };
 
+  const orderedFactIds = inferOrderedFactIds(instruction, facts);
+  if (orderedFactIds.length >= 2) {
+    return [{
+      type: "reorder",
+      ordered_fact_ids: orderedFactIds,
+      reason: "按孩子重新讲述的先后关系调整相关事件顺序"
+    }];
+  }
+
   const correction = /不是(.{1,100}?)[，,。；;\s]*(?:而是|应该是|是)(.{1,140})/u.exec(instruction) ||
     /把(.{1,100}?)(?:改成|改为|换成|换为)(.{1,140})/u.exec(instruction);
   if (correction) {
@@ -1435,6 +1511,31 @@ function assignRevisionOperationsToSentences(lockedDiary, operations, factById, 
   const unmatched = [];
   for (const operation of operations) {
     if (operation.type === "add" && operation.placement !== "merge") continue;
+    if (operation.type === "reorder") {
+      const matchedIndexes = (operation.ordered_fact_ids || []).map(factId => {
+        const directIndex = lockedDiary.findIndex(sentence => (sentence?.factIds || []).includes(factId));
+        if (directIndex >= 0) return directIndex;
+        const fact = factById.get(factId);
+        if (!fact) return -1;
+        return revisionOperationSentenceIndex(
+          lockedDiary,
+          { type: "replace", target_fact_id: factId },
+          fact,
+          null
+        );
+      }).filter(index => index >= 0);
+      if (new Set(matchedIndexes).size < 2) {
+        unmatched.push(operation);
+        continue;
+      }
+      const firstIndex = Math.min(...matchedIndexes);
+      const lastIndex = Math.max(...matchedIndexes);
+      for (let index = firstIndex; index <= lastIndex; index += 1) {
+        if (!assignments.has(index)) assignments.set(index, []);
+        assignments.get(index).push(operation);
+      }
+      continue;
+    }
     const index = revisionOperationSentenceIndex(
       lockedDiary,
       operation,
@@ -1508,6 +1609,46 @@ function revisionChangeIsValid(text, operations, factById = new Map()) {
   });
 }
 
+function revisionOrderIsValid(sentences, operations, factById) {
+  const usedTexts = (sentences || []).flatMap(sentence => Array.isArray(sentence?.factTexts) ? sentence.factTexts : []);
+  return (operations || []).filter(operation => operation.type === "reorder").every(operation => {
+    let cursor = -1;
+    for (const factId of operation.ordered_fact_ids || []) {
+      const factText = factById.get(factId)?.text;
+      if (!factText) return false;
+      const nextIndex = usedTexts.findIndex((text, index) => index > cursor && text === factText);
+      if (nextIndex < 0) return false;
+      cursor = nextIndex;
+    }
+    return true;
+  });
+}
+
+function revisionWritingViolations(sentences) {
+  const violations = [];
+  for (const [index, sentence] of (sentences || []).entries()) {
+    const text = String(sentence?.text || "").trim();
+    if (/(顺序不对|顺序应该|我说的是|我是说|我的意思是|刚才说|要修改|改成|修改成|应该写成)/u.test(text)) {
+      violations.push({ type: "instruction_residue", sentenceIndex: index, text });
+    }
+    if (/(^|[，、\s])(嗯|呃|那个|就是说)(?=$|[，。！？、\s])/u.test(text)) {
+      violations.push({ type: "speech_filler", sentenceIndex: index, text });
+    }
+    if (/(?:我|我们|他|她|大家)[^，。！？]{0,12}(?:先|才)(?:吃|睡|玩|去|看|读|做)的[^，。！？]{1,8}/u.test(text)) {
+      violations.push({ type: "spoken_word_order", sentenceIndex: index, text });
+    }
+    if (/^(?:吃完|睡完|玩完|看完|读完|做完)[^，。！？]{0,10}(?:起来)?(?:先|才)?(?:吃|睡|玩|去|看|读|做)的/u.test(text)) {
+      violations.push({ type: "subjectless_spoken_word_order", sentenceIndex: index, text });
+    }
+    if (text.length < 5 || !/[。！？!?]$/u.test(text)) {
+      violations.push({ type: "incomplete_sentence", sentenceIndex: index, text });
+    }
+  }
+  const thenCount = ((sentences || []).map(sentence => String(sentence?.text || "")).join("").match(/然后/gu) || []).length;
+  if (thenCount > 1) violations.push({ type: "repeated_then", count: thenCount });
+  return violations;
+}
+
 async function reviseLockedCompositionWithQwen(input) {
   const lockedDiary = Array.isArray(input.lockedDiary) ? input.lockedDiary : [];
   const operations = Array.isArray(input.revisionOperations) ? input.revisionOperations : [];
@@ -1538,12 +1679,13 @@ async function reviseLockedCompositionWithQwen(input) {
   const claimedFactIds = new Set();
   for (const group of sceneGroups) {
     const sentences = group.indexes.map(index => lockedDiary[index]);
-    const groupOperations = group.indexes.flatMap(index => operationsForIndex(index));
+    const groupOperations = [...new Set(group.indexes.flatMap(index => operationsForIndex(index)))];
     const linkedIds = new Set(sentences.flatMap(sentence => sentence.factIds || []));
     for (const operation of groupOperations) {
       if (operation.target_fact_id) linkedIds.add(operation.target_fact_id);
       if (operation.anchor_fact_id) linkedIds.add(operation.anchor_fact_id);
       if (operation.applied_fact_id) linkedIds.add(operation.applied_fact_id);
+      for (const factId of operation.ordered_fact_ids || []) linkedIds.add(factId);
     }
     group.sentences = sentences;
     group.operations = groupOperations;
@@ -1584,10 +1726,12 @@ async function reviseLockedCompositionWithQwen(input) {
           "每个 affected_scene 的全部 expected_facts 必须各绑定一次；factTexts 使用完整 text。同一场景正文可以只表达一次重叠含义，但来源账本仍需全部绑定。",
           "每个新增事实只能出现在一个 scene 或一条 addition 中，不能既合并进旧场景又单独生成新句。",
           "明确的时间顺序、因果、条件、转折或约定属于事实关系，修改局部内容时必须保留。",
+          "reorder 的 ordered_fact_ids 是唯一有效的先后约束。必须按该顺序组织相应事实，可以合并连续动作，但不得反转、遗漏或重复。",
+          "修改操作已经提取完毕，不要复述孩子如何提出修改，也不要把口语填充词、指令语气或‘先做的某事、才吃的某物’这类口语倒装原样写进日记。",
+          "请真正重新组织句子：按小学低年级主谓宾结构写成‘主语+动作+对象’，再用‘……后、接着、后来、最后’连接先后；不得为了省事照抄某条长事实。",
           "优先保留孩子原有形容词、叠词和儿童化说法，不擅自增加成人化词语、原因、评价、情绪或细节。",
           "factTexts 只能使用对应场景 expected_facts 或 added_facts 里完整的 text。"
         ],
-        instruction: input.revisionInstruction || "",
         intent: input.revisionMode || "",
         operations: operations.map(operation => ({
           type: operation.type,
@@ -1597,8 +1741,15 @@ async function reviseLockedCompositionWithQwen(input) {
           new_text: operation.new_text || "",
           anchor_fact_id: operation.anchor_fact_id || "",
           applied_fact_id: operation.applied_fact_id || "",
-          placement: operation.placement || ""
+          placement: operation.placement || "",
+          ordered_fact_ids: operation.ordered_fact_ids || []
         })),
+        order_constraints: operations
+          .filter(operation => operation.type === "reorder")
+          .map(operation => ({
+            ordered_fact_ids: operation.ordered_fact_ids,
+            ordered_facts: (operation.ordered_fact_ids || []).map(id => factById.get(id)?.text).filter(Boolean)
+          })),
         affected_scenes: sceneGroups.map(group => ({
           id: group.id,
           original_sentences: group.sentences,
@@ -1611,8 +1762,8 @@ async function reviseLockedCompositionWithQwen(input) {
   let result;
   try {
     result = await callQwenJson(messages);
-  } catch {
-    result = { scenes: [], additions: [] };
+  } catch (error) {
+    throw new Error(`修改内容暂时没有整理成功：${error.message}`);
   }
   const sceneResults = new Map((Array.isArray(result.scenes) ? result.scenes : []).map(scene => [scene.sceneId, scene]));
   const sceneReplacementAtIndex = new Map();
@@ -1629,7 +1780,10 @@ async function reviseLockedCompositionWithQwen(input) {
       expectedTexts.every(text => useCounts.get(text) === 1) &&
       usedTexts.every(text => expectedTextSet.has(text));
     const joinedText = candidateSentences.map(sentence => sentence.text).join("");
-    const validCandidate = candidateSentences.length > 0 && exactCoverage && revisionChangeIsValid(joinedText, group.operations, factById);
+    const validCandidate = candidateSentences.length > 0 && exactCoverage &&
+      revisionChangeIsValid(joinedText, group.operations, factById) &&
+      revisionOrderIsValid(candidateSentences, group.operations, factById) &&
+      revisionWritingViolations(candidateSentences).length === 0;
     let replacements;
     if (validCandidate) {
       replacements = candidateSentences.map((sentence, index) => ({
@@ -1639,6 +1793,13 @@ async function reviseLockedCompositionWithQwen(input) {
         factIds: group.activeFacts.filter(fact => sentence.factTexts.includes(fact.text)).map(fact => fact.id)
       }));
     } else {
+      const deterministicFallbackAllowed = group.operations.length > 0 && group.operations.every(operation =>
+        ["replace", "delete", "remove_phrase"].includes(operation.type) &&
+        operation.old_text && group.sentences.some(sentence => String(sentence?.text || "").includes(operation.old_text))
+      );
+      if (!deterministicFallbackAllowed) {
+        throw new Error("修改后的句子还没有整理通顺，原日记已保留");
+      }
       const fallbackClaimedIds = new Set();
       replacements = group.sentences.map((sentence, offset) => {
         const sentenceOperations = operationsForIndex(group.indexes[offset]);
@@ -1657,19 +1818,6 @@ async function reviseLockedCompositionWithQwen(input) {
         };
       }).filter(sentence => sentence.text && (sentence.factIds.length || sentence.hasPhraseOnlyEdit))
         .map(({ hasPhraseOnlyEdit, ...sentence }) => sentence);
-      const coveredFallbackIds = new Set(replacements.flatMap(sentence => sentence.factIds || []));
-      for (const operation of group.operations) {
-        if (operation.type !== "add" || !operation.applied_fact_id || coveredFallbackIds.has(operation.applied_fact_id)) continue;
-        const fact = factById.get(operation.applied_fact_id);
-        if (!fact) continue;
-        replacements.push({
-          id: `sentence_revised_fallback_${Date.now()}_${group.indexes[0]}_${replacements.length}`,
-          text: /[。！？!?]$/u.test(fact.text) ? fact.text : `${fact.text}。`,
-          factTexts: [fact.text],
-          factIds: [fact.id]
-        });
-        coveredFallbackIds.add(fact.id);
-      }
     }
     sceneReplacementAtIndex.set(group.indexes[0], replacements);
     const replacementId = replacements[0]?.id || "";
@@ -1734,15 +1882,7 @@ async function reviseLockedCompositionWithQwen(input) {
   }
   for (const fact of addedFacts) {
     if (coveredAddedFactIds.has(fact.id)) continue;
-    const placement = placementForFact(fact);
-    generatedAdditionSentences.push({
-      id: `sentence_added_${Date.now()}_${revised.length + generatedAdditionSentences.length}`,
-      text: `${fact.text}。`,
-      factTexts: [fact.text],
-      factIds: [fact.id],
-      ...placement,
-      position: placement.position || "end"
-    });
+    throw new Error("新补充的内容还没有整理成完整句子，原日记已保留");
   }
   const additionsBeforeSentence = new Map();
   const additionsAfterSentence = new Map();
@@ -1976,8 +2116,17 @@ async function handleRevise(req, res) {
   const fallbackOperations = fallbackRevisionOperations(normalizationInput);
   const exactPhraseRemoval = fallbackOperations.find(operation => operation.type === "remove_phrase");
   const exactFactEdit = fallbackOperations.find(operation => ["replace", "delete"].includes(operation.type));
+  const inferredReorder = fallbackOperations.find(operation => operation.type === "reorder");
   let rawOperations = Array.isArray(result.operations) ? result.operations : [];
-  if (exactPhraseRemoval) {
+  if (inferredReorder) {
+    const modelReorder = rawOperations.find(operation => operation?.type === "reorder");
+    rawOperations = rawOperations.filter(operation => {
+      if (operation?.type !== "replace" || !operation.target_fact_id || !operation.new_text) return true;
+      const target = (input.facts || []).find(fact => fact.id === operation.target_fact_id);
+      return !target || normalizeSemanticText(target.text) !== normalizeSemanticText(operation.new_text);
+    });
+    if (!modelReorder) rawOperations.push(inferredReorder);
+  } else if (exactPhraseRemoval) {
     rawOperations = rawOperations.filter(operation => operation?.type !== "delete").concat(exactPhraseRemoval);
   } else if (exactFactEdit) {
     rawOperations = rawOperations.filter(operation => {
@@ -1990,7 +2139,11 @@ async function handleRevise(req, res) {
   let normalizedOperations = normalizeRevisionOperations(normalizationInput, rawOperations);
   if (!normalizedOperations.length) normalizedOperations = normalizeRevisionOperations(normalizationInput, fallbackOperations);
   const operations = normalizedOperations.filter(operation => {
-    if (!["replace", "delete", "add", "remove_phrase"].includes(operation?.type)) return false;
+    if (!["replace", "delete", "add", "remove_phrase", "reorder"].includes(operation?.type)) return false;
+    if (operation.type === "reorder") {
+      return Array.isArray(operation.ordered_fact_ids) && operation.ordered_fact_ids.length >= 2 &&
+        operation.ordered_fact_ids.every(id => validIds.has(id));
+    }
     if (operation.type === "add") return Boolean(operation.new_text);
     if (operation.type === "remove_phrase") return validSentenceIds.has(operation.target_sentence_id) && Boolean(operation.old_text);
     if (!validIds.has(operation.target_fact_id)) return false;
@@ -1999,6 +2152,8 @@ async function handleRevise(req, res) {
   const allowedIntents = new Set(["explicit_edit", "related_restatement", "related_addition", "new_event", "unclear"]);
   const inferredIntent = operations.some(operation => operation.type === "remove_phrase" || operation.type === "delete" || operation.type === "replace")
     ? "explicit_edit"
+    : operations.some(operation => operation.type === "reorder")
+      ? "related_restatement"
     : operations.some(operation => operation.type === "add" && operation.anchor_fact_id)
       ? "related_addition"
       : operations.some(operation => operation.type === "add") ? "new_event" : "unclear";
