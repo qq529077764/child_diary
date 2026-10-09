@@ -8,11 +8,13 @@
       <text class="hero-title">今天的小故事，直接说给小耳朵听</text>
       <text class="muted">开始以后一直说就好，中间不需要点按钮。</text>
     </view>
-    <view class="theme-card"><text class="eyebrow">今日主题</text><text class="theme">今天你帮助别人做了什么？</text></view>
+    <view class="theme-card">
+      <view class="theme-meta"><text class="eyebrow">今日主题</text><button class="privacy-inline" bindtap="openPrivacyCenter">家长与隐私</button></view>
+      <text class="theme">今天你帮助别人做了什么？</text>
+    </view>
     <view class="home-actions">
       <button class="button primary" bindtap="startStory">开始说</button>
       <button class="button soft history-entry" bindtap="openHistory">我的日记 {{diaryHistory.length ? diaryHistory.length + ' 篇' : ''}}</button>
-      <button class="privacy-entry" bindtap="openPrivacyCenter">家长与隐私</button>
     </view>
   </view>
 
