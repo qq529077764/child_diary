@@ -1018,6 +1018,7 @@ async function reviseWithQwen(input) {
             old_text: "remove_phrase 填写要从原句去掉的原文；其他操作可为空",
             anchor_fact_id: "add 若是对已有事件的补充，填写最相关的现有事实 id；独立新事件为空",
             placement: "add 使用 merge|before|after|independent；其他操作为空",
+            conflict: "replace 时填写 true/false；只有新旧内容不能同时成立才是 true",
             slot: "what|detail|feeling|result",
             label: "简短中文标签",
             new_text: "replace/add 后的完整事实；delete 为空",
@@ -1028,6 +1029,7 @@ async function reviseWithQwen(input) {
         rules: [
           "不能只靠‘删除、替换、补充’等关键词判断。孩子重新讲述与原句人物、地点、动作和时间高度相关的内容时，intent=related_restatement，并按整个相关场景理解。",
           "相关场景重说时：最新口述中与旧事实明确冲突的内容用 replace；新增且不冲突的内容用 add+merge；本次没提到但不冲突的旧事实必须保留。",
+          "同义重述、语序变化、完成态变化或增加‘就、又、还’等连接语气不属于冲突，不能 replace；只有人物、对象、动作、属性、数量、时间、地点或否定关系无法同时成立时 conflict=true。",
           "如果一个旧事实只是另一个新事实的重复、残片或已被完整包含，可以 replace 一个主要事实并 delete 被包含的重复事实；不得删除无关或仅仅没有重说的事实。",
           "明确说‘不是A，是B’时 replace 对应事实；明确说‘我没说A、不要A’时 delete 对应事实。",
           "孩子明确要求去掉原句里的某个词或短语，而该内容不是独立事实时，使用 remove_phrase；old_text 必须逐字出现在 target_sentence_id 对应原句中。",
@@ -1043,8 +1045,10 @@ async function reviseWithQwen(input) {
           "不要把指令措辞写进日记事实，只保留修改后的事实内容。"
         ],
         instruction: input.instruction || "",
-        facts: input.facts || [],
-        diary: input.diary || []
+        facts: (input.facts || []).map(fact => ({ id: fact.id, slot: fact.slot, label: fact.label, text: fact.text })),
+        diary: (input.diary || []).map((sentence, index) => typeof sentence === "string"
+          ? { id: `sentence_${index}`, text: sentence, factIds: [], factTexts: [] }
+          : { id: sentence.id, text: sentence.text, factIds: sentence.factIds || [], factTexts: sentence.factTexts || [] })
       })
     }
   ];
@@ -1074,6 +1078,7 @@ function normalizeRevisionOperations(input, operations) {
   const instruction = String(input.instruction || "");
   const hasDeleteCue = /(删掉|删除|去掉|不要写|别写|我(没有|没)说|这句不对|不是)/u.test(instruction);
   const hasPhraseDeleteCue = /(删掉|删除|去掉|不要写|别写)/u.test(instruction);
+  const hasExplicitReplaceCue = /(不是.{1,160}?(?:而是|应该是|是)|改成|改为|换成|换为|听错|识别错|说错)/u.test(instruction);
   const normalized = [...operations];
   for (let index = 0; index < normalized.length; index += 1) {
     const operation = normalized[index];
@@ -1131,6 +1136,7 @@ function normalizeRevisionOperations(input, operations) {
     }
     if (operation.type === "replace") {
       if (!target || !operation.new_text) continue;
+      if (input.revisionIntent === "related_restatement" && !hasExplicitReplaceCue && operation.conflict !== true) continue;
       const related = sharesSpecificBigram(target.text, operation.new_text) ||
         sharesSpecificBigram(instruction, target.text) ||
         semanticSimilarity(target.text, operation.new_text) >= 0.45;
@@ -1206,7 +1212,7 @@ function fallbackRevisionOperations(input) {
     const target = findTarget(correction[1]);
     const newText = clean(correction[2]);
     if (target && newText) {
-      return [{ type: "replace", target_fact_id: target.id, slot: target.slot || "detail", label: target.label || "语音修改", new_text: newText, reason: "按孩子明确说出的替换指令修改" }];
+      return [{ type: "replace", target_fact_id: target.id, conflict: true, slot: target.slot || "detail", label: target.label || "语音修改", new_text: newText, reason: "按孩子明确说出的替换指令修改" }];
     }
   }
 
@@ -1385,15 +1391,22 @@ async function reviseLockedCompositionWithQwen(input) {
         ],
         instruction: input.revisionInstruction || "",
         intent: input.revisionMode || "",
-        operations,
+        operations: operations.map(operation => ({
+          type: operation.type,
+          target_fact_id: operation.target_fact_id || "",
+          target_sentence_id: operation.target_sentence_id || "",
+          old_text: operation.old_text || "",
+          new_text: operation.new_text || "",
+          anchor_fact_id: operation.anchor_fact_id || "",
+          applied_fact_id: operation.applied_fact_id || "",
+          placement: operation.placement || ""
+        })),
         affected_scenes: sceneGroups.map(group => ({
           id: group.id,
           original_sentences: group.sentences,
-          operations: group.operations,
           expected_facts: group.activeFacts
         })),
-        added_facts: addedFacts,
-        untouched_sentences: lockedDiary.filter((sentence, index) => !affectedIndexes.includes(index)).map(sentence => ({ id: sentence.id, text: sentence.text }))
+        added_facts: addedFacts.map(fact => ({ id: fact.id, slot: fact.slot, text: fact.text }))
       })
     }
   ];
@@ -1705,11 +1718,12 @@ async function handleFinalize(req, res) {
 async function handleRevise(req, res) {
   const input = await readJson(req);
   const result = await reviseWithQwen(input);
+  const normalizationInput = { ...input, revisionIntent: result.intent };
   const validIds = new Set((input.facts || []).map(fact => fact.id));
   const validSentenceIds = new Set((input.diary || []).map((sentence, index) =>
     typeof sentence === "string" ? `sentence_${index}` : sentence?.id
   ).filter(Boolean));
-  const fallbackOperations = fallbackRevisionOperations(input);
+  const fallbackOperations = fallbackRevisionOperations(normalizationInput);
   const exactPhraseRemoval = fallbackOperations.find(operation => operation.type === "remove_phrase");
   const exactFactEdit = fallbackOperations.find(operation => ["replace", "delete"].includes(operation.type));
   let rawOperations = Array.isArray(result.operations) ? result.operations : [];
@@ -1723,8 +1737,8 @@ async function handleRevise(req, res) {
       return true;
     }).concat(exactFactEdit);
   }
-  let normalizedOperations = normalizeRevisionOperations(input, rawOperations);
-  if (!normalizedOperations.length) normalizedOperations = normalizeRevisionOperations(input, fallbackOperations);
+  let normalizedOperations = normalizeRevisionOperations(normalizationInput, rawOperations);
+  if (!normalizedOperations.length) normalizedOperations = normalizeRevisionOperations(normalizationInput, fallbackOperations);
   const operations = normalizedOperations.filter(operation => {
     if (!["replace", "delete", "add", "remove_phrase"].includes(operation?.type)) return false;
     if (operation.type === "add") return Boolean(operation.new_text);

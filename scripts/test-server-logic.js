@@ -32,13 +32,22 @@ assert.equal(
 );
 
 const longRestatement = "检查结束以后，我进教室吃早餐，早餐很好吃。我是重新把这件事情说完整，不是在后面新增另一个故事。";
-const normalizedRestatement = normalizeRevisionOperations({ instruction: longRestatement, facts, diary }, [{
+const normalizedRestatement = normalizeRevisionOperations({ instruction: longRestatement, facts, diary, revisionIntent: "related_restatement" }, [{
   type: "replace",
   target_fact_id: "f1",
   slot: "what",
+  conflict: true,
   new_text: "检查结束以后进教室吃早餐"
 }]);
 assert.equal(normalizedRestatement[0]?.type, "replace", "自然重说不能再因文字较长被强制改成新增");
+
+const stylisticRestatement = normalizeRevisionOperations({ instruction: longRestatement, facts, diary, revisionIntent: "related_restatement" }, [{
+  type: "replace",
+  target_fact_id: "f1",
+  conflict: false,
+  new_text: "我就进教室吃早餐"
+}]);
+assert.equal(stylisticRestatement.length, 0, "自然重说中的同义或语气变化不能覆盖原事实");
 
 const oneTargetOnce = normalizeRevisionOperations({ instruction: "不是原来的说法，我重新说", facts, diary }, [
   { type: "replace", target_fact_id: "f1", new_text: "我进教室吃早餐" },
