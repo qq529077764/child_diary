@@ -3,6 +3,8 @@ const assert = require("node:assert/strict");
 let pageDefinition;
 const storage = new Map();
 const modals = [];
+let loginCalls = 0;
+let privacyHandler;
 
 global.Page = definition => { pageDefinition = definition; };
 global.wx = {
@@ -10,7 +12,10 @@ global.wx = {
   setStorageSync: (key, value) => storage.set(key, value),
   removeStorageSync: key => storage.delete(key),
   showModal: options => { modals.push(options); },
-  getRecorderManager: () => ({ stop() {} })
+  login: () => { loginCalls += 1; },
+  onNeedPrivacyAuthorization: handler => { privacyHandler = handler; },
+  offNeedPrivacyAuthorization: () => { privacyHandler = undefined; },
+  getRecorderManager: () => ({ onStart() {}, onStop() {}, onError() {}, stop() {} })
 };
 
 require("../wechat-miniapp/pages/index/index.js");
@@ -28,6 +33,19 @@ function createPage(overrides = {}) {
 }
 
 async function run() {
+  const privacyPage = {
+    ...pageDefinition,
+    data: structuredClone(pageDefinition.data),
+    setData(update) { Object.assign(this.data, update); }
+  };
+  privacyPage.onLoad();
+  assert.equal(loginCalls, 0, "没有监护人同意时，启动小程序不能调用微信登录");
+  await privacyPage.startStory();
+  assert.equal(privacyPage.data.showGuardianConsent, true, "首次开始录音前必须显示监护人确认");
+  assert.equal(loginCalls, 0, "监护人确认前不能建立云端会话");
+  assert.equal(typeof privacyHandler, "function", "小程序应接入微信隐私授权回调");
+  privacyPage.onUnload();
+
   const facts = [
     { id: "f1", text: "去了公园", slot: "what", active: true },
     { id: "f2", text: "很开心", slot: "feeling", active: true }

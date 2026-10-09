@@ -11,6 +11,7 @@
 - `wechat-miniapp/`：原生微信小程序源码
 - `server.js`：腾讯 ASR 与通义千问接口服务
 - `mvp-product-spec.md`：当前 MVP 产品与开发说明书
+- `compliance/童心日记儿童个人信息保护规则.txt`：审核可上传的儿童隐私补充规则
 - `regression-cases/`：与生产逻辑隔离的匿名回归案例库
 - `.env.example`：后端配置模板
 
@@ -44,6 +45,7 @@ http://127.0.0.1:5178/health
 ```bash
 node scripts/test-server-logic.js
 node scripts/test-miniapp-revision.js
+node scripts/test-privacy-storage.js
 ```
 
 正式提示词通用性检查：
@@ -75,8 +77,11 @@ QWEN_BASE_URL
 ## 日记存储
 
 - 日记保存在服务器 SQLite 数据库，按微信用户隔离。
-- 支持历史列表、详情查询和软删除。
+- 首次连接服务器或打开麦克风前必须取得监护人同意；服务端也会校验同意记录。
+- 支持历史列表、详情查询和单篇永久删除。
+- “家长与隐私”支持撤回同意，并永久删除当前用户、全部日记和手机离线副本。
 - 本机 `diaryHistory` 作为离线副本，旧版日记在首次登录时自动上传，云端同步失败时下次启动重试。
+- 隔离数据库备份默认保留 30 天，不用于日常查询，到期自动清理。
 
 ## 服务器部署
 

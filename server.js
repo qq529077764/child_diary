@@ -43,6 +43,13 @@ database.exec(`
     PRIMARY KEY (user_id, id),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
+  CREATE TABLE IF NOT EXISTS guardian_consents (
+    user_id TEXT PRIMARY KEY,
+    policy_version TEXT NOT NULL,
+    consented_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
   CREATE INDEX IF NOT EXISTS idx_diaries_user_created
     ON diaries(user_id, created_at DESC);
 `);
@@ -101,6 +108,16 @@ function requireUser(req, res) {
   const user = authenticatedUser(req);
   if (!user) sendError(res, 401, "unauthorized", "请重新登录后再试。");
   return user;
+}
+
+function requireGuardianConsent(user, res) {
+  const consent = database.prepare("SELECT policy_version FROM guardian_consents WHERE user_id = ?")
+    .get(user.id);
+  if (!consent) {
+    sendError(res, 403, "guardian_consent_required", "需要监护人同意后才能使用这项功能。");
+    return false;
+  }
+  return true;
 }
 
 async function exchangeWechatCode(code) {
@@ -1678,15 +1695,44 @@ function handleGetDiary(res, user, diaryId) {
 }
 
 function handleDeleteDiary(res, user, diaryId) {
-  const result = database.prepare(`
-    UPDATE diaries SET deleted_at = ?, updated_at = ?
-    WHERE user_id = ? AND id = ? AND deleted_at IS NULL
-  `).run(Date.now(), Date.now(), user.id, diaryId);
+  const result = database.prepare("DELETE FROM diaries WHERE user_id = ? AND id = ?")
+    .run(user.id, diaryId);
   if (!result.changes) {
     sendError(res, 404, "diary_not_found", "没有找到这篇日记。");
     return;
   }
   sendJson(res, 200, { deleted: true, id: diaryId });
+}
+
+async function handleGuardianConsent(req, res, user) {
+  const input = await readJson(req);
+  const policyVersion = String(input.policyVersion || "").trim();
+  if (!/^[A-Za-z0-9._-]{3,64}$/.test(policyVersion)) {
+    sendError(res, 400, "invalid_policy_version", "监护人同意版本格式不正确。");
+    return;
+  }
+  const now = Date.now();
+  database.prepare(`
+    INSERT INTO guardian_consents(user_id, policy_version, consented_at, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      policy_version = excluded.policy_version,
+      consented_at = CASE
+        WHEN guardian_consents.policy_version = excluded.policy_version THEN guardian_consents.consented_at
+        ELSE excluded.consented_at
+      END,
+      updated_at = excluded.updated_at
+  `).run(user.id, policyVersion, now, now);
+  sendJson(res, 200, { consented: true, policyVersion, consentedAt: now });
+}
+
+function handleDeleteAccount(res, user) {
+  const result = database.prepare("DELETE FROM users WHERE id = ?").run(user.id);
+  if (!result.changes) {
+    sendError(res, 404, "account_not_found", "没有找到需要删除的账户数据。");
+    return;
+  }
+  sendJson(res, 200, { deleted: true });
 }
 
 async function handleAnalyze(req, res) {
@@ -1778,9 +1824,24 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === "POST" && pathname === "/api/guardian-consent") {
+    const user = requireUser(req, res);
+    if (!user) return;
+    handleGuardianConsent(req, res, user).catch(error => sendError(res, 500, "consent_save_failed", error.message));
+    return;
+  }
+
+  if (req.method === "DELETE" && pathname === "/api/account") {
+    const user = requireUser(req, res);
+    if (!user) return;
+    handleDeleteAccount(res, user);
+    return;
+  }
+
   if (pathname === "/api/diaries" || pathname.startsWith("/api/diaries/")) {
     const user = requireUser(req, res);
     if (!user) return;
+    if (!requireGuardianConsent(user, res)) return;
     const diaryId = decodeURIComponent(pathname.slice("/api/diaries/".length));
     if (req.method === "POST" && pathname === "/api/diaries") {
       handleCreateDiary(req, res, user).catch(error => sendError(res, 500, "diary_save_failed", error.message));
@@ -1805,6 +1866,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "POST" && pathname.startsWith("/api/")) {
     const user = requireUser(req, res);
     if (!user) return;
+    if (!requireGuardianConsent(user, res)) return;
   }
 
   if (req.method === "POST" && pathname === "/api/asr") {

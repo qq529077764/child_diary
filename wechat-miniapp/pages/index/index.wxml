@@ -12,6 +12,7 @@
     <view class="home-actions">
       <button class="button primary" bindtap="startStory">开始说</button>
       <button class="button soft history-entry" bindtap="openHistory">我的日记 {{diaryHistory.length ? diaryHistory.length + ' 篇' : ''}}</button>
+      <button class="privacy-entry" bindtap="openPrivacyCenter">家长与隐私</button>
     </view>
   </view>
 
@@ -93,8 +94,57 @@
     <button wx:else class="button green bottom" bindtap="retryRecording">重新打开麦克风</button>
   </view>
 
+  <view wx:elif="{{phase === 'privacy'}}" class="screen privacy-screen">
+    <view class="page-header"><button class="icon-button" bindtap="backHome">‹</button><text class="page-title">家长与隐私</text><view class="header-spacer"></view></view>
+    <scroll-view class="privacy-center" scroll-y>
+      <view class="privacy-status {{guardianConsentRecorded ? 'agreed' : ''}}">
+        <text class="privacy-status-title">{{guardianConsentRecorded ? '监护人已同意' : '尚未记录监护人同意'}}</text>
+        <text class="privacy-status-text">{{guardianConsentRecorded ? '语音整理和云端日记功能可以使用。' : '在开始录音或查看云端日记前，会先请监护人阅读并确认。'}}</text>
+      </view>
+      <view class="privacy-summary">
+        <text class="privacy-heading">我们怎样保护孩子的信息</text>
+        <text class="privacy-paragraph">录音只用于语音转文字，本服务不会长期保存录音文件。确认后的日记会保存在服务器，监护人可以删除单篇日记，也可以撤回同意并删除全部数据。</text>
+        <text class="privacy-paragraph">我们不会把孩子的信息用于广告、用户画像或公开展示。</text>
+      </view>
+      <button class="settings-row" bindtap="openChildPrivacyRules"><text>儿童个人信息保护规则</text><text>›</text></button>
+      <button class="settings-row" bindtap="openWechatPrivacyContract"><text>小程序隐私保护指引</text><text>›</text></button>
+      <view class="contact-row"><text>联系邮箱</text><text>529077764@qq.com</text></view>
+    </scroll-view>
+    <button wx:if="{{guardianConsentRecorded}}" class="danger-outline" bindtap="withdrawGuardianConsent">撤回同意并删除全部数据</button>
+  </view>
+
   <view wx:else class="screen success">
     <view class="success-icon">✓</view><text class="hero-title">保存成功</text><text class="muted">今天的小故事已经放进日记本里啦。</text>
     <view class="actions bottom"><button class="button green" bindtap="openHistory">查看日记本</button><button class="button primary" bindtap="restart">再讲一篇</button></view>
+  </view>
+
+  <view wx:if="{{showGuardianConsent}}" class="privacy-mask">
+    <view class="guardian-dialog">
+      <text class="guardian-kicker">请家长阅读</text>
+      <text class="guardian-title">监护人同意后再开始</text>
+      <text class="guardian-copy">童心日记面向儿童使用。我们会处理孩子的录音片段、转写文字和日记内容，用于语音识别、问题引导、日记整理与保存。</text>
+      <text class="guardian-copy">录音不会在日记服务器长期保存；日记可随时删除，也可撤回同意并删除全部数据。</text>
+      <view class="guardian-links">
+        <button class="text-link" bindtap="openChildPrivacyRules">儿童个人信息保护规则</button>
+        <button class="text-link" bindtap="openWechatPrivacyContract">小程序隐私保护指引</button>
+      </view>
+      <button id="guardian-agree-button" class="button green consent-agree" open-type="agreePrivacyAuthorization" bindtap="confirmGuardianConsent" bindagreeprivacyauthorization="confirmGuardianConsent">我是监护人并同意</button>
+      <button id="guardian-decline-button" class="consent-decline" bindtap="declineGuardianConsent">暂不使用</button>
+    </view>
+  </view>
+
+  <view wx:if="{{showChildPrivacyRules}}" class="privacy-mask rules-mask">
+    <view class="rules-dialog">
+      <view class="rules-header"><text class="rules-title">儿童个人信息保护规则</text><button class="rules-close" bindtap="closeChildPrivacyRules">×</button></view>
+      <scroll-view class="rules-scroll" scroll-y>
+        <text class="rules-intro">更新及生效日期：2026年10月9日</text>
+        <text class="rules-intro">请监护人在孩子使用前完整阅读。只有在监护人同意后，童心日记才会连接服务器或打开麦克风。</text>
+        <view wx:for="{{childPrivacySections}}" wx:key="title" class="rules-section">
+          <text class="rules-section-title">{{index + 1}}. {{item.title}}</text>
+          <text class="rules-section-text">{{item.text}}</text>
+        </view>
+      </scroll-view>
+      <button class="button primary rules-done" bindtap="closeChildPrivacyRules">我已阅读</button>
+    </view>
   </view>
 </view>

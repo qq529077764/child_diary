@@ -22,6 +22,7 @@ const API_BASE_URL = "https://childdiary.127space.com";
 
 ## 当前交互
 
+- 首次使用先由监护人阅读儿童个人信息保护规则并确认；确认前不登录服务器、不打开麦克风。
 - 开始后持续录音，约每 6 秒自动上传一个音频分段。
 - 实时字幕固定显示末尾约三行。
 - 引导问题会保留并自动滚动到最新一条。
@@ -31,7 +32,8 @@ const API_BASE_URL = "https://childdiary.127space.com";
 - 支持自然重说相关场景，也支持语音替换、删除、补充事实和删除句内多余短语；未涉及内容保持不变。
 - 确认后的日记保存到服务器，本地 `diaryHistory` 作为离线副本。
 - 旧版本地日记首次登录时自动上传，失败后下次启动重试。
-- 日记详情页支持二次确认后删除。
+- 日记详情页支持二次确认后永久删除。
+- “家长与隐私”可查看两份隐私规则，也可撤回同意并删除全部云端数据和手机副本。
 
 ## 接口
 
@@ -41,10 +43,12 @@ const API_BASE_URL = "https://childdiary.127space.com";
 - `POST /api/revise`
 - `POST /api/compose`
 - `POST /api/auth/session`
+- `POST /api/guardian-consent`
 - `POST /api/diaries`
 - `GET /api/diaries`
 - `GET /api/diaries/:id`
 - `DELETE /api/diaries/:id`
+- `DELETE /api/account`
 - `GET /health`
 
 后端密钥只保存在服务器 `.env`，不得写入小程序源码。
@@ -52,5 +56,6 @@ const API_BASE_URL = "https://childdiary.127space.com";
 ## 正式发布前
 
 - 部署 HTTPS 后端并配置 `request`、`uploadFile` 合法域名。
+- 在微信公众平台完成《小程序隐私保护指引》，并上传 `../compliance/童心日记儿童个人信息保护规则.txt` 作为儿童保护补充文档。
 - 接入正式儿童内容安全策略。
-- 根据需要增加登录、云端保存和 TTS。
+- 根据需要增加 TTS。

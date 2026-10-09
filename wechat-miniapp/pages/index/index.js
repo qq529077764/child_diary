@@ -5,6 +5,39 @@ const DIARY_HISTORY_KEY = "diaryHistory";
 const LATEST_DIARY_KEY = "latestDiary";
 const CLOUD_TOKEN_KEY = "cloudSessionToken";
 const INSTALLATION_ID_KEY = "installationId";
+const GUARDIAN_CONSENT_KEY = "guardianConsent";
+const CHILD_PRIVACY_VERSION = "2026-10-09-v1";
+const PRIVATE_STORAGE_KEYS = [
+  DIARY_HISTORY_KEY,
+  LATEST_DIARY_KEY,
+  CLOUD_TOKEN_KEY,
+  INSTALLATION_ID_KEY,
+  GUARDIAN_CONSENT_KEY,
+  "pendingDiaryRevision"
+];
+
+const CHILD_PRIVACY_SECTIONS = [
+  {
+    title: "我们会使用什么信息",
+    text: "经监护人同意后，我们会使用微信用户标识、孩子的录音片段、语音转写文字、事实信息和生成的日记。录音片段只用于本次语音识别，本服务不会把录音文件长期保存在日记服务器。"
+  },
+  {
+    title: "这些信息用来做什么",
+    text: "用于把口述转成文字、发现故事里还可以补充的内容、整理日记、语音修改，以及保存和查询已经确认的日记。不会用于广告、用户画像或公开展示。"
+  },
+  {
+    title: "会由谁处理",
+    text: "录音片段会交给腾讯云语音识别服务转写；转写文字、事实信息和当前日记会交给阿里云通义千问完成问题引导、整理和修改。通义千问不会收到本小程序上传的原始录音。"
+  },
+  {
+    title: "保存、删除和撤回",
+    text: "确认保存的日记会保存在服务器，直到监护人主动删除。删除单篇日记会立即从正在使用的数据库中删除；备份副本与线上服务隔离，并在最长30天内自动到期。监护人也可以撤回同意并删除全部日记和账户标识。"
+  },
+  {
+    title: "监护人的权利",
+    text: "监护人可以查看和删除日记、撤回同意并删除全部数据。拒绝或撤回不会产生额外费用，但语音整理、云端保存和日记查询功能将不能继续使用。需要帮助可联系 529077764@qq.com。"
+  }
+];
 
 Page({
   data: {
@@ -23,7 +56,11 @@ Page({
     selectedDiary: null,
     revisionDisplay: "",
     transcriptAnchorId: "transcript_end_0",
-    feedAnchorId: "feed_end_0"
+    feedAnchorId: "feed_end_0",
+    showGuardianConsent: false,
+    showChildPrivacyRules: false,
+    guardianConsentRecorded: false,
+    childPrivacySections: CHILD_PRIVACY_SECTIONS
   },
 
   onLoad() {
@@ -44,16 +81,36 @@ Page({
     this.loadDiaryHistory();
     this.cloudToken = wx.getStorageSync(CLOUD_TOKEN_KEY) || "";
     this.authError = null;
-    this.authPromise = this.initializeCloudDiary().catch(error => {
-      this.authError = error;
-      return null;
-    });
+    this.authPromise = null;
+    this.guardianConsentServerSynced = false;
+    this.cloudHistoryInitialized = false;
+    this.pendingProtectedAction = "";
+    this.privacyAuthorizationResolvers = [];
+    this.privacyAuthorizationRequestActive = false;
+    this.guardianConsentSubmitting = false;
+    this.privacyAuthorizationHandler = resolve => {
+      if (typeof resolve === "function") this.privacyAuthorizationResolvers.push(resolve);
+      this.setData({ showGuardianConsent: true });
+    };
+    if (typeof wx.onNeedPrivacyAuthorization === "function") {
+      wx.onNeedPrivacyAuthorization(this.privacyAuthorizationHandler);
+    }
+    const guardianConsentRecorded = this.hasGuardianConsent();
+    this.setData({ guardianConsentRecorded });
+    if (guardianConsentRecorded) {
+      this.startCloudInitialization().catch(error => {
+        this.authError = error;
+      });
+    }
   },
 
   onUnload() {
     clearTimeout(this.segmentTimer);
     this.keepRecording = false;
     try { this.recorder.stop(); } catch (error) {}
+    if (typeof wx.offNeedPrivacyAuthorization === "function" && this.privacyAuthorizationHandler) {
+      wx.offNeedPrivacyAuthorization(this.privacyAuthorizationHandler);
+    }
   },
 
   resetRuntime() {
@@ -155,6 +212,162 @@ Page({
     return diaryHistory;
   },
 
+  hasGuardianConsent() {
+    try {
+      const consent = wx.getStorageSync(GUARDIAN_CONSENT_KEY);
+      return Boolean(consent?.agreed && consent.policyVersion === CHILD_PRIVACY_VERSION);
+    } catch (error) {
+      return false;
+    }
+  },
+
+  requireGuardianConsent(action) {
+    if (this.hasGuardianConsent()) return true;
+    this.pendingProtectedAction = action || this.pendingProtectedAction || "";
+    this.setData({ showGuardianConsent: true, guardianConsentRecorded: false });
+    this.requestWechatPrivacyAuthorization();
+    return false;
+  },
+
+  requestWechatPrivacyAuthorization() {
+    if (this.privacyAuthorizationRequestActive || typeof wx.requirePrivacyAuthorize !== "function") return;
+    this.privacyAuthorizationRequestActive = true;
+    wx.requirePrivacyAuthorize({
+      success: () => { this.privacyAuthorizationRequestActive = false; },
+      fail: () => { this.privacyAuthorizationRequestActive = false; }
+    });
+  },
+
+  resolvePrivacyAuthorization(eventName) {
+    const resolvers = this.privacyAuthorizationResolvers.splice(0);
+    resolvers.forEach(resolve => {
+      try {
+        resolve({
+          event: eventName,
+          buttonId: eventName === "agree" ? "guardian-agree-button" : "guardian-decline-button"
+        });
+      } catch (error) {}
+    });
+  },
+
+  async confirmGuardianConsent() {
+    if (this.guardianConsentSubmitting) return;
+    this.guardianConsentSubmitting = true;
+    const agreedAt = Date.now();
+    try {
+      wx.setStorageSync(GUARDIAN_CONSENT_KEY, {
+        agreed: true,
+        policyVersion: CHILD_PRIVACY_VERSION,
+        agreedAt
+      });
+      this.guardianConsentServerSynced = false;
+      this.setData({
+        showGuardianConsent: false,
+        guardianConsentRecorded: true
+      });
+      this.resolvePrivacyAuthorization("agree");
+      const action = this.pendingProtectedAction;
+      this.pendingProtectedAction = "";
+      await this.ensureCloudSession();
+      if (action === "story") await this.beginStory();
+      if (action === "history") await this.enterHistory();
+    } catch (error) {
+      wx.showModal({
+        title: "暂时没有连接成功",
+        content: error.message || "请检查网络后再试。监护人同意记录已经保留。",
+        showCancel: false
+      });
+    } finally {
+      this.guardianConsentSubmitting = false;
+    }
+  },
+
+  declineGuardianConsent() {
+    this.pendingProtectedAction = "";
+    this.setData({ showGuardianConsent: false, guardianConsentRecorded: false });
+    this.resolvePrivacyAuthorization("disagree");
+  },
+
+  openChildPrivacyRules() {
+    this.setData({ showChildPrivacyRules: true });
+  },
+
+  closeChildPrivacyRules() {
+    this.setData({ showChildPrivacyRules: false });
+  },
+
+  openWechatPrivacyContract() {
+    if (typeof wx.openPrivacyContract !== "function") {
+      wx.showModal({ title: "当前微信版本暂不支持", content: "请更新微信后再查看《小程序隐私保护指引》。", showCancel: false });
+      return;
+    }
+    wx.openPrivacyContract({
+      fail: error => wx.showModal({
+        title: "暂时无法打开",
+        content: error?.errMsg || "请稍后再试。",
+        showCancel: false
+      })
+    });
+  },
+
+  openPrivacyCenter() {
+    this.setData({
+      phase: "privacy",
+      guardianConsentRecorded: this.hasGuardianConsent(),
+      selectedDiary: null
+    });
+  },
+
+  clearPrivateLocalData() {
+    PRIVATE_STORAGE_KEYS.forEach(key => {
+      try { wx.removeStorageSync(key); } catch (error) {}
+    });
+    this.cloudToken = "";
+    this.authPromise = null;
+    this.authError = null;
+    this.guardianConsentServerSynced = false;
+    this.cloudHistoryInitialized = false;
+    this.pendingProtectedAction = "";
+    this.loadDiaryHistory();
+  },
+
+  withdrawGuardianConsent() {
+    if (!this.hasGuardianConsent()) {
+      this.clearPrivateLocalData();
+      this.resetRuntime();
+      this.setData({ phase: "home", guardianConsentRecorded: false, selectedDiary: null });
+      return;
+    }
+    wx.showModal({
+      title: "撤回同意并删除全部数据？",
+      content: "服务器中的全部日记和账户标识都会删除，手机里的日记副本也会清除。此操作不能恢复。",
+      confirmText: "全部删除",
+      confirmColor: "#d85f3f",
+      success: async result => {
+        if (!result.confirm) return;
+        wx.showLoading({ title: "正在删除", mask: true });
+        try {
+          await this.ensureAccountSessionForDeletion();
+          await this.rawRequest("/api/account", "DELETE");
+          this.clearPrivateLocalData();
+          this.resetRuntime();
+          this.setData({
+            phase: "home",
+            guardianConsentRecorded: false,
+            selectedDiary: null,
+            diaryTitle: "",
+            diarySentences: []
+          });
+          wx.showModal({ title: "已经删除", content: "监护人同意、云端日记和手机副本都已删除。", showCancel: false });
+        } catch (error) {
+          wx.showModal({ title: "还没有删除成功", content: error.message || "请检查网络后再试。", showCancel: false });
+        } finally {
+          wx.hideLoading();
+        }
+      }
+    });
+  },
+
   installationId() {
     let id = wx.getStorageSync(INSTALLATION_ID_KEY);
     if (!id) {
@@ -193,38 +406,84 @@ Page({
   },
 
   async initializeCloudDiary() {
+    if (!this.hasGuardianConsent()) throw new Error("需要监护人同意后才能连接日记服务器");
+    await this.authenticateCloudSession();
+    await this.syncGuardianConsent();
+    return this.synchronizeDiaryHistory();
+  },
+
+  async authenticateCloudSession() {
+    if (this.cloudToken) {
+      try {
+        const current = await this.rawRequest("/api/auth/session", "POST", {}, true);
+        if (current.token) return current.token;
+      } catch (error) {
+        if (error.statusCode !== 401) throw error;
+        this.cloudToken = "";
+        wx.removeStorageSync(CLOUD_TOKEN_KEY);
+      }
+    }
     const code = await this.wechatLoginCode();
     const payload = { code, installationId: this.installationId() };
-    let auth;
-    try {
-      auth = await this.rawRequest("/api/auth/session", "POST", payload, true);
-    } catch (error) {
-      if (error.statusCode !== 401 || !this.cloudToken) throw error;
-      this.cloudToken = "";
-      wx.removeStorageSync(CLOUD_TOKEN_KEY);
-      auth = await this.rawRequest("/api/auth/session", "POST", payload, false);
-    }
+    const auth = await this.rawRequest("/api/auth/session", "POST", payload, false);
     if (!auth.token) throw new Error("服务器未返回登录信息");
     this.cloudToken = auth.token;
     this.authError = null;
     wx.setStorageSync(CLOUD_TOKEN_KEY, auth.token);
+    return auth.token;
+  },
+
+  async ensureAccountSessionForDeletion() {
+    return this.authenticateCloudSession();
+  },
+
+  startCloudInitialization() {
+    if (!this.hasGuardianConsent()) return Promise.reject(new Error("需要监护人同意后才能继续"));
+    if (!this.authPromise) {
+      this.authPromise = this.initializeCloudDiary()
+        .catch(error => {
+          this.authError = error;
+          throw error;
+        })
+        .finally(() => {
+          this.authPromise = null;
+        });
+    }
+    return this.authPromise;
+  },
+
+  async syncGuardianConsent() {
+    if (this.guardianConsentServerSynced) return;
+    if (!this.cloudToken) throw new Error("还没有连接到日记服务器");
+    const consent = wx.getStorageSync(GUARDIAN_CONSENT_KEY) || {};
+    await this.rawRequest("/api/guardian-consent", "POST", {
+      policyVersion: CHILD_PRIVACY_VERSION,
+      agreedAt: Number(consent.agreedAt) || Date.now()
+    });
+    this.guardianConsentServerSynced = true;
+  },
+
+  async synchronizeDiaryHistory() {
+    if (this.cloudHistoryInitialized) return this.data.diaryHistory;
     const localHistory = this.readDiaryHistory();
     for (const record of localHistory) {
       try { await this.rawRequest("/api/diaries", "POST", record); } catch (error) {}
     }
-    return this.refreshCloudHistory();
+    const history = await this.refreshCloudHistory();
+    this.cloudHistoryInitialized = true;
+    return history;
   },
 
   async ensureCloudSession() {
-    if (this.cloudToken) return this.cloudToken;
-    if (!this.authPromise) this.authPromise = this.initializeCloudDiary().catch(error => { throw error; });
-    await this.authPromise;
+    if (!this.hasGuardianConsent()) throw new Error("需要监护人同意后才能继续");
+    if (!this.cloudToken) await this.startCloudInitialization();
+    else await this.syncGuardianConsent();
     if (!this.cloudToken) {
       const error = this.authError;
-      this.authPromise = null;
       this.authError = null;
       throw new Error(error?.message || "还没有连接到日记服务器");
     }
+    if (!this.cloudHistoryInitialized) await this.synchronizeDiaryHistory();
     return this.cloudToken;
   },
 
@@ -240,6 +499,11 @@ Page({
   },
 
   async openHistory() {
+    if (!this.requireGuardianConsent("history")) return;
+    await this.enterHistory();
+  },
+
+  async enterHistory() {
     this.loadDiaryHistory();
     this.setData({ phase: "history", selectedDiary: null });
     try {
@@ -330,7 +594,7 @@ Page({
     if (!diary) return;
     wx.showModal({
       title: "删除这篇日记？",
-      content: "删除后，日记本里就看不到它了。",
+      content: "日记会从服务器和手机中删除，不能恢复。隔离备份中的副本会在最长30天内自动到期。",
       confirmText: "删除",
       confirmColor: "#d85f3f",
       success: async result => {
@@ -351,6 +615,11 @@ Page({
   },
 
   async startStory() {
+    if (!this.requireGuardianConsent("story")) return;
+    await this.beginStory();
+  },
+
+  async beginStory() {
     try {
       await this.ensureCloudSession();
     } catch (error) {
