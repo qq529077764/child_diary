@@ -19,7 +19,7 @@ function fakeModelResponse(messages) {
   const joined = messages.map(message => message.content).join("\n");
   const story = {
     titleHint: "公园日记",
-    spans: [{ id: "span_1", text: "我和妈妈去了公园，那里有好多好多鸽子，我还喂了它们", role: "child_story", accepted: true, reason: "" }],
+    spanRoles: { child_story: ["span_1"], adult_guidance: [], background_audio: [], meta_speech: [], noise: [] },
     scenes: [{ id: "scene_park", label: "公园", order: 0, sourceSpanIds: ["span_1"] }],
     events: [
       { id: "event_park", sceneId: "scene_park", subject: "我和妈妈", action: "去", object: "公园", time: "", location: "", manner: "", result: "", feeling: "", polarity: "positive", certainty: "certain", details: [], childExpressions: [], sourceSpanIds: ["span_1"], status: "active", confidence: 0.99 },
@@ -41,7 +41,7 @@ function fakeModelResponse(messages) {
     };
   }
   if (joined.includes("独立的儿童口述来源审计员")) return { hardErrors: [], verdict: "pass" };
-  if (joined.includes("fullTranscript")) return story;
+  if (joined.includes("sourceSpans")) return story;
   if (joined.includes("独立的儿童日记语义审计员")) return { hardErrors: [], softIssues: [], verdict: "pass" };
   const revised = joined.includes("小小的");
   return {
@@ -71,12 +71,20 @@ async function waitForServer(baseUrl, child) {
 }
 
 async function run() {
+  let malformedExtractionInjected = false;
   const fakeModel = http.createServer((req, res) => {
     let body = "";
     req.on("data", chunk => { body += chunk; });
     req.on("end", () => {
       const request = JSON.parse(body);
-      const content = JSON.stringify(fakeModelResponse(request.messages || []));
+      const joined = (request.messages || []).map(message => message.content).join("\n");
+      const shouldInjectMalformed = !malformedExtractionInjected
+        && joined.includes("sourceSpans")
+        && !joined.includes("compact_json_retry");
+      if (shouldInjectMalformed) malformedExtractionInjected = true;
+      const content = shouldInjectMalformed
+        ? '{"titleHint":"截断测试","spans":['
+        : JSON.stringify(fakeModelResponse(request.messages || []));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
     });
@@ -128,7 +136,9 @@ async function run() {
     assert.equal(realtime.body.facts[0].text, "我和妈妈去了公园");
     const draft = await request("/api/finalize", "POST", { transcript, facts: [] }, token);
     assert.equal(draft.response.status, 200, JSON.stringify(draft.body));
+    assert.match(processOutput, /Qwen stage retry/, "模型首次返回截断JSON时必须用紧凑模式自动重试");
     assert.equal(draft.body.story.schemaVersion, 2);
+    assert.equal(draft.body.story.spans[0].text, transcript, "模型只回传片段分类，服务端必须恢复原始来源文本");
     assert.deepEqual(draft.body.sentences[0].eventIds, ["event_park", "event_feed"]);
     const saved = await request("/api/diaries", "POST", {
       id: "semantic_api_test", title: draft.body.title, sentences: draft.body.sentences,

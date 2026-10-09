@@ -328,6 +328,7 @@ function qwenConfig() {
   return {
     apiKey: process.env.QWEN_API_KEY,
     model: process.env.QWEN_MODEL || "qwen-plus",
+    fastModel: process.env.QWEN_FAST_MODEL || "qwen-flash",
     baseUrl: (process.env.QWEN_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/$/, "")
   };
 }
@@ -338,16 +339,34 @@ function extractJson(text) {
     return JSON.parse(trimmed);
   } catch {}
   const match = trimmed.match(/\{[\s\S]*\}/);
-  if (!match) throw new Error(`No JSON in model response: ${trimmed.slice(0, 200)}`);
-  return JSON.parse(match[0]);
+  if (match) {
+    try {
+      return JSON.parse(match[0]);
+    } catch {}
+  }
+  const error = new Error("模型返回的结构数据不完整");
+  error.code = "MODEL_JSON_INVALID";
+  error.outputChars = trimmed.length;
+  throw error;
 }
 
-async function callQwenJson(messages) {
+async function callQwenJson(messages, options = {}) {
   const config = qwenConfig();
   if (!config.apiKey) throw new Error("QWEN_API_KEY is not configured");
+  const stage = String(options.stage || "unspecified");
+  const maxTokens = Math.max(800, Math.min(5000, Number(options.maxTokens) || 3600));
+  const timeoutMs = Math.max(10000, Math.min(60000, Number(options.timeoutMs) || 45000));
   let lastError;
+  let requestMessages = messages;
+  let compactRetry = false;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const startedAt = Date.now();
     try {
+      const fastStage = /^(?:audit|reaudit)_(?:diary|revision)/u.test(stage)
+        || /^(?:audit|reaudit)_story_(?:source|correction)$/u.test(stage);
+      const model = options.model || (compactRetry
+        ? (fastStage ? config.model : config.fastModel)
+        : (fastStage ? config.fastModel : config.model));
       const response = await fetch(`${config.baseUrl}/chat/completions`, {
         method: "POST",
         headers: {
@@ -355,12 +374,13 @@ async function callQwenJson(messages) {
           Authorization: `Bearer ${config.apiKey}`
         },
         body: JSON.stringify({
-          model: config.model,
-          messages,
+          model,
+          messages: requestMessages,
           temperature: 0.1,
-          max_tokens: 5000,
+          max_tokens: maxTokens,
           response_format: { type: "json_object" }
-        })
+        }),
+        signal: AbortSignal.timeout(timeoutMs)
       });
       const text = await response.text();
       if (!response.ok) {
@@ -370,11 +390,53 @@ async function callQwenJson(messages) {
       }
       const data = JSON.parse(text);
       const content = data?.choices?.[0]?.message?.content || "";
-      return extractJson(content);
+      const finishReason = data?.choices?.[0]?.finish_reason || "";
+      if (finishReason === "length") {
+        const error = new Error("模型输出达到长度上限");
+        error.code = "MODEL_OUTPUT_TRUNCATED";
+        error.outputChars = content.length;
+        throw error;
+      }
+      const result = extractJson(content);
+      console.log("Qwen stage completed", {
+        stage,
+        model,
+        attempt,
+        elapsedMs: Date.now() - startedAt,
+        outputChars: content.length,
+        finishReason
+      });
+      return result;
     } catch (error) {
       lastError = error;
       const retryable = error.retryable !== false;
       if (attempt >= 2 || !retryable) break;
+      console.warn("Qwen stage retry", {
+        stage,
+        attempt,
+        elapsedMs: Date.now() - startedAt,
+        reason: error.code || error.name || "unknown",
+        outputChars: Number(error.outputChars) || 0
+      });
+      if (["MODEL_JSON_INVALID", "MODEL_OUTPUT_TRUNCATED"].includes(error.code)) {
+        compactRetry = true;
+        requestMessages = [
+          ...messages,
+          {
+            role: "user",
+            content: JSON.stringify({
+              task: "compact_json_retry",
+              reason: "上次JSON过长或不完整。重新返回一个完整、紧凑、可直接解析的JSON对象。",
+              constraints: [
+                "不要复制输入原文或解释原因",
+                "删除reason、confidence和所有空字段",
+                "合并重复项，保留事实、否定、纠正和儿童特色词",
+                "JSON必须在限制内完整结束"
+              ]
+            })
+          }
+        ];
+      }
       await new Promise(resolve => setTimeout(resolve, 450));
     }
   }
@@ -929,6 +991,10 @@ async function handleCompose(req, res) {
 async function handleFinalize(req, res) {
   const startedAt = Date.now();
   const input = await readJson(req);
+  console.log("Finalize started", {
+    transcriptChars: String(input.transcript || "").length,
+    inputFacts: Array.isArray(input.facts) ? input.facts.length : 0
+  });
   const result = await finalizeSemanticDiary(input, callQwenJson);
   console.log("Finalize completed", {
     elapsedMs: Date.now() - startedAt,
@@ -1024,8 +1090,14 @@ const server = http.createServer((req, res) => {
 
   if (req.method === "POST" && pathname === "/api/finalize") {
     handleFinalize(req, res).catch(error => {
-      console.error("Finalize failed:", error.message);
-      sendJson(res, 500, { error: error.message });
+      console.error("Finalize failed:", error.code || error.message);
+      const modelIncomplete = ["MODEL_JSON_INVALID", "MODEL_OUTPUT_TRUNCATED"].includes(error.code);
+      const modelTimeout = error.name === "TimeoutError" || error.name === "AbortError";
+      sendJson(res, 500, {
+        error: modelIncomplete || modelTimeout
+          ? "模型返回不完整，已自动重试但仍未完成，请再试一次。"
+          : error.message
+      });
     });
     return;
   }

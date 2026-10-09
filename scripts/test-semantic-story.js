@@ -5,7 +5,11 @@ const {
   validateCompositionStructure,
   validateStory
 } = require("../lib/story-model");
-const { deterministicStyleIssues, finalizeSemanticDiary, reviseSemanticDiary } = require("../lib/semantic-pipeline");
+const { deterministicStyleIssues, finalizeSemanticDiary, reviseSemanticDiary, segmentTranscript } = require("../lib/semantic-pipeline");
+
+const longSegments = segmentTranscript(Array.from({ length: 80 }, (_, index) => `第${index + 1}句话。`).join(""));
+assert.ok(longSegments.length <= 48, "长口述的来源片段数量必须受控，避免事件账本输出过长");
+assert.equal(longSegments.map(item => item.text).join(""), Array.from({ length: 80 }, (_, index) => `第${index + 1}句话。`).join(""), "分段不得丢失原口述内容");
 
 function baseStory() {
   return normalizeStory({
@@ -40,7 +44,7 @@ const invalidNegativeDetail = normalizeStory({
   scenes: [{ id: "negative_scene", order: 0, sourceSpanIds: ["negative_span"] }],
   events: [{ id: "watch_event", sceneId: "negative_scene", subject: "我", action: "看", object: "哥哥骑车", details: ["没有骑自行车"], sourceSpanIds: ["negative_span"], status: "active", certainty: "certain" }]
 });
-assert.equal(validateStory(invalidNegativeDetail).some(error => error.startsWith("negative_detail_must_be_event")), true, "明确否定不得藏在普通细节中而被成文遗漏");
+assert.deepEqual(validateStory(invalidNegativeDetail), [], "与同一主语明确绑定的否定细节可保留在事件中，交由成文审计防止遗漏");
 
 const explicitTimeStory = normalizeStory({
   spans: [{ id: "time_span", text: "早上画画，下午喂鸽子", role: "child_story", accepted: true }],
@@ -136,15 +140,15 @@ async function testFinalizePipeline() {
     },
     { hardErrors: [], softIssues: [], verdict: "pass" }
   ];
-  const result = await finalizeSemanticDiary({ transcript: "我跟妈妈去公园，鸽子好多好多，我喂了鸽子。" }, async () => responses.shift());
+  const result = await finalizeSemanticDiary({ transcript: "我跟妈妈去公园。鸽子好多好多，我喂了鸽子。" }, async () => responses.shift());
   assert.equal(result.story.schemaVersion, 2, "第一版必须返回版本化事件账本");
   assert.deepEqual(result.sentences[0].eventIds, ["event_arrive", "event_feed"], "正文来源使用事件编号而不是事实原句");
   assert.equal(responses.length, 0, "语义正确时应完成事件提取、来源审计、成文和正文审计");
 
   await assert.rejects(
     finalizeSemanticDiary({ transcript: "孩子只说了去公园。" }, async () => baseStory()),
-    /source_span_not_in_transcript/,
-    "模型虚构的来源片段必须在成文前被拒绝"
+    /semantic_story_invalid/,
+    "模型使用不存在的来源片段必须在成文前被拒绝"
   );
 }
 
@@ -208,14 +212,17 @@ async function testCorrectionSourceAudit() {
   const transcript = "树是甜甜的，不对，是苹果甜甜的。苹果红红的。";
   const extracted = {
     titleHint: "苹果",
-    spans: [{ id: "span_correction", text: transcript, role: "child_story", accepted: true }],
-    scenes: [{ id: "scene_correction", order: 0, sourceSpanIds: ["span_correction"] }],
-    events: [
-      { id: "old_tree", sceneId: "scene_correction", subject: "树", action: "是", object: "甜甜的", polarity: "negative", sourceSpanIds: ["span_correction"], status: "active", certainty: "certain" },
-      { id: "sweet_apple", sceneId: "scene_correction", subject: "苹果", action: "是", object: "甜甜的", sourceSpanIds: ["span_correction"], status: "active", certainty: "certain" },
-      { id: "red_apple", sceneId: "scene_correction", subject: "苹果", action: "是", object: "红红的", sourceSpanIds: ["span_correction"], status: "active", certainty: "certain" }
+    spans: [
+      { id: "span_1", role: "child_story", accepted: true },
+      { id: "span_2", role: "child_story", accepted: true }
     ],
-    corrections: [{ id: "correction_tree_apple", discardedText: "树是甜甜的", adoptedText: "苹果甜甜的", sourceSpanIds: ["span_correction"] }]
+    scenes: [{ id: "scene_correction", order: 0, sourceSpanIds: ["span_1", "span_2"] }],
+    events: [
+      { id: "old_tree", sceneId: "scene_correction", subject: "树", action: "是", object: "甜甜的", polarity: "negative", sourceSpanIds: ["span_1"], status: "active", certainty: "certain" },
+      { id: "sweet_apple", sceneId: "scene_correction", subject: "苹果", action: "是", object: "甜甜的", sourceSpanIds: ["span_1"], status: "active", certainty: "certain" },
+      { id: "red_apple", sceneId: "scene_correction", subject: "苹果", action: "是", object: "红红的", sourceSpanIds: ["span_2"], status: "active", certainty: "certain" }
+    ],
+    corrections: [{ id: "correction_tree_apple", discardedText: "树是甜甜的", adoptedText: "苹果甜甜的", sourceSpanIds: ["span_1"] }]
   };
   const responses = [
     extracted,
@@ -229,7 +236,54 @@ async function testCorrectionSourceAudit() {
   assert.equal(result.story.events.find(event => event.id === "sweet_apple").status, "active", "最终采用内容不能因审计事件编号误判而删除");
 }
 
-Promise.all([testFinalizePipeline(), testRevisionPipeline(), testCorrectionSourceAudit()]).then(() => {
+async function testPrefixCorrection() {
+  const transcript = "不是白色的鸟，是灰灰的小鸟。";
+  const extracted = {
+    titleHint: "小鸟",
+    spanRoles: { child_story: ["span_1"], adult_guidance: [], background_audio: [], meta_speech: [], noise: [] },
+    scenes: [{ id: "bird_scene", order: 0, sourceSpanIds: ["span_1"] }],
+    events: [
+      { id: "wrong_bird", sceneId: "bird_scene", subject: "我", action: "没有喂", object: "白色的鸟", polarity: "negative", sourceSpanIds: ["span_1"] },
+      { id: "right_bird", sceneId: "bird_scene", subject: "我", action: "喂", object: "灰灰的小鸟", details: ["不是白色的鸟"], childExpressions: [{ text: "灰灰的", bindTo: "object", policy: "preserve" }], sourceSpanIds: ["span_1"] }
+    ],
+    corrections: [{ id: "bird_correction", discardedText: "不是白色的鸟", adoptedText: "灰灰的小鸟", sourceSpanIds: ["span_1"] }]
+  };
+  const responses = [
+    extracted,
+    { hardErrors: [{ type: "missing_child_event", eventIds: ["right_bird"], missingMeaning: "我喂了灰灰的小鸟" }], verdict: "hard_fail" },
+    { title: "小鸟", sentences: [{ sceneId: "bird_scene", text: "我喂了灰灰的小鸟。", eventIds: ["right_bird"] }] },
+    { hardErrors: [], softIssues: [], verdict: "pass" }
+  ];
+  const result = await finalizeSemanticDiary({ transcript, facts: [] }, async () => responses.shift());
+  assert.equal(result.story.events.find(event => event.id === "wrong_bird").status, "superseded", "‘不是A，是B’必须把A当作被撤回属性，不得造成否定动作");
+  assert.deepEqual(result.story.events.find(event => event.id === "right_bird").details, [], "被纠正的旧属性不得残留在新事件细节中");
+  assert.equal(result.sentences[0].text.includes("白色"), false, "被纠正的旧属性不得进入正文");
+}
+
+async function testSpatialPostureNormalization() {
+  const transcript = "我坐在石头上吃甜甜的苹果。";
+  const extracted = {
+    spanRoles: { child_story: ["span_1"], adult_guidance: [], background_audio: [], meta_speech: [], noise: [] },
+    scenes: [{ id: "scene_1", order: 0, sourceSpanIds: ["span_1"] }],
+    events: [
+      { id: "sit", sceneId: "scene_1", subject: "我", action: "坐了", object: "石头", sourceSpanIds: ["span_1"] },
+      { id: "eat", sceneId: "scene_1", subject: "我", action: "吃", object: "甜甜的苹果", sourceSpanIds: ["span_1"] }
+    ]
+  };
+  const responses = [
+    extracted,
+    { hardErrors: [], verdict: "pass" },
+    { title: "吃苹果", sentences: [{ sceneId: "scene_1", text: "我坐在石头上吃甜甜的苹果。", eventIds: ["sit", "eat"] }] },
+    { hardErrors: [], softIssues: [], verdict: "pass" }
+  ];
+  const result = await finalizeSemanticDiary({ transcript, facts: [] }, async () => responses.shift());
+  const sit = result.story.events.find(event => event.id === "sit");
+  assert.equal(sit.action, "坐", "位置姿态动作应保留核心动词");
+  assert.equal(sit.object, "", "坐的地点不是动作宾语");
+  assert.equal(sit.location, "石头上", "应从原始来源恢复完整位置。");
+}
+
+Promise.all([testFinalizePipeline(), testRevisionPipeline(), testCorrectionSourceAudit(), testPrefixCorrection(), testSpatialPostureNormalization()]).then(() => {
   console.log("semantic story regression: ok");
 }).catch(error => {
   console.error(error);
