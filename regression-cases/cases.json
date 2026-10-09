@@ -48,5 +48,35 @@
     "symptom": "第一版只保留少量事实，第二次相同流程又能完整生成。",
     "invariant": "所有审核通过的事实必须进入第一版且只表达一次。",
     "generalRule": "使用精确 factTexts 账本检查覆盖；未完整覆盖时拒绝结果并统一校对。"
+  },
+  {
+    "id": "case-fragment-subsumption-001",
+    "capturedAt": "2026-10-09",
+    "stage": "first_draft",
+    "status": "generalized",
+    "minimalInput": "孩子先说出完整动作，停顿后又补出一个没有新增信息的动作残片。",
+    "symptom": "残片被当成独立事实逐条写入，形成句尾病句。",
+    "invariant": "事实来源需要完整覆盖，但重叠含义在正文中只表达一次。",
+    "generalRule": "事实池是来源账本而非逐条照抄清单；被完整动作包含的残片绑定到同一完整句并省略重复措辞。"
+  },
+  {
+    "id": "case-related-restatement-001",
+    "capturedAt": "2026-10-09",
+    "stage": "revision_compose",
+    "status": "generalized",
+    "minimalInput": "孩子没有使用编辑口令，而是自然重说已有场景并补充一个细节。",
+    "symptom": "重说内容被当成独立新增，旧句与新句并存并重复。",
+    "invariant": "相关场景自然重说应局部融合，明确冲突以最新为准，兼容旧事实保留。",
+    "generalRule": "修改意图由语义和场景关联判断；相邻受影响句作为场景块统一重整。"
+  },
+  {
+    "id": "case-sentence-phrase-removal-001",
+    "capturedAt": "2026-10-09",
+    "stage": "revision_compose",
+    "status": "generalized",
+    "minimalInput": "孩子明确要求删掉生成句中的多余短语，但该短语没有对应独立事实。",
+    "symptom": "事实级修改找不到目标，重复提示没有修改。",
+    "invariant": "成文阶段产生的句内冗余也必须可以被明确删除。",
+    "generalRule": "支持带句子 ID 的 remove_phrase 操作，同时保持该句其他事实来源不变。"
   }
 ]

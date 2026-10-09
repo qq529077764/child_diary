@@ -75,30 +75,34 @@ async function run() {
     sentences: structuredClone(revisionPage.data.diarySentences),
     facts: structuredClone(revisionPage.facts)
   };
-  revisionPage.request = async path => {
+  let revisionRequest;
+  revisionPage.request = async (path, data) => {
     assert.equal(path, "/api/revise");
+    revisionRequest = data;
     return { operations: [{ type: "replace", target_fact_id: "f2", new_text: "特别开心", slot: "feeling" }] };
   };
   let composeOptions;
   revisionPage.composeDiary = async options => { composeOptions = options; };
   await revisionPage.finishRevision();
   assert.equal(revisionPage.facts.find(fact => fact.id === "f2").text, "特别开心", "明确替换应更新目标事实");
+  assert.equal(revisionRequest.diary[0].id, "s1", "修改判定必须接收句子 id，不能只传纯文本");
+  assert.deepEqual(revisionRequest.diary[0].factIds, ["f1"], "修改判定必须接收句子与事实的关联");
   assert.equal(composeOptions.lockedDiary[0].text, "我去了公园。", "未涉及句子必须锁定");
   assert.equal(composeOptions.revisionOperations[0].old_text, "很开心", "局部成文必须知道被替换的旧事实");
 
-  const supplementalPage = createPage();
-  supplementalPage.data.phase = "revise";
-  supplementalPage.data.diaryTitle = "公园日记";
-  supplementalPage.data.diarySentences = structuredClone(revisionPage.data.diarySentences);
-  supplementalPage.facts = structuredClone(facts);
-  supplementalPage.revisionTranscript = "后来我和哥哥玩了滑滑梯，我们还一起开了粉色的小汽车，回家前我看见了很多小鸟，我特别开心。";
-  supplementalPage.revisionBaseSnapshot = {
-    title: supplementalPage.data.diaryTitle,
-    sentences: structuredClone(supplementalPage.data.diarySentences),
-    facts: structuredClone(supplementalPage.facts)
+  const newEventPage = createPage();
+  newEventPage.data.phase = "revise";
+  newEventPage.data.diaryTitle = "公园日记";
+  newEventPage.data.diarySentences = structuredClone(revisionPage.data.diarySentences);
+  newEventPage.facts = structuredClone(facts);
+  newEventPage.revisionTranscript = "后来我和哥哥玩了滑滑梯，我们还一起开了粉色的小汽车，回家前我看见了很多小鸟，我特别开心。";
+  newEventPage.revisionBaseSnapshot = {
+    title: newEventPage.data.diaryTitle,
+    sentences: structuredClone(newEventPage.data.diarySentences),
+    facts: structuredClone(newEventPage.facts)
   };
-  supplementalPage.request = async () => ({
-    revisionMode: "supplemental_narration",
+  newEventPage.request = async () => ({
+    revisionMode: "new_event",
     operations: [
       { type: "add", slot: "what", label: "新活动", new_text: "和哥哥玩了滑滑梯", anchor_fact_id: "f1", placement: "after" },
       { type: "add", slot: "detail", label: "新活动", new_text: "一起开了粉色的小汽车", anchor_fact_id: "f1", placement: "after" },
@@ -106,16 +110,38 @@ async function run() {
       { type: "add", slot: "feeling", label: "感受", new_text: "特别开心", anchor_fact_id: "f2", placement: "merge" }
     ]
   });
-  let supplementalCompose;
-  supplementalPage.composeDiary = async options => { supplementalCompose = options; };
-  await supplementalPage.finishRevision();
-  assert.equal(supplementalCompose.revisionOperations.length, 4, "长段续讲中的多个新事实必须全部进入局部成文");
-  assert.equal(supplementalPage.facts.filter(fact => fact.id.startsWith("rev_")).length, 4, "长段续讲不能只保留前两项事实");
+  let newEventCompose;
+  newEventPage.composeDiary = async options => { newEventCompose = options; };
+  await newEventPage.finishRevision();
+  assert.equal(newEventCompose.revisionOperations.length, 4, "新事件口述中的多个事实必须全部进入局部成文");
+  assert.equal(newEventPage.facts.filter(fact => fact.id.startsWith("rev_")).length, 4, "新事件不能只保留前两项事实");
+  assert.equal(newEventCompose.revisionMode, "new_event", "客户端必须把语义修改意图交给局部成文器");
   assert.deepEqual(
-    supplementalCompose.revisionOperations.map(operation => [operation.anchor_fact_id, operation.placement]),
+    newEventCompose.revisionOperations.map(operation => [operation.anchor_fact_id, operation.placement]),
     [["f1", "after"], ["f1", "after"], ["f2", "before"], ["f2", "merge"]],
     "客户端必须把事实锚点和插入位置原样交给局部成文器"
   );
+
+  const phrasePage = createPage();
+  phrasePage.data.phase = "revise";
+  phrasePage.data.diaryTitle = "上学日记";
+  phrasePage.data.diarySentences = [{ id: "s3", text: "我进教室吃早餐，进去了。", factIds: ["f3"], factTexts: ["进教室吃早餐"] }];
+  phrasePage.facts = [{ id: "f3", text: "进教室吃早餐", slot: "what", active: true }];
+  phrasePage.revisionTranscript = "去掉那个进去了";
+  phrasePage.revisionBaseSnapshot = {
+    title: phrasePage.data.diaryTitle,
+    sentences: structuredClone(phrasePage.data.diarySentences),
+    facts: structuredClone(phrasePage.facts)
+  };
+  phrasePage.request = async () => ({
+    revisionMode: "explicit_edit",
+    operations: [{ type: "remove_phrase", target_sentence_id: "s3", old_text: "进去了" }]
+  });
+  let phraseCompose;
+  phrasePage.composeDiary = async options => { phraseCompose = options; };
+  await phrasePage.finishRevision();
+  assert.equal(phraseCompose.revisionOperations[0].type, "remove_phrase", "句内冗余删除不能因没有独立事实而丢失");
+  assert.equal(phrasePage.facts.length, 1, "句内删词不能误删原句事实");
 
   const unclearPage = createPage();
   unclearPage.data.phase = "revise";

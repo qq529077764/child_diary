@@ -39,9 +39,10 @@ http://127.0.0.1:5178/health
 3. 开发测试阶段关闭合法域名校验。
 4. 手机与电脑连接同一个 Wi-Fi 后生成预览码测试。
 
-修改链路回归测试：
+服务端规则与修改链路回归测试：
 
 ```bash
+node scripts/test-server-logic.js
 node scripts/test-miniapp-revision.js
 ```
 
@@ -53,7 +54,7 @@ node scripts/test-prompt-generality.js
 
 生产提示词不得叠加单次测试的人名、地点、活动或原句。测试问题先记录到案例库，确认属于可复现的共性或违反核心事实约束后，再抽象为通用规则。
 
-当前测试 AppID 已写入 `project.config.json`。正式发布前必须改用 HTTPS 服务，并在小程序后台配置合法域名。
+当前正式 AppID 已写入 `project.config.json`，接口使用 HTTPS 服务；发布前仍需确认小程序后台的 `request` 和 `uploadFile` 合法域名配置。
 
 ## 配置项
 

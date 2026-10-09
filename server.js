@@ -435,9 +435,14 @@ function semanticSimilarity(left, right) {
 function dedupeSemanticFacts(facts) {
   const unique = [];
   for (const fact of facts) {
-    const duplicateIndex = unique.findIndex(existing =>
-      existing.slot === fact.slot && semanticSimilarity(existing.text, fact.text) >= 0.72
-    );
+    const factText = normalizeSemanticText(fact.text);
+    const duplicateIndex = unique.findIndex(existing => {
+      if (existing.slot !== fact.slot) return false;
+      const existingText = normalizeSemanticText(existing.text);
+      const contained = Math.min(existingText.length, factText.length) >= 5 &&
+        (existingText.includes(factText) || factText.includes(existingText));
+      return existingText === factText || contained || semanticSimilarity(existing.text, fact.text) >= 0.9;
+    });
     if (duplicateIndex < 0) {
       unique.push(fact);
       continue;
@@ -726,7 +731,8 @@ function dedupeCompositionSentences(sentences) {
   const unique = [];
   for (const sentence of sentences || []) {
     if (!sentence?.text) continue;
-    const duplicate = unique.find(existing => semanticSimilarity(existing.text, sentence.text) >= 0.68);
+    const normalized = normalizeSemanticText(sentence.text);
+    const duplicate = unique.find(existing => normalizeSemanticText(existing.text) === normalized);
     if (!duplicate) {
       unique.push(sentence);
       continue;
@@ -761,16 +767,24 @@ function compositionPenalty(draft) {
   const sentences = Array.isArray(draft?.sentences) ? draft.sentences : [];
   let penalty = sentences.length ? 0 : 100;
   const thenCount = (sentences.map(sentence => String(sentence?.text || "")).join("").match(/然后/gu) || []).length;
+  const factUseCounts = new Map();
   if (thenCount > 1) penalty += (thenCount - 1) * 10;
   for (const sentence of sentences) {
     const text = String(sentence?.text || "").trim();
+    for (const factText of Array.isArray(sentence?.factTexts) ? sentence.factTexts : []) {
+      factUseCounts.set(factText, (factUseCounts.get(factText) || 0) + 1);
+    }
     if (text.length < 5) penalty += 8;
     if (!/[。！？!?]$/.test(text)) penalty += 2;
     if (/(与之前矛盾|保留原话|事实冲突|编辑说明)/u.test(text)) penalty += 20;
     if (/(.{2,5})(?:之后|以后|接着|然后).{0,4}\1/u.test(text)) penalty += 12;
     if (/(吃完|做完|玩完|看完|说完).{0,6}\1/u.test(text)) penalty += 12;
     if (/(之后|以后|接着|然后|因为|所以|但是)[，。！？!?]?$/u.test(text)) penalty += 10;
+    if (/，(?!我|我们|他|她|它|爸爸|妈妈|老师|哥哥|姐姐|弟弟|妹妹|同学|朋友|小朋友|大家)[^，。！？!?]{1,5}(?:了|啦)[。！？!?]$/u.test(text)) penalty += 14;
     if (!/(我|我们|爸爸|妈妈|老师|哥哥|姐姐|弟弟|妹妹|同学|朋友|小朋友|他|她|大家)/u.test(text)) penalty += 3;
+  }
+  for (const count of factUseCounts.values()) {
+    if (count > 1) penalty += (count - 1) * 12;
   }
   return penalty;
 }
@@ -787,7 +801,9 @@ async function refineCompositionWithQwen(input, draft, facts, missingFacts) {
       content: JSON.stringify({
         schema: { title: "短标题", sentences: [{ text: "一句日记", factTexts: ["实际使用的事实 text"] }] },
         rules: [
-          "所有 facts 都必须覆盖且每个事实只表达一次；missing_facts 要合并回它真实发生的位置。",
+          "所有 facts 的有效含义都必须覆盖且只表达一次；missing_facts 要合并回它真实发生的位置。",
+          "facts 是来源账本，不是逐条照抄清单。同一场景中重复、包含或前后补全的事实要绑定到同一句完整表达，factTexts 可同时列出这些来源，但正文不得把每条 fact text 再说一遍。",
+          "孩子停顿后补出的半句、指代词或单独的‘去了、进去了、做完了’若没有新增独立信息，要并入上下文或省略，不能原样留成病句。",
           "每个独立句子必须有明确主语和谓语，主语只能来自事实；时间或地点作状语时也不能省略必要主语，并列动作可以共用一次主语。",
           "同一活动的连续阶段合并成一句或一个紧凑事件，不能拆成重复叙述。",
           "按时间和事件顺序组织：发生了什么、过程或结果、最后感受；感受不得放在对应事情之前。",
@@ -797,7 +813,7 @@ async function refineCompositionWithQwen(input, draft, facts, missingFacts) {
           "优先保留孩子原话中的形容词、叠词和人物关系，不擅自替换成义词或添加华丽表达。",
           "accepted_child_utterances 是审核后的孩子原话片段，是措辞和细节的唯一来源；facts 只用于确定哪些内容有效并检查覆盖。",
           "忽略并禁止写入记不清、不确定、可能、猜测的内容。",
-          "factTexts 必须使用 facts 中完整的 text，列出该句使用的全部事实。",
+          "factTexts 必须使用 facts 中完整的 text，列出该句覆盖的全部来源；被更完整事实包含的来源也要绑定，但不要求在正文重复措辞。",
           "孩子明确表达的时间先后、因果、转折、条件、约定和自我纠正必须整体保留，不能拆散、反转或删除。",
           "保持儿童口吻，不写编辑说明，不添加事实池没有的信息。"
         ],
@@ -830,9 +846,11 @@ async function composeWithQwen(input) {
           sentences: [{ text: "一句日记", factTexts: ["这句话使用到的事实 text"] }]
         },
         rules: [
-          "每一句只能表达 facts 中已有的事实，factTexts 必须逐项列出该句实际使用的事实 text。",
+          "每一句只能表达 facts 中已有的有效含义，factTexts 必须逐项列出该句覆盖的事实 text。",
           "accepted_child_utterances 是已经去除家长引导、背景声和无效内容的孩子原话片段。正文用词、形容和细节优先从这里取，不得根据事实标签自行扩写。",
           "可以调整语序、主语和谓语位置，合并相邻事实，去掉口头重复和无意义语气词。",
+          "facts 是来源账本，不是要求逐条照抄的句子。同一场景中重复、包含、前后补全或指向同一动作的事实，应共同绑定到一条通顺表达，正文只说一次。",
+          "孩子停顿后补出的半句、指代词或单独的‘去了、进去了、做完了’如果没有增加独立信息，要结合上下文并入完整动作或省略，不能原样留在句尾。",
           "每个独立句子必须符合小学低年级可学习的完整表达：有明确主语和谓语，需要宾语时写清宾语。地点或时间放句首后仍要保留必要主语。",
           "一句主要表达一件事或一个连续动作；一个句子包含多个不同事件时，按事件边界用句号断开，不能只用逗号一直串联。连续动作仍应合并，不能为了断句重复同一活动。",
           "优先原样保留孩子收音中使用的形容词、叠词和有特点的说法，不擅自替换成更成人化的近义词，也不新增原话没有的形容词或副词。",
@@ -840,7 +858,7 @@ async function composeWithQwen(input) {
           "连接词只用于孩子已经明确表达的时间先后，不得为了文采新增因果、感受或场景。语言要比口述完整，但仍像孩子自己的日记，不使用成人化华丽词语。",
           "按真实时间顺序写：先写事件，再写过程和结果，最后写与该事件对应的感受；不能把感受放到事情发生之前。",
           "明确的结束、离开、返回或休息等收尾节点之后，禁止再出现此前已经结束的活动。",
-          "同一个活动只叙述一次。连续动作属于同一事件时要合并成一个完整事件，不能拆成多次重复叙述。",
+          "同一个活动只叙述一次。连续动作属于同一事件时要合并成一个完整事件；较完整事实已经包含较短事实时，只表达完整含义，并把两条来源都列入 factTexts。",
           "严禁为了衔接而重复同一动作或写出前后同义、缺少新信息的病句。",
           "可以使用‘今天、然后、后来、但是、所以’等连接词，但不能用连接词暗示孩子没有说过的因果。",
           "不要逐条照抄事实；要把零散短语组织成主谓完整、前后连贯的句子。",
@@ -863,10 +881,8 @@ async function composeWithQwen(input) {
   let currentPenalty = compositionPenalty(result);
   let usedFactTexts = new Set(result.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []));
   let missingFacts = facts.filter(fact => !factIsCovered(fact, usedFactTexts));
-  // 第一次同时校对表达与覆盖；如仍有遗漏，再允许一次专门补齐。
-  // 客户端为 finalize 预留 120 秒，不再用跳过覆盖校验换取速度。
-  for (let attempt = 0; attempt < 2 && (currentPenalty > 0 || missingFacts.length); attempt += 1) {
-    if (attempt > 0 && !missingFacts.length) break;
+  // 只有质量或覆盖不合格时再做一次统一校对，避免多轮模型调用拖慢成文。
+  for (let attempt = 0; attempt < 1 && (currentPenalty > 0 || missingFacts.length); attempt += 1) {
     try {
       const refined = await refineCompositionWithQwen(input, result, facts, missingFacts);
       if (!Array.isArray(refined.sentences)) refined.sentences = [];
@@ -987,16 +1003,19 @@ async function reviseWithQwen(input) {
   const messages = [
     {
       role: "system",
-      content: "你是儿童口述日记的事实修改模块。把孩子的语音修改指令转换为可验证的事实操作。只能修改明确对应的事实，不得猜测、不得改动未提及事实。只返回 JSON。"
+      content: "你是儿童口述日记的局部场景修改老师。先理解孩子这次说的是明确编辑、重新讲述原有场景、补充原有场景，还是新增事件。规则只负责限制边界；你要综合相关原句、相关事实和最新口述，生成可验证的局部事实操作。不得改动无关场景。只返回 JSON。"
     },
     {
       role: "user",
       content: JSON.stringify({
-        task: "根据 instruction 对 facts 生成替换、删除或补充操作。",
+        task: "根据 instruction 找到相关场景，并生成替换、删除、补充或句内删词操作。",
         schema: {
+          intent: "explicit_edit|related_restatement|related_addition|new_event|unclear",
           operations: [{
-            type: "replace|delete|add",
-            target_fact_id: "replace/delete 必须填写现有事实 id；add 为空",
+            type: "replace|delete|add|remove_phrase",
+            target_fact_id: "replace/delete 必须填写现有事实 id；add/remove_phrase 为空",
+            target_sentence_id: "remove_phrase 必须填写现有句子 id；其他操作为空",
+            old_text: "remove_phrase 填写要从原句去掉的原文；其他操作可为空",
             anchor_fact_id: "add 若是对已有事件的补充，填写最相关的现有事实 id；独立新事件为空",
             placement: "add 使用 merge|before|after|independent；其他操作为空",
             slot: "what|detail|feeling|result",
@@ -1007,17 +1026,19 @@ async function reviseWithQwen(input) {
           message: "没有安全可执行操作时，告诉孩子怎样说得更清楚"
         },
         rules: [
-          "‘不是A，是B’通常是 replace，只修改包含A且语义对应的事实。",
-          "‘我没有说A/删掉A’通常是 delete，只删除明确对应的事实。",
-          "‘还要加上A/我还想说A’通常是 add，A必须是孩子明确说出的事实。",
+          "不能只靠‘删除、替换、补充’等关键词判断。孩子重新讲述与原句人物、地点、动作和时间高度相关的内容时，intent=related_restatement，并按整个相关场景理解。",
+          "相关场景重说时：最新口述中与旧事实明确冲突的内容用 replace；新增且不冲突的内容用 add+merge；本次没提到但不冲突的旧事实必须保留。",
+          "如果一个旧事实只是另一个新事实的重复、残片或已被完整包含，可以 replace 一个主要事实并 delete 被包含的重复事实；不得删除无关或仅仅没有重说的事实。",
+          "明确说‘不是A，是B’时 replace 对应事实；明确说‘我没说A、不要A’时 delete 对应事实。",
+          "孩子明确要求去掉原句里的某个词或短语，而该内容不是独立事实时，使用 remove_phrase；old_text 必须逐字出现在 target_sentence_id 对应原句中。",
           "如果 instruction 对同一人物、对象、事件或关系给出明确更正，必须 replace 对应错误事实，不能只 add 正确信息后同时保留错误信息。",
-          "如果同一个错误事实在 facts 中有多个近似版本，返回对应的 delete 操作一并清除重复项，只保留一条修改后的正确事实。",
+          "如果同一个错误事实在 facts 中有多个近似版本，返回 delete 一并清除被替代或被包含的重复项，只保留完整事实。",
           "replace/delete 的 target_fact_id 必须来自 facts，禁止编造 id。",
-          "孩子重新讲了一大段故事时，没再提到的旧事实不等于要删除；只把新信息作为 add，对明确纠正的同一事实作为 replace。",
+          "孩子重新讲了一大段相关场景时，没再提到的旧事实不等于要删除；只覆盖明确冲突，保留其余兼容事实。",
           "已经出现在 facts 或 diary 中的人物、地点、活动和句子不得再返回 add；即使孩子在修改时又讲了一遍，也只视为原事实的重述。",
           "add 若补充同一事件内部的细节、结果或感受，填写 anchor_fact_id 且 placement=merge。",
           "add 若由‘之前、以前、之后、后来’等引入相邻事件，填写 anchor_fact_id 且 placement=before 或 after。独立新事件使用 independent。",
-          "只有 instruction 明确说‘删掉’‘不要写’或‘我没说’时才能 delete；‘不是A，是B’属于 replace，不能拆成 delete 和 add。绝不能为了用新故事取代旧故事而批量 delete。",
+          "‘不是A，是B’属于 replace，不能拆成 delete 和 add。绝不能为了用新说法取代整个旧故事而批量 delete。",
           "不能确定目标事实时 operations 返回空数组，不得凭相似词强行修改。",
           "不要把指令措辞写进日记事实，只保留修改后的事实内容。"
         ],
@@ -1028,62 +1049,6 @@ async function reviseWithQwen(input) {
     }
   ];
   return callQwenJson(messages);
-}
-
-async function extractSupplementalRevisionOperations(input) {
-  const messages = [
-    {
-      role: "system",
-      content: "你是儿童日记的续讲事实提取器。孩子正在已有日记后继续讲新的事情。逐段提取所有明确的新事件和感受，不重写旧日记，不把修改指令、家长提示、电视声或无意义语句当成事实。只返回 JSON。"
-    },
-    {
-      role: "user",
-      content: JSON.stringify({
-        task: "从 supplemental_speech 中找出 existing_facts 和 diary 尚未记录的全部明确事实，每件不同事情单独返回一项。",
-        schema: { additions: [{ slot: "what|detail|feeling|result", label: "简短标签", text: "新增事实", quote: "口述中的原话片段", anchor_fact_id: "相关 existing_facts id 或空", placement: "merge|before|after|independent" }] },
-        rules: [
-          "按口述顺序扫描到结尾，人物、地点、活动、结果和感受都不能只取前两项就停止。",
-          "text 保留孩子使用的人物关系、动作和形容词，但去掉嗯、然后然后等口头填充词。",
-          "quote 必须逐字出现在 supplemental_speech 中；无法找到原话依据的内容不得返回。",
-          "与 existing_facts 或 diary 已有内容相同、近似重复或只是换一种说法的内容不要返回。",
-          "同一事件内部补充使用 merge；‘回家前’等发生在锚点事件前的内容用 before；‘之后、后来’用 after；无关系才用 independent。",
-          "一句家长追问、操作说明、要求继续说或与故事无关的背景声不要返回。",
-          "不要合并互不相同的事件，也不要添加孩子没有说过的原因、时间、地点或感受。"
-        ],
-        supplemental_speech: input.instruction || "",
-        existing_facts: input.facts || [],
-        diary: input.diary || []
-      })
-    }
-  ];
-  const result = await callQwenJson(messages);
-  const existingTexts = [
-    ...(input.facts || []).map(fact => fact?.text),
-    ...(input.diary || []).map(sentence => typeof sentence === "string" ? sentence : sentence?.text)
-  ].filter(Boolean);
-  const removeKnownClauses = text => String(text || "")
-    .split(/[，,。；;]/u)
-    .map(clause => clause.trim())
-    .filter(Boolean)
-    .filter(clause => !existingTexts.some(existing =>
-      semanticSimilarity(existing, clause) >= 0.52 ||
-      (normalizeSemanticText(clause).length >= 5 && normalizeSemanticText(existing).includes(normalizeSemanticText(clause)))
-    ))
-    .join("，");
-  return (Array.isArray(result.additions) ? result.additions : [])
-    .filter(item => item?.text && item?.quote && quoteAppearsInTranscript(item.quote, input.instruction || ""))
-    .map(item => ({ item, newText: removeKnownClauses(item.text) }))
-    .filter(({ newText }) => newText)
-    .map(({ item, newText }) => ({
-        type: "add",
-        target_fact_id: "",
-        slot: ["what", "detail", "feeling", "result"].includes(item.slot) ? item.slot : "detail",
-        label: item.label || "语音补充",
-        new_text: newText,
-        anchor_fact_id: (input.facts || []).some(fact => fact.id === item.anchor_fact_id) ? item.anchor_fact_id : "",
-        placement: ["merge", "before", "after", "independent"].includes(item.placement) ? item.placement : "independent",
-        reason: "孩子在历史日记后继续讲出的新事实"
-      }));
 }
 
 function hasNegation(text) {
@@ -1103,10 +1068,12 @@ function sharesSpecificBigram(left, right) {
 
 function normalizeRevisionOperations(input, operations) {
   const facts = Array.isArray(input.facts) ? input.facts : [];
+  const diary = (Array.isArray(input.diary) ? input.diary : []).map((sentence, index) =>
+    typeof sentence === "string" ? { id: `sentence_${index}`, text: sentence } : sentence
+  );
   const instruction = String(input.instruction || "");
-  const compactInstruction = normalizeSemanticText(instruction);
-  const isLongNarration = compactInstruction.length >= 36;
   const hasDeleteCue = /(删掉|删除|去掉|不要写|别写|我(没有|没)说|这句不对|不是)/u.test(instruction);
+  const hasPhraseDeleteCue = /(删掉|删除|去掉|不要写|别写)/u.test(instruction);
   const normalized = [...operations];
   for (let index = 0; index < normalized.length; index += 1) {
     const operation = normalized[index];
@@ -1125,17 +1092,6 @@ function normalizeRevisionOperations(input, operations) {
     };
   }
 
-  const replacements = normalized.filter(operation => operation?.type === "replace");
-  for (const replacement of replacements) {
-    const target = facts.find(fact => fact.id === replacement.target_fact_id);
-    if (!target) continue;
-    for (const fact of facts) {
-      if (!fact?.id || fact.id === target.id) continue;
-      if (semanticSimilarity(fact.text, target.text) < 0.7) continue;
-      if (normalized.some(operation => operation.type === "delete" && operation.target_fact_id === fact.id)) continue;
-      normalized.push({ type: "delete", target_fact_id: fact.id, slot: fact.slot, label: fact.label, new_text: "", reason: "清除同一错误事实的重复版本" });
-    }
-  }
   const safe = [];
   const normalizeAddPlacement = operation => {
     const anchorExists = facts.some(fact => fact.id === operation.anchor_fact_id);
@@ -1146,32 +1102,67 @@ function normalizeRevisionOperations(input, operations) {
     if (!anchorFactId && placement !== "independent") placement = "independent";
     return { ...operation, target_fact_id: "", anchor_fact_id: anchorFactId, placement };
   };
+  const replacementOperations = normalized.filter(operation => operation?.type === "replace" && operation.new_text);
   for (const operation of normalized) {
-    if (!operation || !["replace", "delete", "add"].includes(operation.type)) continue;
+    if (!operation || !["replace", "delete", "add", "remove_phrase"].includes(operation.type)) continue;
+    if (operation.type === "remove_phrase") {
+      const sentence = diary.find(item => item?.id === operation.target_sentence_id);
+      const oldText = String(operation.old_text || "").trim();
+      if (!hasPhraseDeleteCue || !sentence?.text || !oldText || !String(sentence.text).includes(oldText)) continue;
+      const safeOperation = { ...operation, target_fact_id: "", old_text: oldText };
+      const duplicate = safe.some(existing =>
+        existing.type === "remove_phrase" &&
+        existing.target_sentence_id === safeOperation.target_sentence_id &&
+        existing.old_text === safeOperation.old_text
+      );
+      if (!duplicate) safe.push(safeOperation);
+      continue;
+    }
     const target = facts.find(fact => fact.id === operation.target_fact_id);
     if (operation.type === "delete") {
-      if (!target || !hasDeleteCue || (isLongNarration && !sharesSpecificBigram(instruction, target.text))) continue;
+      if (!target) continue;
+      const subsumedByReplacement = replacementOperations.some(replacement =>
+        replacement.target_fact_id !== target.id && (
+          sharesSpecificBigram(target.text, replacement.new_text) ||
+          semanticSimilarity(target.text, replacement.new_text) >= 0.48
+        )
+      );
+      if (!hasDeleteCue && !subsumedByReplacement) continue;
     }
     if (operation.type === "replace") {
       if (!target || !operation.new_text) continue;
-      const correctionCue = /(不是|听错|识别错|说错|改成|应该是|其实是|是.{1,20}不是)/u.test(instruction);
       const related = sharesSpecificBigram(target.text, operation.new_text) ||
         sharesSpecificBigram(instruction, target.text) ||
         semanticSimilarity(target.text, operation.new_text) >= 0.45;
-      if (!related || (isLongNarration && !correctionCue && !sharesSpecificBigram(instruction, target.text))) {
-        safe.push(normalizeAddPlacement({ ...operation, type: "add", target_fact_id: "" }));
-        continue;
-      }
+      if (!related) continue;
     }
     const safeOperation = operation.type === "add" ? normalizeAddPlacement(operation) : operation;
     if (safeOperation.type === "add") {
-      const duplicatesExisting = facts.some(fact =>
-        normalizeSemanticText(fact.text) === normalizeSemanticText(safeOperation.new_text) ||
-        normalizeSemanticText(fact.text).includes(normalizeSemanticText(safeOperation.new_text)) ||
-        normalizeSemanticText(safeOperation.new_text).includes(normalizeSemanticText(fact.text)) ||
-        semanticSimilarity(fact.text, safeOperation.new_text) >= 0.55
+      const knownTexts = [
+        ...facts.map(fact => fact.text),
+        ...replacementOperations.map(replacement => replacement.new_text)
+      ].filter(Boolean);
+      const duplicatesExisting = knownTexts.some(text =>
+        normalizeSemanticText(text) === normalizeSemanticText(safeOperation.new_text) ||
+        normalizeSemanticText(text).includes(normalizeSemanticText(safeOperation.new_text)) ||
+        normalizeSemanticText(safeOperation.new_text).includes(normalizeSemanticText(text)) ||
+        semanticSimilarity(text, safeOperation.new_text) >= 0.76
       );
       if (duplicatesExisting) continue;
+    }
+    if (["replace", "delete"].includes(safeOperation.type)) {
+      const existingIndex = safe.findIndex(existing =>
+        ["replace", "delete"].includes(existing.type) && existing.target_fact_id === safeOperation.target_fact_id
+      );
+      if (existingIndex >= 0) {
+        const existing = safe[existingIndex];
+        if (safeOperation.type === "delete" && hasDeleteCue) safe[existingIndex] = safeOperation;
+        else if (safeOperation.type === "replace" && existing.type === "replace" &&
+          normalizeSemanticText(safeOperation.new_text).length > normalizeSemanticText(existing.new_text).length) {
+          safe[existingIndex] = safeOperation;
+        }
+        continue;
+      }
     }
     const duplicatesOperation = safe.some(existing => {
       if (existing.type !== safeOperation.type) return false;
@@ -1191,6 +1182,9 @@ function normalizeRevisionOperations(input, operations) {
 function fallbackRevisionOperations(input) {
   const instruction = String(input.instruction || "").trim();
   const facts = (input.facts || []).filter(fact => fact?.id && fact?.text);
+  const diary = (Array.isArray(input.diary) ? input.diary : []).map((sentence, index) =>
+    typeof sentence === "string" ? { id: `sentence_${index}`, text: sentence } : sentence
+  );
   const clean = value => String(value || "")
     .replace(/^[“”'"，,。；;：:\s]+|[“”'"，,。；;：:\s]+$/gu, "")
     .replace(/^(?:这句|这一句|文章里|日记里)/u, "")
@@ -1216,6 +1210,26 @@ function fallbackRevisionOperations(input) {
     }
   }
 
+  const phraseDeletion = /(?:删掉|删除|去掉|不要写|别写)(?:那个|这句|这句话|这几个字|掉)?[“”"']?([^，。；;！!？?]{1,40})/u.exec(instruction);
+  if (phraseDeletion) {
+    const oldText = clean(phraseDeletion[1]).replace(/^(?:那个|这句|这句话|这几个字)/u, "");
+    const sentence = diary.find(item => oldText && String(item?.text || "").includes(oldText));
+    const matchingFact = findTarget(oldText);
+    const phraseIsIndependentFact = matchingFact && (
+      normalizeSemanticText(matchingFact.text) === normalizeSemanticText(oldText) ||
+      semanticSimilarity(matchingFact.text, oldText) >= 0.72
+    );
+    if (sentence && !phraseIsIndependentFact) {
+      return [{
+        type: "remove_phrase",
+        target_fact_id: "",
+        target_sentence_id: sentence.id,
+        old_text: oldText,
+        reason: "按孩子明确说出的要求删除原句中的多余文字"
+      }];
+    }
+  }
+
   const deletion = /(?:把)?(.{1,120}?)(?:删掉|删除|去掉|不要写)/u.exec(instruction) ||
     /(?:删掉|删除|去掉|不要写)(.{1,120})/u.exec(instruction);
   if (deletion) {
@@ -1231,31 +1245,8 @@ function fallbackRevisionOperations(input) {
   return [];
 }
 
-function dedupeRevisedSentences(sentences) {
-  const unique = [];
-  for (const sentence of sentences || []) {
-    if (!sentence?.text) continue;
-    const normalized = normalizeSemanticText(sentence.text);
-    const duplicate = unique.find(existing =>
-      normalizeSemanticText(existing.text) === normalized
-    );
-    if (!duplicate) {
-      unique.push(sentence);
-      continue;
-    }
-    duplicate.factTexts = [...new Set([
-      ...(Array.isArray(duplicate.factTexts) ? duplicate.factTexts : []),
-      ...(Array.isArray(sentence.factTexts) ? sentence.factTexts : [])
-    ])];
-    duplicate.factIds = [...new Set([
-      ...(Array.isArray(duplicate.factIds) ? duplicate.factIds : []),
-      ...(Array.isArray(sentence.factIds) ? sentence.factIds : [])
-    ])];
-  }
-  return unique;
-}
-
 function sentenceMatchesRevision(sentence, operation, originalFact, anchorFact) {
+  if (operation.target_sentence_id && sentence.id === operation.target_sentence_id) return true;
   if (operation.target_fact_id && (sentence.factIds || []).includes(operation.target_fact_id)) return true;
   if (operation.type === "add" && operation.placement === "merge" && operation.anchor_fact_id && (sentence.factIds || []).includes(operation.anchor_fact_id)) return true;
   const candidates = [
@@ -1271,27 +1262,47 @@ function sentenceMatchesRevision(sentence, operation, originalFact, anchorFact) 
 
 function deterministicRevisionText(sentence, operations, linkedFacts) {
   let text = String(sentence.text || "");
-  let replaced = false;
+  let changed = false;
   for (const operation of operations) {
     if (operation.type === "replace" && operation.old_text && operation.new_text && text.includes(operation.old_text)) {
-      text = text.replace(operation.old_text, operation.new_text);
-      replaced = true;
+      text = text.split(operation.old_text).join(operation.new_text);
+      changed = true;
+    }
+    if (operation.type === "delete" && operation.old_text && text.includes(operation.old_text)) {
+      text = text.split(operation.old_text).join("");
+      changed = true;
+    }
+    if (operation.type === "remove_phrase" && operation.old_text && text.includes(operation.old_text)) {
+      text = text.split(operation.old_text).join("");
+      changed = true;
     }
   }
-  if (replaced) return text;
-  return linkedFacts.length ? `${linkedFacts.map(fact => fact.text).join("，")}。` : "";
+  text = text
+    .replace(/，{2,}/gu, "，")
+    .replace(/。{2,}/gu, "。")
+    .replace(/，([。！？!?])/gu, "$1")
+    .replace(/^[，。；;\s]+|[，；;\s]+$/gu, "")
+    .trim();
+  if (changed && text) return /[。！？!?]$/u.test(text) ? text : `${text}。`;
+  if (linkedFacts.length === 1) return `${linkedFacts[0].text}。`;
+  return String(sentence.text || "");
 }
 
-function revisionChangeIsValid(change, operations) {
-  if (!change?.text) return false;
+function revisionChangeIsValid(text, operations) {
+  if (!text) return false;
   return operations.every(operation => {
-    if (operation.type !== "replace") return true;
-    const includesNew = operation.new_text && (
-      String(change.text).includes(operation.new_text) ||
-      semanticSimilarity(change.text, operation.new_text) >= 0.48
-    );
-    const keepsOld = operation.old_text && String(change.text).includes(operation.old_text);
-    return includesNew && !keepsOld;
+    if (operation.type === "remove_phrase" || operation.type === "delete") {
+      return !operation.old_text || !String(text).includes(operation.old_text);
+    }
+    if (operation.type === "replace") {
+      const includesNew = operation.new_text && (
+        String(text).includes(operation.new_text) ||
+        semanticSimilarity(text, operation.new_text) >= 0.48
+      );
+      const keepsOld = operation.old_text && String(text).includes(operation.old_text);
+      return includesNew && !keepsOld;
+    }
+    return true;
   });
 }
 
@@ -1309,7 +1320,37 @@ async function reviseLockedCompositionWithQwen(input) {
   const operationsForSentence = sentence => operations.filter(operation =>
     sentenceMatchesRevision(sentence, operation, originalFacts.get(operation.target_fact_id), factById.get(operation.anchor_fact_id))
   );
-  const affectedSentences = lockedDiary.filter(sentence => operationsForSentence(sentence).length > 0);
+  const affectedIndexes = lockedDiary
+    .map((sentence, index) => operationsForSentence(sentence).length ? index : -1)
+    .filter(index => index >= 0);
+  const sceneGroups = [];
+  for (const index of affectedIndexes) {
+    const previous = sceneGroups[sceneGroups.length - 1];
+    if (previous && index === previous.indexes[previous.indexes.length - 1] + 1) {
+      previous.indexes.push(index);
+    } else {
+      sceneGroups.push({ id: `scene_${sceneGroups.length}`, indexes: [index] });
+    }
+  }
+  const claimedFactIds = new Set();
+  for (const group of sceneGroups) {
+    const sentences = group.indexes.map(index => lockedDiary[index]);
+    const groupOperations = operations.filter(operation => sentences.some(sentence =>
+      sentenceMatchesRevision(sentence, operation, originalFacts.get(operation.target_fact_id), factById.get(operation.anchor_fact_id))
+    ));
+    const linkedIds = new Set(sentences.flatMap(sentence => sentence.factIds || []));
+    for (const operation of groupOperations) {
+      if (operation.target_fact_id) linkedIds.add(operation.target_fact_id);
+      if (operation.applied_fact_id) linkedIds.add(operation.applied_fact_id);
+    }
+    group.sentences = sentences;
+    group.operations = groupOperations;
+    group.activeFacts = [...linkedIds]
+      .filter(id => !claimedFactIds.has(id))
+      .map(id => factById.get(id))
+      .filter(Boolean);
+    group.activeFacts.forEach(fact => claimedFactIds.add(fact.id));
+  }
   const addedFacts = operations
     .filter(operation => operation.type === "add" && operation.applied_fact_id && !(operation.anchor_fact_id && operation.placement === "merge"))
     .map(operation => factById.get(operation.applied_fact_id))
@@ -1317,32 +1358,42 @@ async function reviseLockedCompositionWithQwen(input) {
   const messages = [
     {
       role: "system",
-      content: "你是儿童日记的局部修改器。第一版日记已锁定，只能改写包含本次受影响事实的句子，其他句子一个字也不能改。不得重新生成整篇，不得加入修改指令之外的新信息。只返回 JSON。"
+      content: "你是儿童日记的局部场景修改器。第一版日记已锁定，只重整本次修改涉及的相邻场景，其他句子由系统逐字保留。规则用于限制事实边界；你要综合同一场景的零碎、重复和前后补充，把它们重新组织成自然完整的低年级句子。不得重新生成整篇，不得加入修改口述之外的新信息。只返回 JSON。"
     },
     {
       role: "user",
       content: JSON.stringify({
         schema: {
-          changes: [{ sentenceId: "受影响的原句 id", text: "修改后完整句子", factTexts: ["本句使用的有效事实 text"] }],
+          scenes: [{ sceneId: "affected_scenes 中的 id", sentences: [{ text: "局部重整后的完整句子", factTexts: ["本句覆盖的有效事实 text"] }] }],
           additions: [{ anchorSentenceId: "相关原句 id 或空", position: "before|after|end", text: "新增事实组成的完整句子", factTexts: ["新增事实 text"] }]
         },
         rules: [
-          "changes 只能使用 affected_sentences 中的 sentenceId。",
-          "replace 要在原句位置替换错误信息；delete 只删除目标事实，保留该句里其他事实。",
+          "scenes 只能使用 affected_scenes 中的 sceneId；每个场景可以输出一句或多句，系统会把它们放回原场景位置。",
+          "把一个 affected_scene 当作整体理解。相互重复、包含、补全或属于同一连续动作的事实要融合后只表达一次，不能逐条拼接事实。",
+          "replace 使用最新的明确内容替换冲突部分；delete 去掉目标事实；remove_phrase 去掉指定原句文字；未冲突且仍有效的事实必须保留。",
+          "孩子自然重说相关场景时，要把新旧兼容信息合成通顺的新句子，而不是把新话生硬追加在旧句后面。",
           "未受影响的句子不返回，系统会原样保留。",
-          "placement=merge 的 add 必须合并进对应 affected_sentence。before/after 按 operation 的 anchor_fact_id 找到原句并设置位置。",
+          "placement=merge 的 add 必须融入对应场景。before/after 按 operation 的 anchor_fact_id 找到原句并设置位置。",
           "独立新增事件按时间和语境选择相邻原句；无法判断时 position=end。",
-          "每个修改后句子要有主语和谓语，不重复动作，不新增事实。",
-          "changes 的 factTexts 必须与该原句修改后仍有效的事实完全一致，不能顺手带入其他 active_facts。",
-          "每个新增事实只能出现在一条 change 或 addition 中，不能既合并进旧句又单独生成新句。",
+          "每个修改后句子要有明确主语和谓语，需要时写清宾语；一句主要表达一件事或一组连续动作，不重复动作，不新增事实。",
+          "孩子停顿后补出的半句、指代词或没有独立信息的动作残片要并入完整表达或省略，不能原样留成病句。",
+          "每个 affected_scene 的全部 expected_facts 必须各绑定一次；factTexts 使用完整 text。同一场景正文可以只表达一次重叠含义，但来源账本仍需全部绑定。",
+          "每个新增事实只能出现在一个 scene 或一条 addition 中，不能既合并进旧场景又单独生成新句。",
           "明确的时间顺序、因果、条件、转折或约定属于事实关系，修改局部内容时必须保留。",
-          "factTexts 只能使用 active_facts 里完整的 text。"
+          "优先保留孩子原有形容词、叠词和儿童化说法，不擅自增加成人化词语、原因、评价、情绪或细节。",
+          "factTexts 只能使用对应场景 expected_facts 或 added_facts 里完整的 text。"
         ],
         instruction: input.revisionInstruction || "",
+        intent: input.revisionMode || "",
         operations,
-        affected_sentences: affectedSentences,
+        affected_scenes: sceneGroups.map(group => ({
+          id: group.id,
+          original_sentences: group.sentences,
+          operations: group.operations,
+          expected_facts: group.activeFacts
+        })),
         added_facts: addedFacts,
-        active_facts: facts
+        untouched_sentences: lockedDiary.filter((sentence, index) => !affectedIndexes.includes(index)).map(sentence => ({ id: sentence.id, text: sentence.text }))
       })
     }
   ];
@@ -1350,39 +1401,61 @@ async function reviseLockedCompositionWithQwen(input) {
   try {
     result = await callQwenJson(messages);
   } catch {
-    result = { changes: [], additions: [] };
+    result = { scenes: [], additions: [] };
   }
-  const changes = new Map((result.changes || []).map(change => [change.sentenceId, change]));
-  const activeFactTexts = new Set(facts.map(fact => fact.text));
+  const sceneResults = new Map((Array.isArray(result.scenes) ? result.scenes : []).map(scene => [scene.sceneId, scene]));
+  const sceneReplacementAtIndex = new Map();
+  const replacementAnchorIds = new Map();
+  const removedSceneIndexes = new Set();
+  for (const group of sceneGroups) {
+    const expectedTexts = [...new Set(group.activeFacts.map(fact => fact.text))];
+    const expectedTextSet = new Set(expectedTexts);
+    const candidate = sceneResults.get(group.id);
+    const candidateSentences = Array.isArray(candidate?.sentences) ? candidate.sentences.filter(sentence => sentence?.text) : [];
+    const usedTexts = candidateSentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []);
+    const useCounts = usedTexts.reduce((counts, text) => counts.set(text, (counts.get(text) || 0) + 1), new Map());
+    const exactCoverage = usedTexts.length === expectedTexts.length &&
+      expectedTexts.every(text => useCounts.get(text) === 1) &&
+      usedTexts.every(text => expectedTextSet.has(text));
+    const joinedText = candidateSentences.map(sentence => sentence.text).join("");
+    const validCandidate = candidateSentences.length > 0 && exactCoverage && revisionChangeIsValid(joinedText, group.operations);
+    let replacements;
+    if (validCandidate) {
+      replacements = candidateSentences.map((sentence, index) => ({
+        id: index === 0 ? group.sentences[0].id : `sentence_revised_${Date.now()}_${group.indexes[0]}_${index}`,
+        text: sentence.text,
+        factTexts: sentence.factTexts,
+        factIds: group.activeFacts.filter(fact => sentence.factTexts.includes(fact.text)).map(fact => fact.id)
+      }));
+    } else {
+      const fallbackClaimedIds = new Set();
+      replacements = group.sentences.map(sentence => {
+        const sentenceOperations = operationsForSentence(sentence);
+        const activeSentenceFacts = (sentence.factIds || [])
+          .filter(id => !fallbackClaimedIds.has(id))
+          .map(id => factById.get(id))
+          .filter(Boolean);
+        activeSentenceFacts.forEach(fact => fallbackClaimedIds.add(fact.id));
+        const hasPhraseOnlyEdit = sentenceOperations.some(operation => operation.type === "remove_phrase");
+        return {
+          ...sentence,
+          text: deterministicRevisionText(sentence, sentenceOperations, activeSentenceFacts),
+          factTexts: activeSentenceFacts.map(fact => fact.text),
+          factIds: activeSentenceFacts.map(fact => fact.id),
+          hasPhraseOnlyEdit
+        };
+      }).filter(sentence => sentence.text && (sentence.factIds.length || sentence.hasPhraseOnlyEdit))
+        .map(({ hasPhraseOnlyEdit, ...sentence }) => sentence);
+    }
+    sceneReplacementAtIndex.set(group.indexes[0], replacements);
+    const replacementId = replacements[0]?.id || "";
+    group.sentences.forEach(sentence => replacementAnchorIds.set(sentence.id, replacementId));
+    group.indexes.slice(1).forEach(index => removedSceneIndexes.add(index));
+  }
   const revised = [];
-  for (const sentence of lockedDiary) {
-    const sentenceOperations = operationsForSentence(sentence);
-    if (!sentenceOperations.length) {
-      revised.push(sentence);
-      continue;
-    }
-    const linkedIds = new Set(sentence.factIds || []);
-    for (const operation of sentenceOperations) {
-      if (operation.target_fact_id) linkedIds.add(operation.target_fact_id);
-      if (operation.applied_fact_id) linkedIds.add(operation.applied_fact_id);
-    }
-    const linkedActiveFacts = [...linkedIds].map(id => factById.get(id)).filter(Boolean);
-    if (!linkedActiveFacts.length) continue;
-    const change = changes.get(sentence.id);
-    const validFactTexts = (change?.factTexts || []).filter(text => activeFactTexts.has(text));
-    const linkedFactTexts = linkedActiveFacts.map(fact => fact.text);
-    const hasExactLinkedFacts = validFactTexts.length === linkedFactTexts.length &&
-      linkedFactTexts.every(text => validFactTexts.includes(text));
-    const validChange = validFactTexts.length && hasExactLinkedFacts && revisionChangeIsValid(change, sentenceOperations);
-    const fallbackText = deterministicRevisionText(sentence, sentenceOperations, linkedActiveFacts);
-    revised.push({
-      ...sentence,
-      text: validChange ? change.text : fallbackText,
-      factTexts: validChange ? validFactTexts : linkedActiveFacts.map(fact => fact.text),
-      factIds: validChange
-        ? facts.filter(fact => validFactTexts.includes(fact.text)).map(fact => fact.id)
-        : linkedActiveFacts.map(fact => fact.id)
-    });
+  for (let index = 0; index < lockedDiary.length; index += 1) {
+    if (sceneReplacementAtIndex.has(index)) revised.push(...sceneReplacementAtIndex.get(index));
+    else if (!removedSceneIndexes.has(index)) revised.push(lockedDiary[index]);
   }
   const additions = (Array.isArray(result.additions) ? result.additions : [])
     .map(item => ({
@@ -1399,7 +1472,7 @@ async function reviseLockedCompositionWithQwen(input) {
       ? lockedDiary.find(sentence => (sentence.factIds || []).includes(operation.anchor_fact_id))
       : null;
     return {
-      anchorSentenceId: anchorSentence?.id || "",
+      anchorSentenceId: replacementAnchorIds.get(anchorSentence?.id) || anchorSentence?.id || "",
       position: ["before", "after"].includes(operation?.placement) ? operation.placement : ""
     };
   };
@@ -1461,7 +1534,7 @@ async function reviseLockedCompositionWithQwen(input) {
   }
   return {
     title,
-    sentences: dedupeRevisedSentences(orderedSentences)
+    sentences: orderedSentences
   };
 }
 
@@ -1633,32 +1706,41 @@ async function handleRevise(req, res) {
   const input = await readJson(req);
   const result = await reviseWithQwen(input);
   const validIds = new Set((input.facts || []).map(fact => fact.id));
-  let rawOperations = Array.isArray(result.operations) ? [...result.operations] : [];
-  const revisionInstruction = String(input.instruction || "");
-  const hasExplicitEditCue = /不是.{1,160}?(?:而是|应该是|是)|(?:改成|改为|换成|换为|删掉|删除|去掉|不要写)/u.test(revisionInstruction);
-  const isSupplementalNarration = normalizeSemanticText(revisionInstruction).length >= 36 && !hasExplicitEditCue;
-  if (isSupplementalNarration) {
-    try {
-      const supplementalOperations = await extractSupplementalRevisionOperations(input);
-      if (supplementalOperations.length) {
-        rawOperations = rawOperations.filter(operation => operation?.type !== "add");
-        rawOperations.push(...supplementalOperations);
-      }
-    } catch (error) {
-      console.error("Supplemental revision extraction failed:", error.message);
-    }
+  const validSentenceIds = new Set((input.diary || []).map((sentence, index) =>
+    typeof sentence === "string" ? `sentence_${index}` : sentence?.id
+  ).filter(Boolean));
+  const fallbackOperations = fallbackRevisionOperations(input);
+  const exactPhraseRemoval = fallbackOperations.find(operation => operation.type === "remove_phrase");
+  const exactFactEdit = fallbackOperations.find(operation => ["replace", "delete"].includes(operation.type));
+  let rawOperations = Array.isArray(result.operations) ? result.operations : [];
+  if (exactPhraseRemoval) {
+    rawOperations = rawOperations.filter(operation => operation?.type !== "delete").concat(exactPhraseRemoval);
+  } else if (exactFactEdit) {
+    rawOperations = rawOperations.filter(operation => {
+      if (["replace", "delete"].includes(operation?.type) && operation.target_fact_id === exactFactEdit.target_fact_id) return false;
+      if (exactFactEdit.type === "replace" && operation?.type === "add" && operation.new_text &&
+        semanticSimilarity(operation.new_text, exactFactEdit.new_text) >= 0.72) return false;
+      return true;
+    }).concat(exactFactEdit);
   }
   let normalizedOperations = normalizeRevisionOperations(input, rawOperations);
-  if (!normalizedOperations.length) normalizedOperations = normalizeRevisionOperations(input, fallbackRevisionOperations(input));
+  if (!normalizedOperations.length) normalizedOperations = normalizeRevisionOperations(input, fallbackOperations);
   const operations = normalizedOperations.filter(operation => {
-    if (!["replace", "delete", "add"].includes(operation?.type)) return false;
+    if (!["replace", "delete", "add", "remove_phrase"].includes(operation?.type)) return false;
     if (operation.type === "add") return Boolean(operation.new_text);
+    if (operation.type === "remove_phrase") return validSentenceIds.has(operation.target_sentence_id) && Boolean(operation.old_text);
     if (!validIds.has(operation.target_fact_id)) return false;
     return operation.type === "delete" || Boolean(operation.new_text);
   });
+  const allowedIntents = new Set(["explicit_edit", "related_restatement", "related_addition", "new_event", "unclear"]);
+  const inferredIntent = operations.some(operation => operation.type === "remove_phrase" || operation.type === "delete" || operation.type === "replace")
+    ? "explicit_edit"
+    : operations.some(operation => operation.type === "add" && operation.anchor_fact_id)
+      ? "related_addition"
+      : operations.some(operation => operation.type === "add") ? "new_event" : "unclear";
   sendJson(res, 200, {
     operations,
-    revisionMode: isSupplementalNarration ? "supplemental_narration" : "targeted_edit",
+    revisionMode: allowedIntents.has(result.intent) ? result.intent : inferredIntent,
     message: result.message || "",
     provider: qwenConfig().apiKey ? "qwen" : "local"
   });
@@ -1755,10 +1837,22 @@ const server = http.createServer((req, res) => {
   res.end("Method not allowed");
 });
 
-server.listen(PORT, () => {
-  console.log(`童心日记 API 已启动：http://127.0.0.1:${PORT}`);
-  if (!process.env.TENCENT_SECRET_ID || !process.env.TENCENT_SECRET_KEY) {
-    console.log("未配置腾讯 ASR，/api/asr 会返回配置错误，不会伪造识别文本。");
-  }
-  console.log(qwenConfig().apiKey ? "已配置通义千问。" : "未配置通义千问，AI 接口会明确返回错误。");
-});
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log(`童心日记 API 已启动：http://127.0.0.1:${PORT}`);
+    if (!process.env.TENCENT_SECRET_ID || !process.env.TENCENT_SECRET_KEY) {
+      console.log("未配置腾讯 ASR，/api/asr 会返回配置错误，不会伪造识别文本。");
+    }
+    console.log(qwenConfig().apiKey ? "已配置通义千问。" : "未配置通义千问，AI 接口会明确返回错误。");
+  });
+}
+
+module.exports = {
+  compositionPenalty,
+  dedupeSemanticFacts,
+  deterministicRevisionText,
+  fallbackRevisionOperations,
+  normalizeRevisionOperations,
+  revisionChangeIsValid,
+  semanticSimilarity
+};

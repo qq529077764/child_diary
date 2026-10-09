@@ -110,7 +110,16 @@ Page({
     const facts = Array.isArray(record.facts) ? record.facts.map(fact => ({ ...fact, active: fact.active !== false })) : [];
     const sentences = (record.sentences || []).map((sentence, sentenceIndex) => {
       if (typeof sentence === "string") {
-        return { id: `stored_${savedAt}_${sentenceIndex}`, text: sentence, sourceText: "" };
+        const matchingFacts = facts.filter(fact =>
+          fact?.text && (sentence.includes(fact.text) || fact.text.includes(sentence))
+        );
+        return {
+          id: `stored_${savedAt}_${sentenceIndex}`,
+          text: sentence,
+          factTexts: matchingFacts.map(fact => fact.text),
+          factIds: matchingFacts.map(fact => fact.id),
+          sourceText: matchingFacts.map(fact => fact.text).join("；")
+        };
       }
       const factTexts = Array.isArray(sentence.factTexts) ? sentence.factTexts : [];
       const factIds = Array.isArray(sentence.factIds) && sentence.factIds.length
@@ -730,7 +739,13 @@ Page({
     try {
       // 旧版历史日记的句子与事实关联可能不完整，修改时必须提供该篇保存的全部有效事实。
       const activeFacts = this.facts.filter(fact => fact.active !== false);
-      const result = await this.request("/api/revise", { instruction: this.revisionTranscript, facts: activeFacts, diary: this.data.diarySentences.map(item => item.text) });
+      const revisionDiary = this.data.diarySentences.map(item => ({
+        id: item.id,
+        text: item.text,
+        factTexts: item.factTexts || [],
+        factIds: item.factIds || []
+      }));
+      const result = await this.request("/api/revise", { instruction: this.revisionTranscript, facts: activeFacts, diary: revisionDiary });
       let changed = 0;
       const appliedOperations = [];
       (result.operations || []).forEach(operation => {
@@ -740,7 +755,7 @@ Page({
           target.text = operation.new_text; target.quote = this.revisionTranscript; target.source = "语音修改"; changed += 1; appliedOperations.push({ ...operation, old_text: oldText });
         }
         if (operation.type === "delete" && target) {
-          target.active = false; changed += 1; appliedOperations.push(operation);
+          target.active = false; changed += 1; appliedOperations.push({ ...operation, old_text: target.text });
         }
         if (operation.type === "add" && operation.new_text) {
           const id = `rev_${Date.now()}_${changed}`;
@@ -748,13 +763,17 @@ Page({
           appliedOperations.push({ ...operation, applied_fact_id: id });
           changed += 1;
         }
+        if (operation.type === "remove_phrase" && operation.target_sentence_id && operation.old_text) {
+          changed += 1;
+          appliedOperations.push(operation);
+        }
       });
       if (!changed) {
         this.finalizeStarted = false;
         this.setData({ isFinishing: false, revisionDisplay: result.message || "还没有找到要修改的地方，请再说清楚一点。" });
         wx.showModal({
           title: "还没有修改",
-          content: result.message || "请说清楚要替换、删除或补充的内容。原来的日记没有变化。",
+          content: result.message || "请把想改的那件事重新说完整，也可以直接指出要去掉的内容。原来的日记没有变化。",
           showCancel: false
         });
         return;
@@ -769,7 +788,8 @@ Page({
         lockedTitle: this.data.diaryTitle,
         lockedDiary,
         revisionOperations: appliedOperations,
-        revisionInstruction: this.revisionTranscript
+        revisionInstruction: this.revisionTranscript,
+        revisionMode: result.revisionMode || ""
       });
       this.revisionBaseSnapshot = null;
     } catch (error) {

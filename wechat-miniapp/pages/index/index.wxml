@@ -84,10 +84,10 @@
     <view class="listen-card revise-card recording">
       <view class="rabbit small"><view class="ear left"></view><view class="ear right"></view><view class="head"><view class="eye left"></view><view class="eye right"></view><view class="nose"></view></view></view>
       <text class="listen-title">正在听你修改</text>
-      <scroll-view class="revision-text" scroll-y>{{revisionDisplay || '直接说哪里要替换、删除或补充。'}}</scroll-view>
+      <scroll-view class="revision-text" scroll-y>{{revisionDisplay || '把想改的那件事重新说一遍，也可以直接说要去掉什么。'}}</scroll-view>
       <view wx:if="{{isRecording}}" class="wave"><view></view><view></view><view></view><view></view><view></view></view>
     </view>
-    <view class="tip">请说清楚要替换、删除或补充什么。</view>
+    <view class="tip">只说想改的那件事，其他内容会原样保留。</view>
     <button wx:if="{{isRecording}}" class="button orange bottom" bindtap="applyRevision">说好了，帮我改</button>
     <button wx:elif="{{isFinishing}}" class="button orange bottom" disabled>正在修改</button>
     <button wx:else class="button green bottom" bindtap="retryRecording">重新打开麦克风</button>
