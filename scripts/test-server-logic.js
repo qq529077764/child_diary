@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const {
   assignRevisionOperationsToSentences,
+  compositionHardViolations,
   compositionPenalty,
   dedupeSemanticFacts,
   deterministicRevisionText,
@@ -8,6 +9,44 @@ const {
   normalizeRevisionOperations,
   revisionChangeIsValid
 } = require("../server");
+
+const reversedNegation = compositionHardViolations({
+  sentences: [{ text: "我起得很早，赖床，自己穿好了衣服。", factTexts: ["没有赖床", "自己穿好衣服"] }]
+}, [
+  { id: "negative", text: "没有赖床" },
+  { id: "dressed", text: "自己穿好衣服" }
+]);
+assert.equal(reversedNegation.some(item => item.type === "negation_lost"), true, "否定事实被写成肯定时必须拒绝成文");
+assert.equal(compositionHardViolations({
+  sentences: [{ text: "我起得很早，没有赖床，还自己穿好了衣服。", factTexts: ["没有赖床", "自己穿好衣服"] }]
+}, [
+  { id: "negative", text: "没有赖床" },
+  { id: "dressed", text: "自己穿好衣服" }
+]).length, 0, "正文保留否定关系时应通过校验");
+
+const brokenCompletion = compositionHardViolations({
+  sentences: [
+    { text: "休息结束后，我们吃了点心，吃完点心。", factTexts: [] },
+    { text: "就准备回家了，妈妈来接我。", factTexts: [] }
+  ]
+}, []);
+assert.equal(brokenCompletion.some(item => item.type === "dependent_clause_without_subject"), true, "依赖前句却没有主语的新句必须拒绝");
+assert.equal(brokenCompletion.some(item => item.type === "completion_split_from_result"), true, "完成动作不能与后续结果错误断开");
+assert.equal(compositionHardViolations({
+  sentences: [{ text: "吃完点心后，我们就准备回家了，妈妈来接我。", factTexts: [] }]
+}, []).length, 0, "完成动作与后续结果合并且主语清楚时应通过");
+assert.equal(compositionHardViolations({
+  sentences: [{ text: "后来，我们回到教室了。", factTexts: [] }]
+}, []).length, 0, "连接词后通过逗号写出明确主语时不能误报");
+assert.equal(compositionHardViolations({
+  sentences: [
+    { text: "我们玩完了滑梯。", factTexts: [] },
+    { text: "后来，小狗跑过来了。", factTexts: [] }
+  ]
+}, []).length, 0, "任意事物都可以作主语，不能因不在人称词表中而误报");
+assert.equal(compositionHardViolations({
+  sentences: [{ text: "后来，天气变凉了。", factTexts: [] }]
+}, []).length, 0, "自然现象作主语时不能误报");
 
 const diary = [{
   id: "s1",

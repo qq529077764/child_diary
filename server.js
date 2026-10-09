@@ -806,7 +806,87 @@ function compositionPenalty(draft) {
   return penalty;
 }
 
-async function refineCompositionWithQwen(input, draft, facts, missingFacts) {
+const NEGATION_PATTERN = /(从来没有|从来没|没有|不是|不能|不会|不要|未曾|没|未|不|别)/u;
+const LEADING_DEPENDENCY_PATTERN = /^(就|才|再|又|接着|然后|后来|最后)/u;
+const SUBJECTLESS_ACTION_START_PATTERN = /^(放学|回家|上学|开始|继续|结束|准备|进去|出来|去了|去到|吃了|喝了|玩了|看了|读了|写了|做了|睡了|拿了|穿了|背了|坐了|骑了|搭了|打了|洗了|收了|画了|学了|参观|检查)/u;
+
+function sentencePreservesNegativeFact(sentenceText, factText) {
+  const fact = normalizeSemanticText(factText);
+  const sentence = normalizeSemanticText(sentenceText);
+  const match = fact.match(NEGATION_PATTERN);
+  if (!match) return true;
+  if (sentence.includes(fact)) return true;
+  if (!NEGATION_PATTERN.test(sentence)) return false;
+  const anchor = fact.slice((match.index || 0) + match[0].length);
+  if (anchor.length < 2) return true;
+  const phrase = anchor.slice(0, Math.min(anchor.length, 6));
+  const anchorIndex = sentence.indexOf(phrase);
+  if (anchorIndex < 0) return false;
+  return NEGATION_PATTERN.test(sentence.slice(Math.max(0, anchorIndex - 6), anchorIndex));
+}
+
+function startsWithDependentClauseWithoutSubject(text) {
+  const value = String(text || "").trim().replace(/^[“”"'　\s]+/u, "");
+  if (!LEADING_DEPENDENCY_PATTERN.test(value)) return false;
+  const afterConnector = value
+    .replace(LEADING_DEPENDENCY_PATTERN, "")
+    .replace(/^[，,　\s]+/u, "");
+  const firstClause = afterConnector.split(/[，。！？,!?]/u)[0];
+  // 中文主语可以是任意人物或事物，不能靠有限的人称词表反推“没有主语”。
+  // 这里只拦截高置信度的“连接词 + 直接动作”残句，其余交给模型校对，避免误伤“小狗跑过来”等正常表达。
+  return SUBJECTLESS_ACTION_START_PATTERN.test(firstClause);
+}
+
+function endsWithCompletionAction(text) {
+  const value = String(text || "").trim().replace(/[。！？!?]+$/u, "");
+  return /(吃完|做完|玩完|看完|读完|写完|说完|睡完|洗完|穿完|收完|画完|搭完|打完|学完)[^，。！？,!?]{0,10}$/u.test(value);
+}
+
+function compositionHardViolations(draft, facts) {
+  const sentences = Array.isArray(draft?.sentences) ? draft.sentences : [];
+  const factByText = new Map((facts || []).map(fact => [String(fact?.text || ""), fact]));
+  const violations = [];
+  sentences.forEach((sentence, index) => {
+    const factTexts = Array.isArray(sentence?.factTexts) ? sentence.factTexts : [];
+    for (const factText of factTexts) {
+      const fact = factByText.get(String(factText));
+      if (!fact || !NEGATION_PATTERN.test(normalizeSemanticText(fact.text))) continue;
+      if (!sentencePreservesNegativeFact(sentence.text, fact.text)) {
+        violations.push({
+          type: "negation_lost",
+          sentenceIndex: index,
+          sentenceText: sentence.text,
+          factText: fact.text,
+          message: `正文改变了否定事实“${fact.text}”的原意`
+        });
+      }
+    }
+    if (startsWithDependentClauseWithoutSubject(sentence?.text)) {
+      const previous = sentences[index - 1];
+      violations.push({
+        type: "dependent_clause_without_subject",
+        sentenceIndex: index,
+        previousSentenceIndex: index - 1,
+        sentenceText: sentence.text,
+        previousSentenceText: previous?.text || "",
+        message: "句子以依赖前文的连接词开头，但本句没有明确主语"
+      });
+      if (previous && endsWithCompletionAction(previous.text)) {
+        violations.push({
+          type: "completion_split_from_result",
+          sentenceIndex: index,
+          previousSentenceIndex: index - 1,
+          sentenceText: sentence.text,
+          previousSentenceText: previous.text,
+          message: "完成动作被与它引出的后续事件错误断开"
+        });
+      }
+    }
+  });
+  return violations;
+}
+
+async function refineCompositionWithQwen(input, draft, facts, missingFacts, hardViolations = []) {
   const sourceUtterances = [...new Set(facts.map(fact => String(fact.quote || "").trim()).filter(Boolean))];
   const messages = [
     {
@@ -823,6 +903,9 @@ async function refineCompositionWithQwen(input, draft, facts, missingFacts) {
           "孩子停顿后补出的半句、指代词或单独的‘去了、进去了、做完了’若没有新增独立信息，要并入上下文或省略，不能原样留成病句。",
           "每个独立句子必须有明确主语和谓语，主语只能来自事实；时间或地点作状语时也不能省略必要主语，并列动作可以共用一次主语。",
           "同一活动的连续阶段合并成一句或一个紧凑事件，不能拆成重复叙述。",
+          "事实中的否定关系必须原样保留。‘没有、没、不、不是、不能、不会’不得省略或改成肯定。",
+          "‘吃完、做完、玩完、看完’等完成动作如果引出下一件事，要写成‘……后，主语就……’，不能在完成动作后误用句号。",
+          "句子不得直接以‘就、才、再、又’开头却省略主语；需要承接前句时应合并重整相邻句子。",
           "按时间和事件顺序组织：发生了什么、过程或结果、最后感受；感受不得放在对应事情之前。",
           "明确的结束、离开、返回或休息等收尾事件出现后，之前发生的活动不能再放到文章末尾。遗漏事实必须合并回它真实发生的位置。",
           "一句主要表达一件事或一个连续动作，不能用逗号串联过多事件。",
@@ -837,6 +920,7 @@ async function refineCompositionWithQwen(input, draft, facts, missingFacts) {
         facts,
         accepted_child_utterances: sourceUtterances,
         missing_facts: missingFacts,
+        hard_violations: hardViolations,
         current_draft: draft
       })
     }
@@ -876,6 +960,8 @@ async function composeWithQwen(input) {
           "按真实时间顺序写：先写事件，再写过程和结果，最后写与该事件对应的感受；不能把感受放到事情发生之前。",
           "明确的结束、离开、返回或休息等收尾节点之后，禁止再出现此前已经结束的活动。",
           "同一个活动只叙述一次。连续动作属于同一事件时要合并成一个完整事件；较完整事实已经包含较短事实时，只表达完整含义，并把两条来源都列入 factTexts。",
+          "事实中的否定关系必须保留，不得省略‘没有、没、不、不是、不能、不会’或把否定事实改成肯定。",
+          "完成动作与它引出的后续结果必须正确连接，不得用句号将两者断开。应使用‘……后，主语就……’并写清主语。",
           "严禁为了衔接而重复同一动作或写出前后同义、缺少新信息的病句。",
           "可以使用‘今天、然后、后来、但是、所以’等连接词，但不能用连接词暗示孩子没有说过的因果。",
           "不要逐条照抄事实；要把零散短语组织成主谓完整、前后连贯的句子。",
@@ -898,22 +984,31 @@ async function composeWithQwen(input) {
   let currentPenalty = compositionPenalty(result);
   let usedFactTexts = new Set(result.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []));
   let missingFacts = facts.filter(fact => !factIsCovered(fact, usedFactTexts));
-  // 只有质量或覆盖不合格时再做一次统一校对，避免多轮模型调用拖慢成文。
-  for (let attempt = 0; attempt < 1 && (currentPenalty > 0 || missingFacts.length); attempt += 1) {
+  let hardViolations = compositionHardViolations(result, facts);
+  // 普通质量问题最多校对一次；只有否定翻转或错误断句这类硬错误仍存在时，才允许第二次校对。
+  const maxRefinementAttempts = hardViolations.length ? 2 : 1;
+  for (let attempt = 0; attempt < maxRefinementAttempts && (currentPenalty > 0 || missingFacts.length || hardViolations.length); attempt += 1) {
     try {
-      const refined = await refineCompositionWithQwen(input, result, facts, missingFacts);
+      const refined = await refineCompositionWithQwen(input, result, facts, missingFacts, hardViolations);
       if (!Array.isArray(refined.sentences)) refined.sentences = [];
       refined.sentences = dedupeCompositionSentences(refined.sentences);
       const refinedFactTexts = new Set(refined.sentences.flatMap(sentence => Array.isArray(sentence.factTexts) ? sentence.factTexts : []));
       const refinedMissingFacts = facts.filter(fact => !factIsCovered(fact, refinedFactTexts));
       const refinedPenalty = compositionPenalty(refined);
+      const refinedHardViolations = compositionHardViolations(refined, facts);
       const improvesCoverage = refinedMissingFacts.length < missingFacts.length;
-      const preservesCoverageAndImprovesWriting = refinedMissingFacts.length === missingFacts.length && refinedPenalty < currentPenalty;
-      if (!refined.sentences.length || (!improvesCoverage && !preservesCoverageAndImprovesWriting)) break;
+      const improvesHardValidity = refinedHardViolations.length < hardViolations.length;
+      const preservesCoverageAndImprovesWriting = refinedMissingFacts.length === missingFacts.length &&
+        refinedHardViolations.length === hardViolations.length && refinedPenalty < currentPenalty;
+      const noCoverageRegression = refinedMissingFacts.length <= missingFacts.length;
+      const noHardValidityRegression = refinedHardViolations.length <= hardViolations.length;
+      if (!refined.sentences.length || !noCoverageRegression || !noHardValidityRegression ||
+        (!improvesCoverage && !improvesHardValidity && !preservesCoverageAndImprovesWriting)) break;
       result = refined;
       usedFactTexts = refinedFactTexts;
       missingFacts = refinedMissingFacts;
       currentPenalty = refinedPenalty;
+      hardViolations = refinedHardViolations;
     } catch (error) {
       console.error("Optional composition refinement failed:", error.message);
       break;
@@ -922,6 +1017,11 @@ async function composeWithQwen(input) {
   // 不再把模型认为遗漏的事实机械追加到文章末尾。机械追加会破坏时间顺序，
   // 也会把已经合并表达过的活动再次写一遍；遗漏只允许通过上面的整体重排修复。
   result.sentences = normalizeRepeatedThen(dedupeCompositionSentences(result.sentences));
+  hardViolations = compositionHardViolations(result, facts);
+  if (hardViolations.length) {
+    console.error("Composition rejected by hard validation", hardViolations);
+    throw new Error("日记语义校验没有通过，请重新整理一次");
+  }
   console.log("Composition validated", {
     factCount: facts.length,
     coveredFactCount: facts.length - missingFacts.length,
@@ -2029,6 +2129,7 @@ if (require.main === module) {
 
 module.exports = {
   compositionPenalty,
+  compositionHardViolations,
   dedupeSemanticFacts,
   deterministicRevisionText,
   fallbackRevisionOperations,
