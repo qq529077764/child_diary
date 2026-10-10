@@ -11,7 +11,7 @@
     "minified": true,
     "coverView": true,
     "showShadowRootInWxmlPanel": true,
-    "minifyWXML": false
+    "minifyWXML": true
   },
   "condition": {}
 }
