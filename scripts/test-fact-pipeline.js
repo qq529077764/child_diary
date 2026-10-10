@@ -43,6 +43,24 @@ assert.equal(audited[3].text, "讲完绘本之后，我们吃下午茶", "原话
 assert.deepEqual(audited[2].sourceFactIds, ["read-fragment", "book"]);
 assert.equal(audited.some(fact => fact.id === "loose" || fact.id === "noise"), false, "不完整片段和无效收音不必进入正文事实");
 
+const splitEventFacts = applyFactAudit(
+  "我和同学一起跳绳，是200个，很多个同学，我感觉很好的。",
+  [{ id: "jump-all", slot: "what", text: "我和同学一起跳绳，是200个，很多个同学，我感觉很好的", quote: "我和同学一起跳绳，是200个，很多个同学，我感觉很好的" }],
+  {
+    finalFacts: [
+      { eventKey: "跳绳", sourceFactIds: ["jump-all"], slot: "what", label: "跳绳", text: "我和同学一起跳绳" },
+      { eventKey: "跳绳", sourceFactIds: ["jump-all"], slot: "detail", label: "数量", text: "跳了200个" },
+      { eventKey: "跳绳", sourceFactIds: ["jump-all"], slot: "detail", label: "同学", text: "当时有很多同学" },
+      { eventKey: "跳绳", sourceFactIds: ["jump-all"], slot: "feeling", label: "感受", text: "感觉很好" }
+    ]
+  }
+);
+assert.equal(splitEventFacts.length, 4, "同一段原话中的动作、描述和感受必须能拆成独立语义事实");
+assert.equal(new Set(splitEventFacts.map(fact => fact.id)).size, 4, "拆分后的事实必须各自拥有唯一ID");
+assert.deepEqual(splitEventFacts.map(fact => fact.eventKey), ["跳绳", "跳绳", "跳绳", "跳绳"]);
+assert.deepEqual(splitEventFacts.map(fact => fact.slot), ["what", "detail", "detail", "feeling"]);
+assert.equal(splitEventFacts.every(fact => fact.sourceFactIds[0] === "jump-all"), true, "拆分事实必须共同指回原始证据");
+
 const repeatedThen = normalizeComposition({
   title: "上学",
   sentences: [
