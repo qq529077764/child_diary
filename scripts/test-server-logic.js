@@ -4,6 +4,7 @@ const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
 const server = fs.readFileSync(path.join(root, "server.js"), "utf8");
+const pipeline = fs.readFileSync(path.join(root, "lib/fact-pipeline.js"), "utf8");
 const miniapp = fs.readFileSync(path.join(root, "wechat-miniapp/pages/index/index.js"), "utf8");
 
 const handlerBlock = name => {
@@ -12,13 +13,15 @@ const handlerBlock = name => {
   return server.slice(start, end < 0 ? server.length : end);
 };
 
-assert.match(handlerBlock("handleFinalize"), /finalizeSemanticDiary\(input, callQwenJson\)/, "第一版接口必须只进入语义事件流程");
-assert.doesNotMatch(handlerBlock("handleFinalize"), /finalizeWithQwen\(/, "第一版接口不得回到旧事实文本成文器");
-assert.match(handlerBlock("handleRevise"), /reviseSemanticDiary\(input, callQwenJson\)/, "修改接口必须一次完成语义补丁和局部成文事务");
-assert.doesNotMatch(handlerBlock("handleRevise"), /fallbackRevisionOperations|revisionChangeIsValid|reviseWithQwen/, "修改接口不得回到旧正则或字面校验");
-assert.match(handlerBlock("handleCompose"), /legacy_compose_removed/, "旧成文接口必须明确停用，不能作为隐藏兜底");
-assert.equal(miniapp.includes('request("/api/compose"'), false, "小程序不得再调用旧成文接口");
-assert.equal(miniapp.includes("revisionOperations"), false, "客户端不得再维护旧事实操作和回滚链路");
-assert.match(server, /story_json/, "服务器必须持久化语义事件账本");
+assert.match(handlerBlock("handleFinalize"), /finalizeFactDiary\(input, callQwenJson\)/, "第一版接口必须进入事实审计和成文流程");
+assert.match(handlerBlock("handleRevise"), /reviseFactDiary\(input, callQwenJson\)/, "修改接口必须基于事实账本完成");
+assert.match(handlerBlock("handleCompose"), /legacy_compose_removed/, "旧成文接口必须明确停用");
+assert.equal(miniapp.includes('request("/api/compose"'), false, "小程序不得调用旧成文接口");
+assert.equal(miniapp.includes("storyModel"), false, "客户端不得继续维护语义事件账本");
+assert.equal(miniapp.includes("semanticFactText"), false, "客户端不得机械拼装对应事实");
+assert.match(pipeline, /全文‘然后’原则上不超过一次/, "成文规则必须处理重复然后");
+assert.doesNotMatch(pipeline, /simpleEventSentence|normalizeRepeatedThen|compositionPenalty/, "不得保留旧的机械拼句和替词逻辑");
+assert.equal(fs.existsSync(path.join(root, "lib/semantic-pipeline.js")), false, "旧语义成文模块必须删除");
+assert.equal(fs.existsSync(path.join(root, "lib/story-model.js")), false, "旧事件账本模块必须删除");
 
-console.log("server semantic routing regression: ok");
+console.log("server fact routing regression: ok");

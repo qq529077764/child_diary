@@ -4,7 +4,7 @@ const path = require("path");
 const root = path.resolve(__dirname, "..");
 const productionPromptFiles = [
   "server.js",
-  "lib/semantic-pipeline.js",
+  "lib/fact-pipeline.js",
   "wechat-miniapp/pages/index/index.wxml"
 ];
 const caseSpecificTerms = [

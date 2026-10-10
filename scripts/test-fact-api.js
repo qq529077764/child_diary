@@ -6,7 +6,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const root = path.resolve(__dirname, "..");
-const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "child-diary-semantic-api-"));
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "child-diary-fact-api-"));
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -15,46 +15,53 @@ function listen(server) {
   });
 }
 
+function lastPayload(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    try { return JSON.parse(messages[index].content); } catch {}
+  }
+  return {};
+}
+
+function payloadWith(messages, key) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    try {
+      const value = JSON.parse(messages[index].content);
+      if (value && Object.prototype.hasOwnProperty.call(value, key)) return value;
+    } catch {}
+  }
+  return {};
+}
+
 function fakeModelResponse(messages) {
   const joined = messages.map(message => message.content).join("\n");
-  const story = {
-    title: "公园日记",
-    events: [
-      { id: "e1", subject: "我和妈妈", action: "去", object: "公园", sourceSpanIds: ["span_1"] },
-      { id: "e2", subject: "我", action: "喂", object: "鸽子", expressions: ["好多好多"], sourceSpanIds: ["span_1"] }
-    ],
-    sentences: [{ text: "我和妈妈去了公园，那里有好多好多鸽子，我还喂了它们。", eventIds: ["e1", "e2"] }],
-    corrections: []
-  };
-  if (joined.includes("独立的儿童日记修改补丁审计员")) return { hardErrors: [], verdict: "pass" };
-  if (joined.includes("revisionSpan")) {
-    const revisionSpanId = JSON.parse(messages.at(-1).content).revisionSpan.id;
-    return { intent: "correct", operations: [{ type: "update_event", eventId: "event_2", changes: { object: "小鸟", childExpressions: { add: [{ text: "小小的", bindTo: "object", policy: "preserve" }], removeTexts: [] } }, sourceSpanIds: [revisionSpanId] }] };
-  }
+  const payload = lastPayload(messages);
   if (joined.includes('"current_text"')) {
     return {
       facts: [{ slot: "what", label: "去公园", text: "我和妈妈去了公园", quote: "我和妈妈去了公园", source_role: "child_story", story_relation: "main" }],
-      decision: { action: "ask_followup", reason: "missing_result", question: "到了公园以后，你做了什么呀？", target_key: "我和妈妈去了公园", question_status: "none" },
+      decision: { action: "ask_followup", reason: "missing_result", question: "到了那里以后，你做了什么呀？", target_key: "我和妈妈去了公园", question_status: "none" },
       speech_quality: "coherent",
       segment_role: "child_story"
     };
   }
-  if (joined.includes("独立的儿童口述来源审计员")) return { hardErrors: [], verdict: "pass" };
-  if (joined.includes("sourceSpans")) return story;
-  if (joined.includes("独立的儿童日记语义审计员")) return { hardErrors: [], softIssues: [], verdict: "pass" };
-  const revised = joined.includes("小小的");
-  return {
-    title: "公园日记",
-    scenes: [{
-      sceneId: "scene_main",
-      sentences: [{
-        text: revised
-          ? "我和妈妈去了公园，那里有好多好多小小的鸟，我还喂了它们。"
-          : "我和妈妈去了公园，那里有好多好多鸽子，我还喂了它们。",
-        eventIds: ["event_1", "event_2"]
-      }]
-    }]
-  };
+  if (joined.includes("审核已抽取事实")) return { excludedFacts: [], addedFacts: [] };
+  if (joined.includes("生成最少且明确的事实操作")) {
+    return { operations: [{ type: "replace", targetFactId: "f2", slot: "what", label: "喂小鸟", text: "我喂了好多好多小小的鸟" }] };
+  }
+  if (joined.includes("根据finalFacts和instruction")) {
+    return {
+      title: "公园日记",
+      sentences: [{ id: "s1", text: "我和妈妈去了公园，那里有好多好多小小的鸟，我还喂了它们。", factIds: ["f1", "f2"] }]
+    };
+  }
+  if (joined.includes("把finalFacts组织")) {
+    const ids = (payloadWith(messages, "finalFacts").finalFacts || []).map(fact => fact.id);
+    return {
+      title: "公园日记",
+      sentences: [{ text: "我和妈妈去了公园，那里有好多好多鸽子，我还喂了它们。", factIds: ids }]
+    };
+  }
+  if (joined.includes("修复draft中的指定问题")) return payload.draft;
+  return {};
 }
 
 async function waitForServer(baseUrl, child) {
@@ -66,24 +73,22 @@ async function waitForServer(baseUrl, child) {
     } catch {}
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  throw new Error("semantic API did not start");
+  throw new Error("fact API did not start");
 }
 
 async function run() {
-  let malformedExtractionInjected = false;
+  let malformedCompositionInjected = false;
   const fakeModel = http.createServer((req, res) => {
     let body = "";
     req.on("data", chunk => { body += chunk; });
     req.on("end", () => {
       const request = JSON.parse(body);
       const joined = (request.messages || []).map(message => message.content).join("\n");
-      const shouldInjectMalformed = !malformedExtractionInjected
-        && joined.includes("sourceSpans")
+      const shouldInjectMalformed = !malformedCompositionInjected
+        && joined.includes("把finalFacts组织")
         && !joined.includes("compact_json_retry");
-      if (shouldInjectMalformed) malformedExtractionInjected = true;
-      const content = shouldInjectMalformed
-        ? '{"titleHint":"截断测试","spans":['
-        : JSON.stringify(fakeModelResponse(request.messages || []));
+      if (shouldInjectMalformed) malformedCompositionInjected = true;
+      const content = shouldInjectMalformed ? '{"title":"截断测试","sentences":[' : JSON.stringify(fakeModelResponse(request.messages || []));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
     });
@@ -111,51 +116,53 @@ async function run() {
   api.stdout.on("data", chunk => { processOutput += chunk; });
   api.stderr.on("data", chunk => { processOutput += chunk; });
   const baseUrl = `http://127.0.0.1:${apiPort}`;
-  const request = async (pathName, method = "GET", data, token) => {
-    const response = await fetch(`${baseUrl}${pathName}`, {
+  const request = async (pathname, method = "GET", data, token) => {
+    const response = await fetch(`${baseUrl}${pathname}`, {
       method,
       headers: { ...(data ? { "content-type": "application/json" } : {}), ...(token ? { authorization: `Bearer ${token}` } : {}) },
       ...(data ? { body: JSON.stringify(data) } : {})
     });
-    const body = await response.json();
-    return { response, body };
+    return { response, body: await response.json() };
   };
   try {
     await waitForServer(baseUrl, api);
     const health = await request("/health");
-    assert.equal(health.body.semanticStorySchema, 2);
-    assert.equal(health.body.legacyCompose, false);
-    const session = await request("/api/auth/session", "POST", { installationId: "semantic-api-test-user" });
+    assert.equal(health.body.factDiarySchema, 1);
+    const session = await request("/api/auth/session", "POST", { installationId: "fact-api-test-user" });
     const token = session.body.token;
-    assert.ok(token);
-    await request("/api/guardian-consent", "POST", { policyVersion: "test-2026-10-09" }, token);
+    await request("/api/guardian-consent", "POST", { policyVersion: "test-2026-10-10" }, token);
     const transcript = "我和妈妈去了公园，那里有好多好多鸽子，我还喂了它们。";
+    const facts = [
+      { id: "f1", slot: "what", label: "去公园", text: "我和妈妈去了公园", quote: "我和妈妈去了公园", active: true },
+      { id: "f2", slot: "what", label: "喂鸽子", text: "我喂了好多好多鸽子", quote: "好多好多鸽子，我还喂了它们", active: true }
+    ];
     const realtime = await request("/api/analyze", "POST", { text: transcript, recentText: transcript, existingFacts: [], previousQuestions: [], previousQuestionKeys: [] }, token);
     assert.equal(realtime.response.status, 200, JSON.stringify(realtime.body));
-    assert.equal(realtime.body.facts[0].text, "我和妈妈去了公园");
-    const draft = await request("/api/finalize", "POST", { transcript, facts: [] }, token);
+    const draft = await request("/api/finalize", "POST", { transcript, facts }, token);
     assert.equal(draft.response.status, 200, JSON.stringify(draft.body));
-    assert.match(processOutput, /Qwen stage retry/, "模型首次返回截断JSON时必须用紧凑模式自动重试");
-    assert.equal(draft.body.story.schemaVersion, 2);
-    assert.equal(draft.body.story.spans[0].text, transcript, "模型只回传片段分类，服务端必须恢复原始来源文本");
-    assert.deepEqual(draft.body.sentences[0].eventIds, ["event_1", "event_2"]);
+    assert.match(processOutput, /Qwen stage retry/, "模型首次返回截断JSON时必须自动重试");
+    assert.deepEqual(draft.body.sentences[0].factIds, ["f1", "f2"]);
+    assert.equal(draft.body.sentences[0].sourceText.includes("我和妈妈去了公园"), true);
+    assert.equal(Array.isArray(draft.body.facts), true);
+    assert.equal("story" in draft.body, false);
     const saved = await request("/api/diaries", "POST", {
-      id: "semantic_api_test", title: draft.body.title, sentences: draft.body.sentences,
-      story: draft.body.story, transcript, facts: [], savedAt: Date.now()
+      id: "fact_api_test", title: draft.body.title, sentences: draft.body.sentences,
+      transcript, facts: draft.body.facts, savedAt: Date.now()
     }, token);
-    assert.equal(saved.body.diary.story.schemaVersion, 2);
+    assert.equal(saved.response.status, 201);
+    assert.equal("story" in saved.body.diary, false);
     const revised = await request("/api/revise", "POST", {
       instruction: "不是鸽子，是小小的鸟",
       title: draft.body.title,
-      sentences: draft.body.sentences,
-      story: draft.body.story
+      sentences: draft.body.sentences.map((sentence, index) => ({ ...sentence, id: index ? sentence.id : "s1" })),
+      facts: draft.body.facts
     }, token);
-    assert.equal(revised.body.changed, true);
+    assert.equal(revised.body.changed, true, JSON.stringify(revised.body));
     assert.match(revised.body.sentences[0].text, /小小的/);
+    assert.equal(revised.body.facts.find(fact => fact.id === "f2").text, "我喂了好多好多小小的鸟");
     const legacy = await request("/api/compose", "POST", {}, token);
     assert.equal(legacy.response.status, 410);
-    await request("/api/diaries/semantic_api_test", "DELETE", undefined, token);
-    console.log("semantic API integration: ok");
+    console.log("fact API integration: ok");
   } catch (error) {
     error.message += `\nAPI output:\n${processOutput}`;
     throw error;

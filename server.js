@@ -3,8 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { DatabaseSync } = require("node:sqlite");
-const { finalizeSemanticDiary, reviseSemanticDiary } = require("./lib/semantic-pipeline");
-const { activeEvents, normalizeStory, validateCompositionStructure, validateStory } = require("./lib/story-model");
+const { finalizeFactDiary, reviseFactDiary } = require("./lib/fact-pipeline");
 
 const ROOT = __dirname;
 
@@ -55,9 +54,6 @@ database.exec(`
   CREATE INDEX IF NOT EXISTS idx_diaries_user_created
     ON diaries(user_id, created_at DESC);
 `);
-const diaryColumns = new Set(database.prepare("PRAGMA table_info(diaries)").all().map(column => column.name));
-if (!diaryColumns.has("story_json")) database.exec("ALTER TABLE diaries ADD COLUMN story_json TEXT NOT NULL DEFAULT '{}'");
-
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
   const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
@@ -362,8 +358,7 @@ async function callQwenJson(messages, options = {}) {
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     const startedAt = Date.now();
     try {
-      const fastStage = /^(?:audit|reaudit)_(?:diary|revision)/u.test(stage)
-        || /^(?:audit|reaudit)_story_(?:source|correction)$/u.test(stage);
+      const fastStage = /^(?:audit|reaudit)_(?:diary|revision)/u.test(stage);
       const model = options.model || (compactRetry
         ? (fastStage ? config.model : config.fastModel)
         : (fastStage ? config.fastModel : config.model));
@@ -846,7 +841,6 @@ function presentStoredDiary(row) {
     sentences: parseStoredJson(row.sentences_json, []),
     transcript: row.transcript || "",
     facts: parseStoredJson(row.facts_json, []),
-    story: parseStoredJson(row.story_json, null),
     savedAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -858,21 +852,16 @@ function validatedDiaryInput(input) {
   const sentences = Array.isArray(input.sentences) ? input.sentences.slice(0, 80) : [];
   const facts = Array.isArray(input.facts) ? input.facts.slice(0, 200) : [];
   const transcript = String(input.transcript || "").slice(0, 30000);
-  const story = input.story && typeof input.story === "object" ? normalizeStory(input.story) : null;
   const savedAt = Number(input.savedAt);
   if (!/^[A-Za-z0-9_-]{3,128}$/.test(id)) throw new Error("invalid_diary_id");
   if (!sentences.length || sentences.some(item => !item || typeof item.text !== "string" || item.text.length > 1000)) {
     throw new Error("invalid_diary_sentences");
-  }
-  if (story && (!activeEvents(story).length || validateStory(story).length || validateCompositionStructure(story, { sentences }).length)) {
-    throw new Error("invalid_diary_story");
   }
   return {
     id,
     title: title || "我的日记",
     sentences,
     facts,
-    story,
     transcript,
     savedAt: Number.isFinite(savedAt) && savedAt > 0 ? savedAt : null
   };
@@ -891,14 +880,13 @@ async function handleCreateDiary(req, res, user) {
   const original = database.prepare("SELECT created_at FROM diaries WHERE user_id = ? AND id = ?").get(user.id, input.id);
   const createdAt = original?.created_at || input.savedAt || now;
   database.prepare(`
-    INSERT INTO diaries(user_id, id, title, sentences_json, transcript, facts_json, story_json, created_at, updated_at, deleted_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    INSERT INTO diaries(user_id, id, title, sentences_json, transcript, facts_json, created_at, updated_at, deleted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
     ON CONFLICT(user_id, id) DO UPDATE SET
       title = excluded.title,
       sentences_json = excluded.sentences_json,
       transcript = excluded.transcript,
       facts_json = excluded.facts_json,
-      story_json = excluded.story_json,
       updated_at = excluded.updated_at,
       deleted_at = NULL
   `).run(
@@ -908,7 +896,6 @@ async function handleCreateDiary(req, res, user) {
     JSON.stringify(input.sentences),
     input.transcript,
     JSON.stringify(input.facts),
-    JSON.stringify(input.story || {}),
     createdAt,
     now
   );
@@ -985,7 +972,7 @@ async function handleAnalyze(req, res) {
 
 async function handleCompose(req, res) {
   await readJson(req);
-  sendError(res, 410, "legacy_compose_removed", "成文已经合并到新的语义事件流程，请更新小程序版本。");
+  sendError(res, 410, "legacy_compose_removed", "成文已经合并到新的事实整理流程，请更新小程序版本。");
 }
 
 async function handleFinalize(req, res) {
@@ -995,7 +982,7 @@ async function handleFinalize(req, res) {
     transcriptChars: String(input.transcript || "").length,
     inputFacts: Array.isArray(input.facts) ? input.facts.length : 0
   });
-  const result = await finalizeSemanticDiary(input, callQwenJson);
+  const result = await finalizeFactDiary(input, callQwenJson);
   console.log("Finalize completed", {
     elapsedMs: Date.now() - startedAt,
     inputFacts: Array.isArray(input.facts) ? input.facts.length : 0,
@@ -1006,7 +993,7 @@ async function handleFinalize(req, res) {
 
 async function handleRevise(req, res) {
   const input = await readJson(req);
-  const result = await reviseSemanticDiary(input, callQwenJson);
+  const result = await reviseFactDiary(input, callQwenJson);
   sendJson(res, 200, { ...result, provider: qwenConfig().apiKey ? "qwen" : "local" });
 }
 
@@ -1113,7 +1100,7 @@ const server = http.createServer((req, res) => {
       service: "tongxin-diary-api",
       asr: Boolean(process.env.TENCENT_SECRET_ID && process.env.TENCENT_SECRET_KEY),
       qwen: Boolean(qwenConfig().apiKey),
-      semanticStorySchema: 2,
+      factDiarySchema: 1,
       legacyCompose: false,
       storage: Boolean(database),
       auth: process.env.WECHAT_APP_ID && process.env.WECHAT_APP_SECRET ? "wechat" : process.env.ALLOW_DEVICE_AUTH === "true" ? "device-test" : "not-configured"

@@ -34,41 +34,27 @@ function uniqueTexts(values) {
   return [...new Set(values.map(value => String(value || "").trim()).filter(Boolean))];
 }
 
-function semanticFactText(event) {
-  if (!event) return "";
-  const subject = String(event.subject || "");
-  const action = String(event.action || "");
-  const object = String(event.object || "");
-  const location = String(event.location || "");
-  const manner = String(event.manner || "");
-  const time = String(event.time || "");
-  const posture = /^(?:坐|站|躺|蹲)$/u.test(action);
-  const core = location
-    ? posture ? `${subject}${action}在${location}` : `${subject}在${location}${manner}${action}${object}`
-    : `${subject}${manner}${action}${object}`;
-  const additions = uniqueTexts([event.result, event.feeling, ...(event.details || [])]);
-  return `${time}${core}${additions.length ? `，${additions.join("，")}` : ""}`.trim();
+function joinEvidence(values) {
+  const items = uniqueTexts(values);
+  if (items.length <= 1) return items[0] || "";
+  return items.map(item => item.replace(/[，。；,.;]+$/u, "")).join("；");
 }
 
-function enrichSentencesWithEvidence(sentences, story) {
-  if (!story || story.schemaVersion !== 2) return sentences;
-  const spanById = new Map((story.spans || []).map(span => [span.id, span]));
-  const eventById = new Map((story.events || []).map(event => [event.id, event]));
+function enrichSentencesWithEvidence(sentences, facts) {
+  const factById = new Map((facts || []).map(fact => [fact.id, fact]));
   return sentences.map(sentence => {
-    const events = uniqueTexts(sentence.eventIds || []).map(id => eventById.get(id)).filter(Boolean);
-    const sourceSpanIds = uniqueTexts([
-      ...(sentence.sourceSpanIds || []),
-      ...events.flatMap(event => event.sourceSpanIds || [])
-    ]);
-    const sourceTexts = uniqueTexts(sourceSpanIds.map(id => spanById.get(id)?.text));
-    const semanticFacts = uniqueTexts(events.map(semanticFactText));
-    const factTexts = semanticFacts.length ? semanticFacts : uniqueTexts(sentence.factTexts || []);
+    const linkedFacts = uniqueTexts(sentence.factIds || []).map(id => factById.get(id)).filter(Boolean);
+    const factTexts = linkedFacts.length
+      ? uniqueTexts(linkedFacts.map(fact => fact.text))
+      : uniqueTexts(sentence.factTexts || []);
+    const sourceTexts = linkedFacts.length
+      ? uniqueTexts(linkedFacts.map(fact => fact.quote))
+      : uniqueTexts([sentence.sourceText]);
     return {
       ...sentence,
-      sourceSpanIds,
       factTexts,
       factSummary: factTexts.join("；") || sentence.factSummary || sentence.text,
-      sourceText: sourceTexts.join("；") || sentence.sourceText || ""
+      sourceText: joinEvidence(sourceTexts) || sentence.sourceText || ""
     };
   });
 }
@@ -155,7 +141,6 @@ Page({
     this.transcript = "";
     this.revisionTranscript = "";
     this.facts = [];
-    this.storyModel = null;
     this.utterances = [];
     this.questions = [];
     this.questionKeys = [];
@@ -200,7 +185,6 @@ Page({
   presentDiary(record, index = 0) {
     const savedAt = Number(record.savedAt) || Date.now();
     const facts = Array.isArray(record.facts) ? record.facts.map(fact => ({ ...fact, active: fact.active !== false })) : [];
-    const story = record.story && record.story.schemaVersion === 2 ? record.story : null;
     const storedSentences = (record.sentences || []).map((sentence, sentenceIndex) => {
       if (typeof sentence === "string") {
         const matchingFacts = facts.filter(fact =>
@@ -223,21 +207,17 @@ Page({
       return {
         ...sentence,
         id: sentence.id || `stored_${savedAt}_${sentenceIndex}`,
-        sceneId: sentence.sceneId || "",
-        eventIds: Array.isArray(sentence.eventIds) ? sentence.eventIds : [],
-        sourceSpanIds: Array.isArray(sentence.sourceSpanIds) ? sentence.sourceSpanIds : [],
         factTexts,
         factIds,
         sourceText: sentence.sourceText || factTexts.join("；")
       };
     });
-    const sentences = enrichSentencesWithEvidence(storedSentences, story);
+    const sentences = enrichSentencesWithEvidence(storedSentences, facts);
     return {
       ...record,
       id: record.id || `diary_${savedAt}_${index}`,
       title: record.title || "我的日记",
       facts,
-      story,
       savedAt,
       savedLabel: this.formatSavedTime(savedAt),
       sentences,
@@ -535,7 +515,6 @@ Page({
           const snapshot = this.revisionBaseSnapshot;
           if (snapshot) {
             this.facts = JSON.parse(JSON.stringify(snapshot.facts || []));
-            this.storyModel = snapshot.story ? JSON.parse(JSON.stringify(snapshot.story)) : null;
             this.setData({
               phase: "diary",
               isRecording: false,
@@ -566,7 +545,6 @@ Page({
     this.transcript = String(diary.transcript || "");
     this.utterances = this.transcript ? [this.transcript] : [];
     this.facts = JSON.parse(JSON.stringify(diary.facts || [])).map(fact => ({ ...fact, active: fact.active !== false }));
-    this.storyModel = diary.story ? JSON.parse(JSON.stringify(diary.story)) : null;
     this.editingDiaryId = diary.id;
     this.editingDiarySavedAt = diary.savedAt;
     this.setData({
@@ -905,20 +883,24 @@ Page({
   },
 
   applyDiaryResponse(data) {
-    const story = data.story?.schemaVersion === 2 ? JSON.parse(JSON.stringify(data.story)) : null;
+    if (Array.isArray(data.facts)) {
+      this.facts = JSON.parse(JSON.stringify(data.facts)).map(fact => ({ ...fact, active: fact.active !== false }));
+    }
     const baseSentences = (data.sentences || []).map(sentence => ({
       id: sentence.id || `sentence_${Date.now()}_${Math.random()}`,
-      sceneId: sentence.sceneId || "",
       text: sentence.text,
-      eventIds: Array.isArray(sentence.eventIds) ? sentence.eventIds : [],
-      sourceSpanIds: Array.isArray(sentence.sourceSpanIds) ? sentence.sourceSpanIds : [],
-      factTexts: [],
-      factIds: [],
-      sourceText: ""
+      factTexts: Array.isArray(sentence.factTexts) ? sentence.factTexts : [],
+      factIds: Array.isArray(sentence.factIds) ? sentence.factIds : [],
+      sourceText: sentence.sourceText || ""
     }));
-    const sentences = enrichSentencesWithEvidence(baseSentences, story);
-    if (story) this.storyModel = story;
-    this.setData({ phase: "diary", isFinishing: false, diaryTitle: data.title || "我的日记", diarySentences: sentences });
+    const sentences = enrichSentencesWithEvidence(baseSentences, this.facts);
+    this.setData({
+      phase: "diary",
+      isFinishing: false,
+      diaryTitle: data.title || "我的日记",
+      diarySentences: sentences,
+      factChips: this.facts.filter(fact => fact.active !== false)
+    });
   },
 
   async saveDiary() {
@@ -931,7 +913,6 @@ Page({
       sentences: JSON.parse(JSON.stringify(this.data.diarySentences)),
       transcript: this.transcript,
       facts: JSON.parse(JSON.stringify(this.facts.filter(fact => fact.active !== false))),
-      story: this.storyModel ? JSON.parse(JSON.stringify(this.storyModel)) : null,
       savedAt
     };
     try {
@@ -960,8 +941,7 @@ Page({
     this.revisionBaseSnapshot = {
       title: this.data.diaryTitle,
       sentences: JSON.parse(JSON.stringify(this.data.diarySentences)),
-      facts: JSON.parse(JSON.stringify(this.facts)),
-      story: this.storyModel ? JSON.parse(JSON.stringify(this.storyModel)) : null
+      facts: JSON.parse(JSON.stringify(this.facts))
     };
     this.setData({ phase: "revise", revisionDisplay: "", isFinishing: false });
     await this.startRecorder("revision");
@@ -981,10 +961,10 @@ Page({
 
   async finishRevision() {
     if (!this.revisionTranscript) { this.finalizeStarted = false; this.setData({ isFinishing: false, revisionDisplay: "刚才没有听清，请再说一次。" }); return; }
-    if (!this.storyModel) {
+    if (!this.facts.length || !this.data.diarySentences.some(sentence => Array.isArray(sentence.factIds) && sentence.factIds.length)) {
       this.finalizeStarted = false;
-      this.setData({ isFinishing: false, revisionDisplay: "这篇旧日记需要先用新版重新口述后才能修改。" });
-      wx.showModal({ title: "旧日记暂不修改", content: "这篇日记没有新版语义事件账本。为避免改错，原文已完整保留。新录制的日记可以直接语音修改。", showCancel: false });
+      this.setData({ isFinishing: false, revisionDisplay: "这篇旧日记缺少事实来源，暂时不能安全修改。" });
+      wx.showModal({ title: "旧日记暂不修改", content: "这篇旧日记没有可核对的事实来源。为避免改错，原文已完整保留；新录制的日记可以直接语音修改。", showCancel: false });
       return;
     }
     try {
@@ -993,12 +973,11 @@ Page({
         title: this.data.diaryTitle,
         sentences: this.data.diarySentences.map(item => ({
           id: item.id,
-          sceneId: item.sceneId,
           text: item.text,
-          eventIds: item.eventIds || [],
-          sourceSpanIds: item.sourceSpanIds || []
+          factIds: item.factIds || [],
+          factTexts: item.factTexts || []
         })),
-        story: this.storyModel
+        facts: this.facts.filter(fact => fact.active !== false)
       });
       if (!result.changed) {
         this.finalizeStarted = false;
@@ -1015,7 +994,6 @@ Page({
     } catch (error) {
       if (this.revisionBaseSnapshot) {
         this.facts = JSON.parse(JSON.stringify(this.revisionBaseSnapshot.facts));
-        this.storyModel = this.revisionBaseSnapshot.story ? JSON.parse(JSON.stringify(this.revisionBaseSnapshot.story)) : null;
         this.setData({
           phase: "diary",
           diaryTitle: this.revisionBaseSnapshot.title,
