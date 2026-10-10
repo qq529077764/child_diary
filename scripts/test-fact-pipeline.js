@@ -14,12 +14,33 @@ const facts = [
   { id: "f3", slot: "what", label: "检查", text: "医生姐姐给我检查身体", quote: "医生姐姐给我检查身体" }
 ];
 
+const auditInput = [
+  { id: "gate", slot: "what", text: "妈妈送我到学校门口", quote: "妈妈送我到学校门口" },
+  { id: "bye", slot: "detail", text: "我跟妈妈说再见", quote: "我跟妈妈说再见" },
+  { id: "doctor", slot: "what", text: "医生姐姐给我检查身体", quote: "医生姐姐给我检查身体" },
+  { id: "read-fragment", slot: "what", text: "我们跟老师在教室里讲了", quote: "我们跟老师在教室里讲了" },
+  { id: "book", slot: "detail", text: "老师讲的绘本是三只小猪", quote: "老师给我们讲的绘本是三只小猪" },
+  { id: "tea", slot: "what", text: "讲完绘本之后吃下午茶", quote: "讲完绘本之后我们吃下午茶" },
+  { id: "noise", slot: "detail", text: "妈妈提醒我自己说", quote: "妈妈提醒我自己说" }
+];
 const audited = applyFactAudit(
-  "我自己穿好衣服。妈妈提醒我自己说。妈妈送我去学校。医生姐姐给我检查身体。",
-  [...facts, { id: "noise", slot: "detail", text: "妈妈提醒我自己说", quote: "妈妈提醒我自己说" }],
-  { excludedFacts: [{ id: "noise", reason: "adult_guidance" }], addedFacts: [] }
+  auditInput.map(fact => fact.quote).join("。"),
+  auditInput,
+  {
+    excludedFacts: [{ id: "noise", reason: "adult_guidance" }],
+    finalFacts: [
+      { sourceFactIds: ["gate", "bye"], slot: "what", label: "到校", text: "妈妈送我到学校门口，我跟妈妈说再见" },
+      { sourceFactIds: ["doctor"], slot: "what", label: "检查", text: "医生姐姐给我检查身体" },
+      { sourceFactIds: ["read-fragment", "book"], slot: "what", label: "讲绘本", text: "老师给我们讲了《三只小猪》的绘本" },
+      { sourceFactIds: ["tea"], slot: "what", label: "下午茶", text: "讲完绘本之后，我们吃下午茶" }
+    ]
+  }
 );
-assert.deepEqual(audited.map(fact => fact.id), ["f1", "f2", "f3"], "最终审计只删除明确标记的无效事实");
+assert.deepEqual(audited.map(fact => fact.id), ["gate", "doctor", "read-fragment", "tea"]);
+assert.equal(audited[0].text, "妈妈送我到学校门口，我跟妈妈说再见", "相邻人物的动作归属不能串换");
+assert.equal(audited[2].text, "老师给我们讲了《三只小猪》的绘本", "同一事件的残片应在事实层合并完整");
+assert.equal(audited[3].text, "讲完绘本之后，我们吃下午茶", "原话中的明确先后关系应保留在事实层");
+assert.deepEqual(audited[2].sourceFactIds, ["read-fragment", "book"]);
 
 const repeatedThen = normalizeComposition({
   title: "上学",
@@ -50,26 +71,24 @@ async function testFinalize() {
     facts
   }, async (messages, options) => {
     stages.push(options.stage);
-    if (options.stage === "audit_final_facts") return { excludedFacts: [], addedFacts: [] };
+    if (options.stage === "audit_final_facts") {
+      return {
+        excludedFacts: [],
+        finalFacts: facts.map(fact => ({ sourceFactIds: [fact.id], slot: fact.slot, label: fact.label, text: fact.text }))
+      };
+    }
     if (options.stage === "compose_fact_diary") {
       return {
         title: "上学的一天",
         sentences: [
-          { text: "然后我自己穿好了衣服。", factIds: ["f1"] },
-          { text: "然后妈妈送我去学校。", factIds: ["f2"] },
-          { text: "然后医生姐姐给我检查身体。", factIds: ["f3"] }
+          { text: "我自己穿好衣服后，妈妈送我去了学校。", factIds: ["f1", "f2"] },
+          { text: "到了学校，医生姐姐给我检查了身体。", factIds: ["f3"] }
         ]
       };
     }
-    return {
-      title: "上学的一天",
-      sentences: [
-        { text: "我自己穿好衣服后，妈妈送我去了学校。", factIds: ["f1", "f2"] },
-        { text: "到了学校，医生姐姐给我检查了身体。", factIds: ["f3"] }
-      ]
-    };
+    throw new Error(`unexpected stage: ${options.stage}`);
   });
-  assert.deepEqual(stages, ["audit_final_facts", "compose_fact_diary", "repair_fact_diary"]);
+  assert.deepEqual(stages, ["audit_final_facts", "compose_fact_diary"], "成文不应再触发整篇二次改写");
   assert.equal((result.sentences.map(sentence => sentence.text).join("").match(/然后/gu) || []).length, 0);
   assert.deepEqual(result.sentences[0].factTexts, ["我自己穿好了衣服", "妈妈送我去学校"]);
   assert.match(result.sentences[0].sourceText, /我自己穿好衣服/);

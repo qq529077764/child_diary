@@ -43,7 +43,14 @@ function fakeModelResponse(messages) {
       segment_role: "child_story"
     };
   }
-  if (joined.includes("审核已抽取事实")) return { excludedFacts: [], addedFacts: [] };
+  if (joined.includes("整理成可直接用于成文")) {
+    return {
+      excludedFacts: [],
+      finalFacts: (payloadWith(messages, "knownFacts").knownFacts || []).map(fact => ({
+        sourceFactIds: [fact.id], slot: fact.slot, label: "已确认事实", text: fact.text
+      }))
+    };
+  }
   if (joined.includes("生成最少且明确的事实操作")) {
     return { operations: [{ type: "replace", targetFactId: "f2", slot: "what", label: "喂小鸟", text: "我喂了好多好多小小的鸟" }] };
   }

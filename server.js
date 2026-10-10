@@ -986,6 +986,7 @@ async function handleFinalize(req, res) {
   console.log("Finalize completed", {
     elapsedMs: Date.now() - startedAt,
     inputFacts: Array.isArray(input.facts) ? input.facts.length : 0,
+    outputFacts: Array.isArray(result.facts) ? result.facts.length : 0,
     outputSentences: Array.isArray(result.sentences) ? result.sentences.length : 0
   });
   sendJson(res, 200, { ...result, provider: qwenConfig().apiKey ? "qwen" : "local" });
