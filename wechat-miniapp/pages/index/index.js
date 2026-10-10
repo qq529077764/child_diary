@@ -765,8 +765,7 @@ Page({
       latestText: this.tail(this.transcript, 86),
       transcriptAnchorId: `transcript_end_${this.transcriptAnchorSequence}`
     });
-    if (/(我)?说完(了|啦)?|讲完(了|啦)?/.test(text) && !this.data.isFinishing) this.finishStory();
-    else this.analyzeRealtime();
+    this.analyzeRealtime();
   },
 
   appendText(base, addition) {

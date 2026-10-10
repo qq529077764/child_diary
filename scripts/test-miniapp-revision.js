@@ -55,6 +55,16 @@ async function run() {
   assert.equal(typeof privacyHandler, "function", "小程序应接入微信隐私授权回调");
   privacyPage.onUnload();
 
+  const listeningPage = createPage();
+  let finishCalls = 0;
+  let analyzeCalls = 0;
+  listeningPage.finishStory = () => { finishCalls += 1; };
+  listeningPage.analyzeRealtime = () => { analyzeCalls += 1; };
+  listeningPage.acceptTranscript("讲完绘本之后我们吃下午茶", "story");
+  listeningPage.acceptTranscript("我说完了今天在学校发生的事情", "story");
+  assert.equal(finishCalls, 0, "口述内容无论包含讲完或说完都不能自动开始整理");
+  assert.equal(analyzeCalls, 2, "只有点击我说完啦才能结束，普通口述必须继续分析");
+
   const page = createPage();
   const restored = page.presentDiary({
     id: "diary_new",
