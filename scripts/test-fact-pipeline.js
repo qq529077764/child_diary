@@ -95,13 +95,29 @@ async function testFinalize() {
 }
 
 function testRevisionOperations() {
-  const result = applyRevisionOperations(facts, [
-    { type: "replace", targetFactId: "f3", slot: "what", text: "医生姐姐给我量了身高", label: "量身高" },
-    { type: "add", slot: "feeling", text: "我很开心", label: "心情", afterFactId: "f3" }
-  ], "医生姐姐不是检查身体，是给我量了身高，我很开心");
+  const bookFacts = [
+    ...facts,
+    { id: "book", slot: "what", label: "讲绘本", text: "老师给我们讲了《三只小猪》的绘本", quote: "老师给我们讲的绘本是三只小猪" }
+  ];
+  const result = applyRevisionOperations(bookFacts, [
+    { type: "correct", targetFactId: "f3", oldText: "给我检查身体", newText: "给我量了身高", label: "量身高" },
+    { type: "add_detail", targetFactId: "book", slot: "detail", text: "老师在教室里给我们讲绘本", label: "讲绘本地点" },
+    { type: "add_fact", slot: "feeling", text: "我很开心", label: "心情", afterFactId: "book" }
+  ], "医生姐姐不是给我检查身体，是给我量了身高；老师在教室里给我们讲绘本；我很开心");
   assert.equal(result.facts.find(fact => fact.id === "f3").text, "医生姐姐给我量了身高");
-  assert.equal(result.facts.at(-1).text, "我很开心");
-  assert.equal(result.operations.length, 2);
+  assert.equal(result.facts.find(fact => fact.id === "book").text, "老师给我们讲了《三只小猪》的绘本", "补充地点不能覆盖原事实中的绘本名称");
+  assert.equal(result.facts.some(fact => fact.text === "老师在教室里给我们讲绘本"), true);
+  assert.equal(result.facts.some(fact => fact.text === "我很开心"), true);
+  assert.equal(result.operations.length, 3);
+
+  const unsafeWholeReplacement = applyRevisionOperations([bookFacts.at(-1)], [{
+    type: "correct",
+    targetFactId: "book",
+    oldText: "老师给我们讲了《三只小猪》的绘本",
+    newText: "老师讲了绘本"
+  }], "老师讲了绘本");
+  assert.equal(unsafeWholeReplacement.operations.length, 0, "局部纠正不能退化成整条事实覆盖");
+  assert.equal(unsafeWholeReplacement.facts[0].text, "老师给我们讲了《三只小猪》的绘本");
 }
 
 async function testRevision() {
@@ -116,7 +132,7 @@ async function testRevision() {
     sentences: currentSentences
   }, async (messages, options) => {
     if (options.stage === "parse_fact_revision") {
-      return { operations: [{ type: "replace", targetFactId: "f3", slot: "what", label: "量身高", text: "医生姐姐给我量了身高" }] };
+      return { operations: [{ type: "correct", targetFactId: "f3", oldText: "给我检查身体", newText: "给我量了身高", slot: "what", label: "量身高" }] };
     }
     return {
       title: "上学的一天",

@@ -51,7 +51,7 @@ function fakeModelResponse(messages) {
     };
   }
   if (joined.includes("生成最少且明确的事实操作")) {
-    return { operations: [{ type: "replace", targetFactId: "f2", slot: "what", label: "喂小鸟", text: "我喂了好多好多小小的鸟" }] };
+    return { operations: [{ type: "correct", targetFactId: "f2", oldText: "鸽子", newText: "小小的鸟", slot: "what", label: "喂小鸟" }] };
   }
   if (joined.includes("根据finalFacts和instruction")) {
     return {
