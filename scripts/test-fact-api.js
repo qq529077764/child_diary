@@ -45,7 +45,6 @@ function fakeModelResponse(messages) {
   }
   if (joined.includes("整理成可直接用于成文")) {
     return {
-      excludedFacts: [],
       finalFacts: (payloadWith(messages, "knownFacts").knownFacts || []).map(fact => ({
         sourceFactIds: [fact.id], slot: fact.slot, label: "已确认事实", text: fact.text
       }))

@@ -21,13 +21,13 @@ const auditInput = [
   { id: "read-fragment", slot: "what", text: "我们跟老师在教室里讲了", quote: "我们跟老师在教室里讲了" },
   { id: "book", slot: "detail", text: "老师讲的绘本是三只小猪", quote: "老师给我们讲的绘本是三只小猪" },
   { id: "tea", slot: "what", text: "讲完绘本之后吃下午茶", quote: "讲完绘本之后我们吃下午茶" },
+  { id: "loose", slot: "detail", text: "我们说了", quote: "我们说了" },
   { id: "noise", slot: "detail", text: "妈妈提醒我自己说", quote: "妈妈提醒我自己说" }
 ];
 const audited = applyFactAudit(
   auditInput.map(fact => fact.quote).join("。"),
   auditInput,
   {
-    excludedFacts: [{ id: "noise", reason: "adult_guidance" }],
     finalFacts: [
       { sourceFactIds: ["gate", "bye"], slot: "what", label: "到校", text: "妈妈送我到学校门口，我跟妈妈说再见" },
       { sourceFactIds: ["doctor"], slot: "what", label: "检查", text: "医生姐姐给我检查身体" },
@@ -41,6 +41,7 @@ assert.equal(audited[0].text, "妈妈送我到学校门口，我跟妈妈说再�
 assert.equal(audited[2].text, "老师给我们讲了《三只小猪》的绘本", "同一事件的残片应在事实层合并完整");
 assert.equal(audited[3].text, "讲完绘本之后，我们吃下午茶", "原话中的明确先后关系应保留在事实层");
 assert.deepEqual(audited[2].sourceFactIds, ["read-fragment", "book"]);
+assert.equal(audited.some(fact => fact.id === "loose" || fact.id === "noise"), false, "不完整片段和无效收音不必进入正文事实");
 
 const repeatedThen = normalizeComposition({
   title: "上学",
@@ -73,7 +74,6 @@ async function testFinalize() {
     stages.push(options.stage);
     if (options.stage === "audit_final_facts") {
       return {
-        excludedFacts: [],
         finalFacts: facts.map(fact => ({ sourceFactIds: [fact.id], slot: fact.slot, label: fact.label, text: fact.text }))
       };
     }
