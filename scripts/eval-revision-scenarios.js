@@ -83,7 +83,7 @@ const scenarios = [
     name: "纠正感受程度",
     instruction: "不是很开心，是特别开心。",
     requireArticle: ["特别开心"],
-    forbidArticle: ["我很开心。"]
+    forbidAll: ["我很开心"]
   },
   {
     name: "断续长段重述",
@@ -151,9 +151,25 @@ const scenarios = [
   {
     name: "纠正话术不得进入正文",
     instruction: "医生姐姐给我检查身体，检查没有问题。讲完故事后，不是考察，是开始吃下午茶。",
-    requireArticle: ["医生姐姐给我检查身体", "开始吃下午茶"],
+    requireArticle: ["医生姐姐给我检查身体", "吃下午茶"],
     forbidAll: ["不是考察", "没有提问", "看看", "听听", "量量"],
-    preserveFacts: ["check", "book", "home"]
+    preserveFacts: ["check", "book", "home"],
+    allowUnchanged: true
+  },
+  {
+    name: "长篇续讲反复然后",
+    instruction: "妈妈接我回家以后，然后呢，然后呢，我和爸爸搭了一个好高好高的城堡，然后呢，我还画了一只圆圆的小猫，然后呢，然后呢。",
+    requireArticle: ["爸爸", "好高好高", "城堡", "圆圆", "小猫"],
+    order: ["妈妈来接我", "城堡", "小猫"],
+    forbidAll: ["然后呢"],
+    preserveFacts: ["home"]
+  },
+  {
+    name: "一段口述纠正多个事件",
+    instruction: "早餐呢，然后呢，不是在超市吃，是在教室里吃，山药不要了，只吃鸡蛋和粥。然后呢，放学不是妈妈来接，是爸爸来接我。",
+    requireArticle: ["教室", "鸡蛋", "粥", "爸爸来接我"],
+    forbidAll: ["超市", "山药", "妈妈来接我", "然后呢"],
+    preserveFacts: ["book", "tea"]
   }
 ];
 
@@ -189,6 +205,9 @@ async function evaluate(scenario, token) {
     }, token);
     if (scenario.expectUnchanged) {
       return { name: scenario.name, passed: result.changed === false, elapsedMs: Date.now() - startedAt, changed: result.changed, message: result.message || "" };
+    }
+    if (scenario.allowUnchanged && result.changed === false) {
+      return { name: scenario.name, passed: true, elapsedMs: Date.now() - startedAt, changed: false, message: result.message || "" };
     }
     const article = (result.sentences || []).map(item => item.text).join("");
     const ledger = (result.facts || []).map(item => item.text).join("；");

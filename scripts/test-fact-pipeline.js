@@ -5,7 +5,8 @@ const {
   compositionIssues,
   finalizeFactDiary,
   normalizeComposition,
-  reviseFactDiary
+  reviseFactDiary,
+  sanitizeRevisionChanges
 } = require("../lib/fact-pipeline");
 
 const facts = [
@@ -60,6 +61,41 @@ assert.equal(new Set(splitEventFacts.map(fact => fact.id)).size, 4, "拆分后�
 assert.deepEqual(splitEventFacts.map(fact => fact.eventKey), ["跳绳", "跳绳", "跳绳", "跳绳"]);
 assert.deepEqual(splitEventFacts.map(fact => fact.slot), ["what", "detail", "detail", "feeling"]);
 assert.equal(splitEventFacts.every(fact => fact.sourceFactIds[0] === "jump-all"), true, "拆分事实必须共同指回原始证据");
+
+const sanitizedDeletion = sanitizeRevisionChanges({
+  changes: [{
+    mode: "replace",
+    targetFactIds: ["morning"],
+    facts: [{ text: "穿好衣服" }, { text: "背好书包" }, { text: "早上我很早起床" }]
+  }]
+}, "不要写我起得很早，穿衣服和背书包要保留。", [{ id: "morning", text: "早上我很早起床，穿好衣服，背好书包" }]);
+assert.deepEqual(sanitizedDeletion.changes[0].facts.map(fact => fact.text), ["穿好衣服", "背好书包"], "被否定的旧描述不能被模型重新带回修改事实");
+
+const sanitizedCorrection = sanitizeRevisionChanges({
+  changes: [{ mode: "insert", insertAfterFactId: "home", facts: [{ text: "放学后妈妈来接我" }, { text: "特别开心" }] }]
+}, "不是很开心，是特别开心。", [{ id: "home", text: "放学后妈妈来接我" }, { id: "feeling", text: "我很开心" }]);
+assert.equal(sanitizedCorrection.changes[0].mode, "replace", "旧事件的纠正不能作为重复新增插入");
+assert.deepEqual(sanitizedCorrection.changes[0].targetFactIds, ["feeling"]);
+assert.deepEqual(sanitizedCorrection.changes[0].facts.map(fact => fact.text), ["特别开心"]);
+
+const retargetedCorrection = sanitizeRevisionChanges({
+  changes: [{ mode: "replace", targetFactIds: ["home"], facts: [{ text: "放学后妈妈来接我" }, { text: "特别开心" }] }]
+}, "不是很开心，是特别开心。", [{ id: "home", text: "放学后妈妈来接我" }, { id: "feeling", text: "我很开心" }]);
+assert.equal(retargetedCorrection.changes[0].mode, "replace", "模型选错修改目标时仍应保持替换语义");
+assert.deepEqual(retargetedCorrection.changes[0].targetFactIds, ["feeling"], "用于定位的旧上下文不能成为修改目标");
+assert.deepEqual(retargetedCorrection.changes[0].facts.map(fact => fact.text), ["特别开心"], "用于定位的旧上下文不能重复写回文章");
+
+const wronglyTargetedCorrection = sanitizeRevisionChanges({
+  changes: [{ mode: "replace", targetFactIds: ["home"], facts: [{ text: "特别开心" }] }]
+}, "不是很开心，是特别开心。", [{ id: "home", text: "放学后妈妈来接我" }, { id: "feeling", text: "我很开心" }]);
+assert.deepEqual(wronglyTargetedCorrection.changes[0].targetFactIds, ["feeling"], "纠正内容与原目标不相干时应按语义冲突重新定位");
+
+const additiveExpansion = sanitizeRevisionChanges({
+  changes: [{ mode: "replace", targetFactIds: ["book"], facts: [{ text: "午睡起来后，老师在教室里给我们讲了《三只小猪》的绘本" }] }]
+}, "老师是在教室里给我们讲绘本的。", [{ id: "book", text: "午睡起来后，老师给我们讲了《三只小猪》的绘本" }]);
+assert.equal(additiveExpansion.changes[0].mode, "replace");
+assert.deepEqual(additiveExpansion.changes[0].targetFactIds, ["book"]);
+assert.equal(additiveExpansion.changes[0].facts.length, 1, "给旧事件补充新描述时不能被当成旧内容重复而丢掉");
 
 const repeatedThen = normalizeComposition({
   title: "上学",
@@ -165,9 +201,19 @@ function testRevisionPlan() {
     message: "请说清楚想改哪件事"
   }, "前面改一下", "我的日记");
   assert.equal(vague.changed, false);
+
+  const incompleteComposition = applyRevisionPlan(bookFacts, bookSentences, {
+    mode: "replace",
+    targetSentenceIds: ["s_book"],
+    facts: [{ key: "book", slot: "what", label: "讲绘本", text: "老师讲了《小红帽》的绘本" }],
+    sentences: []
+  }, "绘本改成小红帽", "我的日记");
+  assert.equal(incompleteComposition.changed, false, "局部成文遗漏时不能把原句误当作删除");
+  assert.deepEqual(incompleteComposition.sentences, undefined);
 }
 
 async function testRevision() {
+  const stages = [];
   const currentSentences = [
     { id: "s1", text: "我自己穿好衣服后，妈妈送我去了学校。", factIds: ["f1", "f2"] },
     { id: "s2", text: "到了学校，医生姐姐给我检查了身体。", factIds: ["f3"] }
@@ -178,15 +224,36 @@ async function testRevision() {
     facts,
     sentences: currentSentences
   }, async (messages, options) => {
-    return {
-      additions: [],
-      rewrites: [{
-        targetSentenceIds: ["s2"],
-        facts: [{ key: "check", slot: "what", label: "量身高", text: "医生姐姐给我量了身高" }],
-        sentences: [{ text: "到了学校，医生姐姐给我量了身高。", factKeys: ["check"] }]
-      }]
-    };
+    stages.push(options.stage);
+    if (options.stage === "revise_semantic_changes") {
+      return {
+        changes: [{
+          mode: "replace",
+          targetFactIds: ["f3"],
+          facts: [{ eventKey: "到校检查", slot: "what", label: "量身高", text: "医生姐姐给我量了身高" }]
+        }]
+      };
+    }
+    if (options.stage === "verify_revision_changes") {
+      return {
+        changes: [{
+          mode: "replace",
+          targetFactIds: ["f3"],
+          facts: [{ eventKey: "到校检查", slot: "what", label: "量身高", text: "医生姐姐给我量了身高" }]
+        }]
+      };
+    }
+    if (options.stage === "compose_revision_changes") {
+      return {
+        operations: [{
+          key: "operation_1",
+          sentences: [{ text: "到了学校，医生姐姐给我量了身高。", factKeys: ["new_1_1"] }]
+        }]
+      };
+    }
+    throw new Error(`unexpected stage: ${options.stage}`);
   });
+  assert.deepEqual(stages, ["revise_semantic_changes", "verify_revision_changes", "compose_revision_changes"], "修改必须先确定语义变化、复核事实，再单独完成局部成文");
   assert.equal(result.changed, true);
   assert.equal(result.facts.find(fact => fact.id === "f3").text, "医生姐姐给我量了身高");
   assert.equal(result.sentences[0].text, currentSentences[0].text);
@@ -194,7 +261,48 @@ async function testRevision() {
   assert.match(result.sentences[1].text, /量了身高/);
 }
 
-Promise.all([testFinalize(), testRevision()]).then(() => {
+async function testLongRevisionRecovery() {
+  const localFacts = [
+    { id: "home", slot: "what", label: "接我", text: "放学后妈妈来接我", quote: "放学后妈妈来接我" },
+    { id: "feeling", slot: "feeling", label: "开心", text: "我很开心", quote: "我很开心" }
+  ];
+  const localSentences = [
+    { id: "s_home", text: "放学后妈妈来接我。", factIds: ["home"] },
+    { id: "s_feeling", text: "我很开心。", factIds: ["feeling"] }
+  ];
+  const result = await reviseFactDiary({
+    instruction: "妈妈接我回家以后，然后呢，我和爸爸搭了一个好高好高的城堡，然后呢，我还画了一只圆圆的小猫。",
+    title: "开心的一天",
+    facts: localFacts,
+    sentences: localSentences
+  }, async (messages, options) => {
+    if (["revise_semantic_changes", "verify_revision_changes"].includes(options.stage)) {
+      return {
+        changes: [{
+          mode: "insert",
+          insertAfterFactId: "home",
+          facts: [{ eventKey: "搭城堡", slot: "what", label: "搭城堡", text: "我和爸爸搭了一个好高好高的城堡" }]
+        }]
+      };
+    }
+    if (options.stage === "compose_revision_changes") {
+      const payload = JSON.parse(messages[messages.length - 1].content);
+      assert.equal(payload.operations.length, 2, "语义复核仍遗漏的完整新事件必须从原话证据中恢复");
+      return {
+        operations: [
+          { key: "operation_1", sentences: [{ text: "我和爸爸搭了一个好高好高的城堡。", factKeys: ["new_1_1"] }] },
+          { key: "operation_2", sentences: [{ text: "我还画了一只圆圆的小猫。", factKeys: ["new_2_1"] }] }
+        ]
+      };
+    }
+    throw new Error(`unexpected stage: ${options.stage}`);
+  });
+  const article = result.sentences.map(sentence => sentence.text).join("");
+  assert.match(article, /妈妈来接我.*好高好高的城堡.*圆圆的小猫/u);
+  assert.equal((article.match(/然后呢/gu) || []).length, 0);
+}
+
+Promise.all([testFinalize(), testRevision(), testLongRevisionRecovery()]).then(() => {
   testRevisionPlan();
   console.log("fact pipeline regression: ok");
 }).catch(error => {

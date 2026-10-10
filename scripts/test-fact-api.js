@@ -72,16 +72,29 @@ function fakeModelResponse(messages) {
       }))
     };
   }
-  if (joined.includes("分别返回新增内容")) {
+  if (joined.includes("原子化的事实变更计划")) {
     return {
-      additions: [],
-      rewrites: [{
-        targetSentenceIds: ["s1"],
-        facts: [
-          { key: "park", slot: "what", label: "去公园", text: "我和妈妈去了公园" },
-          { key: "feed", slot: "what", label: "喂小鸟", text: "我喂了好多好多小小的鸟" }
-        ],
-        sentences: [{ text: "我和妈妈去了公园，那里有好多好多小小的鸟，我还喂了它们。", factKeys: ["park", "feed"] }]
+      changes: [{
+        mode: "replace",
+        targetFactIds: ["f2"],
+        facts: [{ eventKey: "喂鸟", slot: "what", label: "喂小鸟", text: "我喂了好多好多小小的鸟" }]
+      }]
+    };
+  }
+  if (joined.includes("复核proposedChanges")) {
+    return {
+      changes: [{
+        mode: "replace",
+        targetFactIds: ["f2"],
+        facts: [{ eventKey: "喂鸟", slot: "what", label: "喂小鸟", text: "我喂了好多好多小小的鸟" }]
+      }]
+    };
+  }
+  if (joined.includes("分别为每个operation写局部替换句")) {
+    return {
+      operations: [{
+        key: "operation_1",
+        sentences: [{ text: "我和妈妈去了公园，那里有好多好多小小的鸟，我还喂了它们。", factKeys: ["kept_1_1", "new_1_1"] }]
       }]
     };
   }
