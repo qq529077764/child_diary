@@ -36,6 +36,28 @@ function fakeModelResponse(messages) {
   const joined = messages.map(message => message.content).join("\n");
   const payload = lastPayload(messages);
   if (joined.includes('"current_text"')) {
+    if (payload.recent_text === "然后呢，然后呢。") {
+      return {
+        facts: [],
+        decision: { action: "keep_listening", reason: "non_story_audio", question: "", target_key: "", question_status: "none" },
+        speech_quality: "coherent",
+        segment_role: "adult_guidance"
+      };
+    }
+    if (payload.recent_text?.includes("我今天起床了，然后呢")) {
+      return {
+        facts: [
+          { slot: "what", label: "起床", text: "我今天起床了", quote: "我今天起床了，然后呢", source_role: "child_story", story_relation: "main" },
+          { slot: "what", label: "穿衣服", text: "我穿好了衣服", quote: "然后呢，我穿好了衣服", source_role: "child_story", story_relation: "main" },
+          { slot: "what", label: "带书包", text: "我带好了书包", quote: "带好了书包，然后呢", source_role: "child_story", story_relation: "main" },
+          { slot: "what", label: "沙池运动", text: "我去了沙池运动", quote: "然后呢就去了沙池运动", source_role: "child_story", story_relation: "main" },
+          { slot: "what", label: "看书", text: "我去了看书", quote: "我去了看书，然后呢", source_role: "child_story", story_relation: "main" }
+        ],
+        decision: { action: "ask_followup", reason: "missing_feeling", question: "去沙池运动时，你是什么感觉呀？", target_key: "去沙池运动", question_status: "none" },
+        speech_quality: "coherent",
+        segment_role: "adult_guidance"
+      };
+    }
     return {
       facts: [{ slot: "what", label: "去公园", text: "我和妈妈去了公园", quote: "我和妈妈去了公园", source_role: "child_story", story_relation: "main" }],
       decision: { action: "ask_followup", reason: "missing_result", question: "到了那里以后，你做了什么呀？", target_key: "我和妈妈去了公园", question_status: "none" },
@@ -148,6 +170,17 @@ async function run() {
     ];
     const realtime = await request("/api/analyze", "POST", { text: transcript, recentText: transcript, existingFacts: [], previousQuestions: [], previousQuestionKeys: [] }, token);
     assert.equal(realtime.response.status, 200, JSON.stringify(realtime.body));
+    const repeatedThen = "我今天起床了，然后呢，我穿好了衣服，带好了书包，然后呢就去了沙池运动，我去了看书，然后呢。";
+    const repeatedThenResult = await request("/api/analyze", "POST", {
+      text: repeatedThen, recentText: repeatedThen, existingFacts: [], previousQuestions: [], previousQuestionKeys: []
+    }, token);
+    assert.equal(repeatedThenResult.response.status, 200, JSON.stringify(repeatedThenResult.body));
+    assert.deepEqual(repeatedThenResult.body.facts.map(fact => fact.text), ["我今天起床了", "我穿好了衣服", "我带好了书包", "我去了沙池运动", "我去了看书"]);
+    const guidanceOnly = await request("/api/analyze", "POST", {
+      text: "然后呢，然后呢。", recentText: "然后呢，然后呢。", existingFacts: [], previousQuestions: [], previousQuestionKeys: []
+    }, token);
+    assert.equal(guidanceOnly.response.status, 200, JSON.stringify(guidanceOnly.body));
+    assert.deepEqual(guidanceOnly.body.facts, []);
     const draft = await request("/api/finalize", "POST", { transcript, facts }, token);
     assert.equal(draft.response.status, 200, JSON.stringify(draft.body));
     assert.match(processOutput, /Qwen stage retry/, "模型首次返回截断JSON时必须自动重试");

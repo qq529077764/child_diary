@@ -19,6 +19,8 @@ assert.match(handlerBlock("handleCompose"), /legacy_compose_removed/, "旧成文
 assert.equal(miniapp.includes('request("/api/compose"'), false, "小程序不得调用旧成文接口");
 assert.equal(miniapp.includes("storyModel"), false, "客户端不得继续维护语义事件账本");
 assert.equal(miniapp.includes("semanticFactText"), false, "客户端不得机械拼装对应事实");
+assert.match(miniapp, /analysisQueue\.push/, "每段识别文字都必须进入事实分析队列");
+assert.doesNotMatch(miniapp, /analysisPending|latestSegmentText/, "不得用单个待处理标记覆盖中间录音片段");
 assert.match(pipeline, /全文‘然后’原则上不超过一次/, "成文规则必须处理重复然后");
 assert.doesNotMatch(pipeline, /simpleEventSentence|normalizeRepeatedThen|compositionPenalty/, "不得保留旧的机械拼句和替词逻辑");
 assert.equal(fs.existsSync(path.join(root, "lib/semantic-pipeline.js")), false, "旧语义成文模块必须删除");

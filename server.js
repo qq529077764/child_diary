@@ -450,20 +450,10 @@ function looksLikeNoise(text) {
 function looksLikeNarrationControl(text) {
   const value = String(text || "").replace(/[\s，。！？、,.!?]/g, "");
   if (!value) return false;
-  return /(然后呢|还有呢|接着说|继续说|你说呀|你自己说|你先说|直接说你的)/u.test(value) ||
-    /(还有|有没有).{0,8}(什么|事情|内容).{0,8}(没说|要说|忘了说)/u.test(value) ||
-    /(事情|故事).{0,6}(说完|讲完|完了)/u.test(value) ||
-    /为什么.{0,8}(提醒|不说|还不说)/u.test(value);
-}
-
-function hasConcreteStorySignal(text) {
-  return /(去了|来到|参观|看到|遇到|吃了|喝了|玩了|做了|帮助|买了|坐了|爬了|滑了|跑了|走了|学了|读了|画了|搭了|回家|上学|放学|睡觉|洗澡|比赛)/u.test(String(text || ""));
-}
-
-function isLikelyNarrationControlFact(fact, recentText) {
-  if (!looksLikeNarrationControl(recentText)) return false;
-  const combined = `${fact?.text || ""}${fact?.quote || ""}`;
-  return !hasConcreteStorySignal(combined);
+  return /^(?:(?:然后呢|还有呢|接着说|继续说|你说呀|你自己说|你先说|直接说你的))+$/u.test(value) ||
+    /^(?:还有|有没有).{0,8}(?:什么|事情|内容).{0,8}(?:没说|要说|忘了说)$/u.test(value) ||
+    /^(?:事情|故事).{0,6}(?:说完|讲完|完了)$/u.test(value) ||
+    /^为什么.{0,8}(?:提醒|不说|还不说)$/u.test(value);
 }
 
 function isUsableDiaryFact(fact) {
@@ -662,7 +652,9 @@ async function analyzeWithQwen(input) {
   const recentText = input.recentText || input.text || "";
   const quality = result.speech_quality || "coherent";
   const segmentRole = result.segment_role || "child_story";
-  if (["adult_guidance", "background_audio", "meta_speech"].includes(segmentRole)) {
+  let candidateFacts = Array.isArray(result.facts) ? result.facts : [];
+  const hasChildStoryFact = candidateFacts.some(fact => fact?.source_role === "child_story");
+  if (["adult_guidance", "background_audio", "meta_speech"].includes(segmentRole) && !hasChildStoryFact) {
     return {
       facts: [],
       decision: { action: "keep_listening", reason: "non_story_audio", question: "", question_status: input.currentQuestion ? "pending" : "none" },
@@ -683,13 +675,11 @@ async function analyzeWithQwen(input) {
     };
   }
   const existingFacts = Array.isArray(input.existingFacts) ? input.existingFacts : [];
-  let candidateFacts = Array.isArray(result.facts) ? result.facts : [];
   const supportedSlots = new Set(["what", "detail", "feeling", "result", "raw"]);
   const facts = dedupeSemanticFacts(removeAggregateDuplicateFacts(candidateFacts
     .filter(fact => fact && fact.slot && fact.text)
     .filter(fact => !fact.source_role || fact.source_role === "child_story")
     .filter(fact => !fact.story_relation || ["main", "related", "new_explicit_event"].includes(fact.story_relation))
-    .filter(fact => !isLikelyNarrationControlFact(fact, recentText))
     .map(fact => supportedSlots.has(fact.slot) ? fact : { ...fact, slot: "detail" })
     .filter(isUsableDiaryFact)
     .filter(fact => !existingFacts.some(existing =>

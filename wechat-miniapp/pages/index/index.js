@@ -151,9 +151,8 @@ Page({
     this.finalizeStarted = false;
     this.segmentActive = false;
     this.analysisRunning = false;
-    this.analysisPending = false;
+    this.analysisQueue = [];
     this.analysisPromise = null;
-    this.latestSegmentText = "";
     this.revisionBaseSnapshot = null;
     this.editingDiaryId = null;
     this.editingDiarySavedAt = null;
@@ -758,8 +757,16 @@ Page({
       this.setData({ revisionDisplay: `我听到：${this.tail(this.revisionTranscript, 72)}` });
       return;
     }
-    this.latestSegmentText = text;
     this.transcript = this.appendText(this.transcript, text);
+    this.analysisQueue.push({
+      recentText: text,
+      transcriptSnapshot: this.transcript,
+      currentQuestion: this.currentQuestion ? { ...this.currentQuestion } : null,
+      questionTranscriptLength: this.questionTranscriptLength,
+      previousQuestions: this.questions.slice(),
+      previousQuestionKeys: this.questionKeys.slice(),
+      followupCount: this.followupCount
+    });
     this.transcriptAnchorSequence += 1;
     this.setData({
       latestText: this.tail(this.transcript, 86),
@@ -778,18 +785,20 @@ Page({
   tail(text, length) { return text.length > length ? `…${text.slice(-length)}` : text; },
 
   analyzeRealtime() {
-    if (this.analysisRunning) { this.analysisPending = true; return this.analysisPromise; }
+    if (this.analysisRunning) return this.analysisPromise;
+    const pending = this.analysisQueue.shift();
+    if (!pending) return Promise.resolve();
     this.analysisRunning = true;
     const runtimeToken = this.runtimeToken;
-    const transcriptSnapshot = this.transcript;
+    const transcriptSnapshot = pending.transcriptSnapshot;
     const request = this.request("/api/analyze", {
-      text: transcriptSnapshot, recentText: this.latestSegmentText || transcriptSnapshot, realtime: true,
+      text: transcriptSnapshot, recentText: pending.recentText, realtime: true,
       existingFacts: this.facts.map(({ slot, label, text, quote }) => ({ slot, label, text, quote })),
-      currentQuestion: this.currentQuestion,
-      answerTextSinceQuestion: this.currentQuestion ? transcriptSnapshot.slice(this.questionTranscriptLength) : "",
-      previousQuestions: this.questions,
-      previousQuestionKeys: this.questionKeys,
-      followupCount: this.followupCount,
+      currentQuestion: pending.currentQuestion,
+      answerTextSinceQuestion: pending.currentQuestion ? transcriptSnapshot.slice(pending.questionTranscriptLength) : "",
+      previousQuestions: pending.previousQuestions,
+      previousQuestionKeys: pending.previousQuestionKeys,
+      followupCount: pending.followupCount,
       maxFollowups: 50
     }).then(data => {
       if (runtimeToken !== this.runtimeToken) return;
@@ -814,7 +823,7 @@ Page({
     }).catch(() => {}).finally(() => {
       if (runtimeToken !== this.runtimeToken) return;
       this.analysisRunning = false;
-      if (this.analysisPending) { this.analysisPending = false; this.analyzeRealtime(); }
+      if (this.analysisQueue.length) this.analyzeRealtime();
     });
     this.analysisPromise = request;
     return request;
@@ -828,9 +837,9 @@ Page({
   },
 
   async waitForRealtimeAnalysis() {
-    while (this.analysisRunning || this.analysisPending) {
+    while (this.analysisRunning || this.analysisQueue.length) {
       try { await this.analysisPromise; } catch (error) {}
-      if (this.analysisRunning || this.analysisPending) await new Promise(resolve => setTimeout(resolve, 40));
+      if (this.analysisRunning || this.analysisQueue.length) await new Promise(resolve => setTimeout(resolve, 40));
     }
   },
 
