@@ -147,6 +147,13 @@ const scenarios = [
     order: ["画了一幅画", "小红帽"],
     forbidAll: ["三只小猪"],
     preserveFacts: ["tea"]
+  },
+  {
+    name: "纠正话术不得进入正文",
+    instruction: "医生姐姐给我检查身体，检查没有问题。讲完故事后，不是考察，是开始吃下午茶。",
+    requireArticle: ["医生姐姐给我检查身体", "开始吃下午茶"],
+    forbidAll: ["不是考察", "没有提问", "看看", "听听", "量量"],
+    preserveFacts: ["check", "book", "home"]
   }
 ];
 
