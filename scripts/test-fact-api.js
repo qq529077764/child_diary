@@ -50,13 +50,17 @@ function fakeModelResponse(messages) {
       }))
     };
   }
-  if (joined.includes("生成最少且明确的事实操作")) {
-    return { operations: [{ type: "correct", targetFactId: "f2", oldText: "鸽子", newText: "小小的鸟", slot: "what", label: "喂小鸟" }] };
-  }
-  if (joined.includes("根据finalFacts和instruction")) {
+  if (joined.includes("分别返回新增内容")) {
     return {
-      title: "公园日记",
-      sentences: [{ id: "s1", text: "我和妈妈去了公园，那里有好多好多小小的鸟，我还喂了它们。", factIds: ["f1", "f2"] }]
+      additions: [],
+      rewrites: [{
+        targetSentenceIds: ["s1"],
+        facts: [
+          { key: "park", slot: "what", label: "去公园", text: "我和妈妈去了公园" },
+          { key: "feed", slot: "what", label: "喂小鸟", text: "我喂了好多好多小小的鸟" }
+        ],
+        sentences: [{ text: "我和妈妈去了公园，那里有好多好多小小的鸟，我还喂了它们。", factKeys: ["park", "feed"] }]
+      }]
     };
   }
   if (joined.includes("把finalFacts组织")) {

@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const {
   applyFactAudit,
-  applyRevisionOperations,
+  applyRevisionPlan,
   compositionIssues,
   finalizeFactDiary,
   normalizeComposition,
@@ -65,6 +65,12 @@ const imperfectLedgerIssues = compositionIssues(imperfectLedger, facts);
 assert.equal(imperfectLedgerIssues.hardIssues.length, 0, "事实ID漏标不能把已经生成的文章整篇判失败");
 assert.equal(imperfectLedgerIssues.softIssues.some(issue => issue.type === "unmapped_facts"), true);
 
+const harmlessUnknownBinding = normalizeComposition({
+  title: "上学",
+  sentences: [{ text: "妈妈送我去学校。", factIds: ["f2", "model_extra_id"] }]
+}, facts);
+assert.equal(compositionIssues(harmlessUnknownBinding, facts).hardIssues.length, 0, "模型多返回的无效事实编号不能让正文整篇失败");
+
 async function testFinalize() {
   const stages = [];
   const result = await finalizeFactDiary({
@@ -94,30 +100,53 @@ async function testFinalize() {
   assert.match(result.sentences[0].sourceText, /我自己穿好衣服/);
 }
 
-function testRevisionOperations() {
+function testRevisionPlan() {
   const bookFacts = [
-    ...facts,
-    { id: "book", slot: "what", label: "讲绘本", text: "老师给我们讲了《三只小猪》的绘本", quote: "老师给我们讲的绘本是三只小猪" }
+    { id: "book", slot: "what", label: "讲绘本", text: "老师给我们讲了《三只小猪》的绘本", quote: "老师给我们讲的绘本是三只小猪" },
+    { id: "tea", slot: "what", label: "下午茶", text: "讲完绘本后吃下午茶", quote: "讲完绘本后吃下午茶" }
   ];
-  const result = applyRevisionOperations(bookFacts, [
-    { type: "correct", targetFactId: "f3", oldText: "给我检查身体", newText: "给我量了身高", label: "量身高" },
-    { type: "add_detail", targetFactId: "book", slot: "detail", text: "老师在教室里给我们讲绘本", label: "讲绘本地点" },
-    { type: "add_fact", slot: "feeling", text: "我很开心", label: "心情", afterFactId: "book" }
-  ], "医生姐姐不是给我检查身体，是给我量了身高；老师在教室里给我们讲绘本；我很开心");
-  assert.equal(result.facts.find(fact => fact.id === "f3").text, "医生姐姐给我量了身高");
-  assert.equal(result.facts.find(fact => fact.id === "book").text, "老师给我们讲了《三只小猪》的绘本", "补充地点不能覆盖原事实中的绘本名称");
-  assert.equal(result.facts.some(fact => fact.text === "老师在教室里给我们讲绘本"), true);
-  assert.equal(result.facts.some(fact => fact.text === "我很开心"), true);
-  assert.equal(result.operations.length, 3);
+  const bookSentences = [
+    { id: "s_book", text: "老师给我们讲了《三只小猪》的绘本。", factIds: ["book"] },
+    { id: "s_tea", text: "讲完绘本后，我们吃下午茶。", factIds: ["tea"] }
+  ];
+  const result = applyRevisionPlan(bookFacts, bookSentences, {
+    mode: "replace",
+    targetSentenceIds: ["s_book"],
+    facts: [{ key: "book", slot: "what", label: "讲绘本", text: "老师在教室里给我们讲了《三只小猪》的绘本" }],
+    sentences: [{ text: "老师在教室里给我们讲了《三只小猪》的绘本。", factKeys: ["book"] }]
+  }, "老师是在教室里给我们讲绘本的", "我的日记");
+  assert.equal(result.changed, true);
+  assert.match(result.sentences[0].text, /教室.*三只小猪/);
+  assert.equal(result.sentences[1].text, bookSentences[1].text, "修改范围外的句子由程序原样保留");
 
-  const unsafeWholeReplacement = applyRevisionOperations([bookFacts.at(-1)], [{
-    type: "correct",
-    targetFactId: "book",
-    oldText: "老师给我们讲了《三只小猪》的绘本",
-    newText: "老师讲了绘本"
-  }], "老师讲了绘本");
-  assert.equal(unsafeWholeReplacement.operations.length, 0, "局部纠正不能退化成整条事实覆盖");
-  assert.equal(unsafeWholeReplacement.facts[0].text, "老师给我们讲了《三只小猪》的绘本");
+  const deleted = applyRevisionPlan(bookFacts, bookSentences, {
+    mode: "replace",
+    targetSentenceIds: ["s_book"],
+    facts: [],
+    sentences: []
+  }, "讲绘本这件事不要写", "我的日记");
+  assert.equal(deleted.changed, true, "删除整件事时局部结果为空是合法修改");
+  assert.deepEqual(deleted.sentences.map(sentence => sentence.id), ["s_tea"]);
+
+  const inserted = applyRevisionPlan(bookFacts, bookSentences, {
+    mode: "insert",
+    targetSentenceIds: [],
+    insertBeforeSentenceId: "s_book",
+    facts: [{ key: "draw", slot: "what", label: "画画", text: "午睡起来后我画了一幅画" }],
+    sentences: [{ text: "午睡起来后，我画了一幅画。", factKeys: ["draw"] }]
+  }, "午睡起来后我画了一幅画，然后老师讲绘本", "我的日记");
+  assert.match(inserted.sentences[0].text, /画了一幅画/);
+  assert.equal(inserted.sentences[1].text, bookSentences[0].text, "插入新事件不能要求模型重写相邻原句");
+  assert.match(inserted.sentences[1].text, /三只小猪/);
+
+  const vague = applyRevisionPlan(bookFacts, bookSentences, {
+    mode: "no_change",
+    targetSentenceIds: [],
+    facts: [],
+    sentences: [],
+    message: "请说清楚想改哪件事"
+  }, "前面改一下", "我的日记");
+  assert.equal(vague.changed, false);
 }
 
 async function testRevision() {
@@ -131,25 +160,24 @@ async function testRevision() {
     facts,
     sentences: currentSentences
   }, async (messages, options) => {
-    if (options.stage === "parse_fact_revision") {
-      return { operations: [{ type: "correct", targetFactId: "f3", oldText: "给我检查身体", newText: "给我量了身高", slot: "what", label: "量身高" }] };
-    }
     return {
-      title: "上学的一天",
-      sentences: [
-        { id: "s1", text: currentSentences[0].text, factIds: ["f1", "f2"] },
-        { id: "s2", text: "到了学校，医生姐姐给我量了身高。", factIds: ["f3"] }
-      ]
+      additions: [],
+      rewrites: [{
+        targetSentenceIds: ["s2"],
+        facts: [{ key: "check", slot: "what", label: "量身高", text: "医生姐姐给我量了身高" }],
+        sentences: [{ text: "到了学校，医生姐姐给我量了身高。", factKeys: ["check"] }]
+      }]
     };
   });
   assert.equal(result.changed, true);
   assert.equal(result.facts.find(fact => fact.id === "f3").text, "医生姐姐给我量了身高");
   assert.equal(result.sentences[0].text, currentSentences[0].text);
+  assert.equal(result.sentences[0].id, "s1", "修改范围外的句子应由程序原样拼回，不交给模型复述");
   assert.match(result.sentences[1].text, /量了身高/);
 }
 
 Promise.all([testFinalize(), testRevision()]).then(() => {
-  testRevisionOperations();
+  testRevisionPlan();
   console.log("fact pipeline regression: ok");
 }).catch(error => {
   console.error(error);
