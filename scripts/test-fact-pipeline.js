@@ -35,6 +35,14 @@ assert.equal(
   "正文多次出现然后时必须触发自然重整"
 );
 
+const imperfectLedger = normalizeComposition({
+  title: "上学",
+  sentences: [{ text: "我自己穿好衣服后，妈妈送我去了学校。", factIds: ["f1", "f2"] }]
+}, facts);
+const imperfectLedgerIssues = compositionIssues(imperfectLedger, facts);
+assert.equal(imperfectLedgerIssues.hardIssues.length, 0, "事实ID漏标不能把已经生成的文章整篇判失败");
+assert.equal(imperfectLedgerIssues.softIssues.some(issue => issue.type === "unmapped_facts"), true);
+
 async function testFinalize() {
   const stages = [];
   const result = await finalizeFactDiary({
