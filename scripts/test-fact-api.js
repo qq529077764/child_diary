@@ -81,7 +81,7 @@ function fakeModelResponse(messages) {
       }]
     };
   }
-  if (joined.includes("复核proposedChanges")) {
+  if (joined.includes("把candidateChanges复核成最终可执行的changes")) {
     return {
       changes: [{
         mode: "replace",

@@ -170,6 +170,25 @@ const scenarios = [
     requireArticle: ["教室", "鸡蛋", "粥", "爸爸来接我"],
     forbidAll: ["超市", "山药", "妈妈来接我", "然后呢"],
     preserveFacts: ["book", "tea"]
+  },
+  {
+    name: "脏旧事实重新修改",
+    title: "我的学校一天",
+    facts: [
+      { id: "dirty_check", slot: "what", label: "检查", text: "医生姐姐给我做了检查，做检查时站着，做完检查我就进了学校", quote: "医生姐姐给我做了检查，做完检查我就进了学校", active: true },
+      { id: "dirty_jump", slot: "what", label: "跳绳", text: "然后呢，我就开始去跳绳；去跳绳了；跳绳的时候是和同学一起跳的时候；是200个；很多个同学；我感觉很好的", quote: "然后呢，我就开始去跳绳，是200个，很多个同学，我感觉很好的", active: true },
+      { id: "dirty_home", slot: "what", label: "接我", text: "放学后妈妈来接我", quote: "放学后妈妈来接我", active: true }
+    ],
+    sentences: [
+      { id: "dirty_s_check", text: "医生姐姐给我做了检查，做完检查我就进了学校。", factIds: ["dirty_check"] },
+      { id: "dirty_s_jump", text: "然后呢，我和很多个同学跳绳，是200个，我感觉很好的。", factIds: ["dirty_jump"] },
+      { id: "dirty_s_home", text: "放学后妈妈来接我。", factIds: ["dirty_home"] }
+    ],
+    instruction: "做完检查之后，我就进教室吃早餐。早餐吃的是粥、鸡蛋，还有山药。然后我和同学们出去跳绳，跳了200多个，感觉很好。",
+    requireArticle: ["进教室", "粥", "鸡蛋", "山药", "跳绳", "200多个", "感觉很好"],
+    order: ["检查", "早餐", "跳绳", "妈妈来接我"],
+    forbidAll: ["然后呢", "是200个", "很多个同学"],
+    maxArticleOccurrences: { "山药": 1 }
   }
 ];
 
@@ -197,11 +216,13 @@ function containsInOrder(article, values) {
 async function evaluate(scenario, token) {
   const startedAt = Date.now();
   try {
+    const inputFacts = scenario.facts || facts;
+    const inputSentences = scenario.sentences || sentences;
     const result = await post("/api/revise", {
       instruction: scenario.instruction,
-      title: "开心的一天",
-      facts,
-      sentences
+      title: scenario.title || "开心的一天",
+      facts: inputFacts,
+      sentences: inputSentences
     }, token);
     if (scenario.expectUnchanged) {
       return { name: scenario.name, passed: result.changed === false, elapsedMs: Date.now() - startedAt, changed: result.changed, message: result.message || "" };
@@ -217,9 +238,13 @@ async function evaluate(scenario, token) {
     for (const value of scenario.forbidArticle || []) checks.push({ check: `正文不含:${value}`, ok: !article.includes(value) });
     for (const value of scenario.forbidAll || []) checks.push({ check: `正文和事实不含:${value}`, ok: !combined.includes(value) });
     if (scenario.order) checks.push({ check: `顺序:${scenario.order.join("→")}`, ok: containsInOrder(article, scenario.order) });
+    for (const [value, maximum] of Object.entries(scenario.maxArticleOccurrences || {})) {
+      const count = article.split(value).length - 1;
+      checks.push({ check: `正文最多出现${maximum}次:${value}`, ok: count <= maximum });
+    }
     const factById = new Map((result.facts || []).map(fact => [fact.id, fact.text]));
     for (const id of scenario.preserveFacts || []) {
-      const original = facts.find(fact => fact.id === id)?.text;
+      const original = inputFacts.find(fact => fact.id === id)?.text;
       checks.push({ check: `保留事实:${id}`, ok: factById.get(id) === original });
     }
     const passed = result.changed === true && checks.every(item => item.ok);
@@ -228,6 +253,7 @@ async function evaluate(scenario, token) {
       passed,
       elapsedMs: Date.now() - startedAt,
       changed: result.changed,
+      message: result.message || "",
       failedChecks: checks.filter(item => !item.ok).map(item => item.check),
       article,
       ledger

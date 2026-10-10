@@ -71,6 +71,15 @@ const sanitizedDeletion = sanitizeRevisionChanges({
 }, "不要写我起得很早，穿衣服和背书包要保留。", [{ id: "morning", text: "早上我很早起床，穿好衣服，背好书包" }]);
 assert.deepEqual(sanitizedDeletion.changes[0].facts.map(fact => fact.text), ["穿好衣服", "背好书包"], "被否定的旧描述不能被模型重新带回修改事实");
 
+const cleanedCorrectionSpeech = sanitizeRevisionChanges({
+  changes: [{
+    mode: "replace",
+    targetFactIds: ["breakfast"],
+    facts: [{ text: "我在教室里吃早餐" }, { text: "只吃鸡蛋和粥，不要山药" }]
+  }]
+}, "早餐不是在超市吃，是在教室里吃，山药不要了，只吃鸡蛋和粥。", [{ id: "breakfast", text: "我在超市里吃早餐，吃了山药、鸡蛋和粥" }]);
+assert.deepEqual(cleanedCorrectionSpeech.changes[0].facts.map(fact => fact.text), ["我在教室里吃早餐", "只吃鸡蛋和粥"], "修改过程中的否定说明不能写进日记事实");
+
 const sanitizedCorrection = sanitizeRevisionChanges({
   changes: [{ mode: "insert", insertAfterFactId: "home", facts: [{ text: "放学后妈妈来接我" }, { text: "特别开心" }] }]
 }, "不是很开心，是特别开心。", [{ id: "home", text: "放学后妈妈来接我" }, { id: "feeling", text: "我很开心" }]);
@@ -276,13 +285,32 @@ async function testLongRevisionRecovery() {
     facts: localFacts,
     sentences: localSentences
   }, async (messages, options) => {
-    if (["revise_semantic_changes", "verify_revision_changes"].includes(options.stage)) {
+    if (options.stage === "revise_semantic_changes") {
       return {
         changes: [{
           mode: "insert",
           insertAfterFactId: "home",
           facts: [{ eventKey: "搭城堡", slot: "what", label: "搭城堡", text: "我和爸爸搭了一个好高好高的城堡" }]
         }]
+      };
+    }
+    if (options.stage === "verify_revision_changes") {
+      const payload = JSON.parse(messages[messages.length - 1].content);
+      const candidateFacts = payload.candidateChanges.flatMap(change => change.facts || []).map(fact => fact.text);
+      assert.equal(candidateFacts.some(value => value.includes("圆圆的小猫")), true, "自动补漏必须发生在最终语义复核之前");
+      return {
+        changes: [
+          {
+            mode: "insert",
+            insertAfterFactId: "home",
+            facts: [{ eventKey: "搭城堡", slot: "what", label: "搭城堡", text: "我和爸爸搭了一个好高好高的城堡" }]
+          },
+          {
+            mode: "insert",
+            insertAfterFactId: "home",
+            facts: [{ eventKey: "画小猫", slot: "what", label: "画小猫", text: "我画了一只圆圆的小猫" }]
+          }
+        ]
       };
     }
     if (options.stage === "compose_revision_changes") {
@@ -302,7 +330,113 @@ async function testLongRevisionRecovery() {
   assert.equal((article.match(/然后呢/gu) || []).length, 0);
 }
 
-Promise.all([testFinalize(), testRevision(), testLongRevisionRecovery()]).then(() => {
+async function testDirtyLegacyRevision() {
+  const legacyFacts = [
+    { id: "check", slot: "what", label: "检查", text: "医生姐姐给我做了检查，做检查时站着，做完检查我就进了学校", quote: "医生姐姐给我做了检查，做完检查我就进了学校" },
+    { id: "jump", slot: "what", label: "跳绳", text: "然后呢，我就开始去跳绳；去跳绳了；跳绳的时候是和同学一起跳的时候；是200个；很多个同学；我感觉很好的", quote: "然后呢，我就开始去跳绳，是200个，很多个同学，我感觉很好的" },
+    { id: "home", slot: "what", label: "回家", text: "放学后妈妈来接我", quote: "放学后妈妈来接我" }
+  ];
+  const legacySentences = [
+    { id: "s_check", text: "医生姐姐给我做了检查，做完检查我就进了学校。", factIds: ["check"] },
+    { id: "s_jump", text: "然后呢，我和很多个同学跳绳，是200个，我感觉很好的。", factIds: ["jump"] },
+    { id: "s_home", text: "放学后妈妈来接我。", factIds: ["home"] }
+  ];
+  const result = await reviseFactDiary({
+    instruction: "做完检查之后，我就进教室吃早餐。早餐吃的是粥、鸡蛋，还有山药。然后我和同学们出去跳绳，跳了200多个，感觉很好。",
+    title: "我的学校一天",
+    facts: legacyFacts,
+    sentences: legacySentences
+  }, async (messages, options) => {
+    if (options.stage === "revise_semantic_changes") {
+      return {
+        changes: [
+          {
+            mode: "replace",
+            targetFactIds: ["check"],
+            facts: [
+              { eventKey: "检查", slot: "what", label: "检查", text: "医生姐姐给我做了检查" },
+              { eventKey: "早餐", slot: "what", label: "吃早餐", text: "做完检查后我进教室吃早餐" },
+              { eventKey: "早餐", slot: "detail", label: "早餐内容", text: "早餐吃了粥、鸡蛋" }
+            ]
+          },
+          {
+            mode: "replace",
+            targetFactIds: ["jump"],
+            facts: [
+              { eventKey: "跳绳", slot: "what", label: "跳绳", text: "我和同学们出去跳绳" },
+              { eventKey: "跳绳", slot: "detail", label: "数量", text: "我跳了200多个" },
+              { eventKey: "跳绳", slot: "feeling", label: "感受", text: "我感觉很好" }
+            ]
+          }
+        ]
+      };
+    }
+    if (["verify_revision_changes", "verify_revision_changes_retry"].includes(options.stage)) {
+      const payload = JSON.parse(messages[messages.length - 1].content);
+      assert.equal(Array.isArray(payload.candidateChanges), true);
+      if (options.stage === "verify_revision_changes") {
+        const breakfastFacts = payload.candidateChanges.flatMap(change => change.facts || []).map(fact => fact.text).filter(value => /早餐|山药/u.test(value));
+        assert.equal(breakfastFacts.includes("早餐吃了粥、鸡蛋和山药"), true, "同一事件的名词补充应合入已有事实，而不是生成独立残片");
+        assert.equal(breakfastFacts.includes("还有山药"), false, "补漏不能制造独立名词残片");
+      }
+      return {
+        changes: [
+          {
+            mode: "replace",
+            targetFactIds: ["check"],
+            facts: [{ eventKey: "检查", slot: "what", label: "检查", text: "医生姐姐给我做了检查" }]
+          },
+          {
+            mode: "insert",
+            insertAfterFactId: "check",
+            facts: [
+              { eventKey: "早餐", slot: "what", label: "吃早餐", text: "做完检查后我进教室吃早餐" },
+              { eventKey: "早餐", slot: "detail", label: "早餐内容", text: "早餐吃了粥、鸡蛋和山药" }
+            ]
+          },
+          {
+            mode: "replace",
+            targetFactIds: ["jump"],
+            facts: [
+              { eventKey: "跳绳", slot: "what", label: "跳绳", text: "我和同学们出去跳绳" },
+              { eventKey: "跳绳", slot: "detail", label: "数量", text: "我跳了200多个" },
+              { eventKey: "跳绳", slot: "feeling", label: "感受", text: "我感觉很好" }
+            ]
+          }
+        ]
+      };
+    }
+    if (options.stage === "compose_revision_changes") {
+      return {
+        operations: [
+          {
+            key: "operation_1",
+            sentences: [
+              { text: "医生姐姐给我做了检查，做完检查后，我进教室吃了早餐，早餐有粥、鸡蛋和山药。", factKeys: ["new_1_1", "new_1_2", "new_1_3"] }
+            ]
+          },
+          {
+            key: "operation_2",
+            sentences: [
+              { text: "吃完早餐，我和同学们出去跳绳，一共跳了200多个，感觉很好。", factKeys: ["new_2_1", "new_2_2", "new_2_3"] }
+            ]
+          }
+        ]
+      };
+    }
+    throw new Error(`unexpected stage: ${options.stage}`);
+  });
+  const article = result.sentences.map(sentence => sentence.text).join("");
+  const ledger = result.facts.map(fact => fact.text).join("；");
+  assert.match(article, /粥、鸡蛋和山药/u);
+  assert.match(article, /跳了200多个/u);
+  for (const fragment of ["然后呢", "是200个", "很多个同学"]) {
+    assert.equal(`${article}；${ledger}`.includes(fragment), false, `旧事实中的残片不能被重新拆回结果：${fragment}`);
+  }
+  assert.equal((article.match(/山药/gu) || []).length, 1, "早餐内容不能被补漏逻辑重复写入");
+}
+
+Promise.all([testFinalize(), testRevision(), testLongRevisionRecovery(), testDirtyLegacyRevision()]).then(() => {
   testRevisionPlan();
   console.log("fact pipeline regression: ok");
 }).catch(error => {
