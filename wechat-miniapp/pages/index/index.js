@@ -30,6 +30,49 @@ const CHILD_PRIVACY_SECTIONS = [
   }
 ];
 
+function uniqueTexts(values) {
+  return [...new Set(values.map(value => String(value || "").trim()).filter(Boolean))];
+}
+
+function semanticFactText(event) {
+  if (!event) return "";
+  const subject = String(event.subject || "");
+  const action = String(event.action || "");
+  const object = String(event.object || "");
+  const location = String(event.location || "");
+  const manner = String(event.manner || "");
+  const time = String(event.time || "");
+  const posture = /^(?:坐|站|躺|蹲)$/u.test(action);
+  const core = location
+    ? posture ? `${subject}${action}在${location}` : `${subject}在${location}${manner}${action}${object}`
+    : `${subject}${manner}${action}${object}`;
+  const additions = uniqueTexts([event.result, event.feeling, ...(event.details || [])]);
+  return `${time}${core}${additions.length ? `，${additions.join("，")}` : ""}`.trim();
+}
+
+function enrichSentencesWithEvidence(sentences, story) {
+  if (!story || story.schemaVersion !== 2) return sentences;
+  const spanById = new Map((story.spans || []).map(span => [span.id, span]));
+  const eventById = new Map((story.events || []).map(event => [event.id, event]));
+  return sentences.map(sentence => {
+    const events = uniqueTexts(sentence.eventIds || []).map(id => eventById.get(id)).filter(Boolean);
+    const sourceSpanIds = uniqueTexts([
+      ...(sentence.sourceSpanIds || []),
+      ...events.flatMap(event => event.sourceSpanIds || [])
+    ]);
+    const sourceTexts = uniqueTexts(sourceSpanIds.map(id => spanById.get(id)?.text));
+    const semanticFacts = uniqueTexts(events.map(semanticFactText));
+    const factTexts = semanticFacts.length ? semanticFacts : uniqueTexts(sentence.factTexts || []);
+    return {
+      ...sentence,
+      sourceSpanIds,
+      factTexts,
+      factSummary: factTexts.join("；") || sentence.factSummary || sentence.text,
+      sourceText: sourceTexts.join("；") || sentence.sourceText || ""
+    };
+  });
+}
+
 Page({
   data: {
     phase: "home",
@@ -157,7 +200,8 @@ Page({
   presentDiary(record, index = 0) {
     const savedAt = Number(record.savedAt) || Date.now();
     const facts = Array.isArray(record.facts) ? record.facts.map(fact => ({ ...fact, active: fact.active !== false })) : [];
-    const sentences = (record.sentences || []).map((sentence, sentenceIndex) => {
+    const story = record.story && record.story.schemaVersion === 2 ? record.story : null;
+    const storedSentences = (record.sentences || []).map((sentence, sentenceIndex) => {
       if (typeof sentence === "string") {
         const matchingFacts = facts.filter(fact =>
           fact?.text && (sentence.includes(fact.text) || fact.text.includes(sentence))
@@ -187,12 +231,13 @@ Page({
         sourceText: sentence.sourceText || factTexts.join("；")
       };
     });
+    const sentences = enrichSentencesWithEvidence(storedSentences, story);
     return {
       ...record,
       id: record.id || `diary_${savedAt}_${index}`,
       title: record.title || "我的日记",
       facts,
-      story: record.story && record.story.schemaVersion === 2 ? record.story : null,
+      story,
       savedAt,
       savedLabel: this.formatSavedTime(savedAt),
       sentences,
@@ -860,7 +905,8 @@ Page({
   },
 
   applyDiaryResponse(data) {
-    const sentences = (data.sentences || []).map(sentence => ({
+    const story = data.story?.schemaVersion === 2 ? JSON.parse(JSON.stringify(data.story)) : null;
+    const baseSentences = (data.sentences || []).map(sentence => ({
       id: sentence.id || `sentence_${Date.now()}_${Math.random()}`,
       sceneId: sentence.sceneId || "",
       text: sentence.text,
@@ -870,7 +916,8 @@ Page({
       factIds: [],
       sourceText: ""
     }));
-    if (data.story?.schemaVersion === 2) this.storyModel = JSON.parse(JSON.stringify(data.story));
+    const sentences = enrichSentencesWithEvidence(baseSentences, story);
+    if (story) this.storyModel = story;
     this.setData({ phase: "diary", isFinishing: false, diaryTitle: data.title || "我的日记", diarySentences: sentences });
   },
 

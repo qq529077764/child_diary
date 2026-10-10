@@ -78,6 +78,8 @@ async function run() {
   });
   assert.equal(restored.story.schemaVersion, 2, "历史日记必须恢复语义事件账本");
   assert.deepEqual(restored.sentences[0].eventIds, ["event_park", "event_feeling"], "历史句子必须恢复事件来源");
+  assert.equal(restored.sentences[0].sourceText, "我去了公园，我很开心", "历史日记必须从语义账本恢复孩子原话");
+  assert.match(restored.sentences[0].factSummary, /去公园/, "历史日记必须从事件恢复对应事实");
 
   page.data.selectedDiary = restored;
   page.restoreDiaryForRevision();
@@ -126,6 +128,7 @@ async function run() {
   assert.equal(revisionRequest.story.schemaVersion, 2, "修改请求必须提交当前事件账本");
   assert.deepEqual(revisionRequest.sentences[0].eventIds, ["event_park", "event_feeling"], "修改请求使用事件编号而不是事实原句");
   assert.equal(revisionPage.data.diarySentences[0].text, "我去了公园，心里特别开心。", "服务器事务成功后客户端才应用新正文");
+  assert.equal(revisionPage.data.diarySentences[0].sourceText, "我去了公园，我很开心", "修改正文后不得丢失原话证据");
   assert.equal(revisionPage.storyModel.events.find(event => event.id === "event_feeling").feeling, "特别开心", "客户端必须整体接收新事件版本");
 
   const unchangedPage = createPage();

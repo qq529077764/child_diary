@@ -655,6 +655,18 @@
   font-weight: 900;
 }
 
+.source-label {
+  display: block;
+  margin-bottom: 6rpx;
+  color: #d86f18;
+  font-size: 22rpx;
+  font-weight: 900;
+}
+
+.source-label-gap {
+  margin-top: 14rpx;
+}
+
 .source-detail {
   display: block;
   color: #827063;
