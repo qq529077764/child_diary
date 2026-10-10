@@ -132,22 +132,25 @@ assert.equal(deleted.story.events.find(event => event.id === "event_feed").statu
 
 async function testFinalizePipeline() {
   const responses = [
-    baseStory(),
-    { hardErrors: [], verdict: "pass" },
     {
       title: "公园日记",
-      scenes: [{ sceneId: "scene_park", sentences: [{ text: "我和妈妈去了公园，那里有好多好多鸽子，我还喂了它们。", eventIds: ["event_arrive", "event_feed"] }] }]
-    },
-    { hardErrors: [], softIssues: [], verdict: "pass" }
+      events: [
+        { id: "e1", subject: "我和妈妈", action: "去", object: "公园", sourceSpanIds: ["span_1"] },
+        { id: "e2", subject: "我", action: "喂", object: "鸽子", expressions: ["好多好多"], sourceSpanIds: ["span_2"] }
+      ],
+      sentences: [{ text: "我和妈妈去了公园，那里有好多好多鸽子，我还喂了它们。", eventIds: ["e1", "e2"] }]
+    }
   ];
   const result = await finalizeSemanticDiary({ transcript: "我跟妈妈去公园。鸽子好多好多，我喂了鸽子。" }, async () => responses.shift());
   assert.equal(result.story.schemaVersion, 2, "第一版必须返回版本化事件账本");
-  assert.deepEqual(result.sentences[0].eventIds, ["event_arrive", "event_feed"], "正文来源使用事件编号而不是事实原句");
-  assert.equal(responses.length, 0, "语义正确时应完成事件提取、来源审计、成文和正文审计");
+  assert.deepEqual(result.sentences[0].eventIds, ["event_1", "event_2"], "正文来源使用事件编号而不是事实原句");
+  assert.equal(responses.length, 0, "语义正确时只需一次紧凑的语义成文请求");
 
   await assert.rejects(
-    finalizeSemanticDiary({ transcript: "孩子只说了去公园。" }, async () => baseStory()),
-    /semantic_story_invalid/,
+    finalizeSemanticDiary({ transcript: "孩子只说了去公园。" }, async () => ({
+      title: "公园", events: [{ id: "e1", subject: "我", action: "去", object: "公园", sourceSpanIds: ["span_missing"] }], sentences: []
+    })),
+    /没有听到/,
     "模型使用不存在的来源片段必须在成文前被拒绝"
   );
 }
@@ -225,15 +228,12 @@ async function testCorrectionSourceAudit() {
     corrections: [{ id: "correction_tree_apple", discardedText: "树是甜甜的", adoptedText: "苹果甜甜的", sourceSpanIds: ["span_1"] }]
   };
   const responses = [
-    extracted,
-    { hardErrors: [{ type: "correction_retained", eventIds: ["sweet_apple"], discardedMeaning: "树是甜甜的", adoptedMeaning: "苹果甜甜的" }], verdict: "hard_fail" },
-    { title: "苹果", sentences: [{ sceneId: "scene_correction", text: "苹果甜甜的、红红的。", eventIds: ["sweet_apple", "red_apple"] }] },
-    { hardErrors: [], softIssues: [], verdict: "pass" }
+    { ...extracted, title: "苹果", sentences: [{ text: "苹果甜甜的、红红的。", eventIds: ["sweet_apple", "red_apple"] }] }
   ];
   const result = await finalizeSemanticDiary({ transcript, facts: [] }, async () => responses.shift());
   assert.equal(result.sentences[0].text, "苹果甜甜的、红红的。", "被撤回旧意应删除，最终采用内容和儿童形容词必须完整保留");
-  assert.equal(result.story.events.find(event => event.id === "old_tree").status, "superseded", "只有与discardedText语义一致的旧事件才可自动标为已撤回");
-  assert.equal(result.story.events.find(event => event.id === "sweet_apple").status, "active", "最终采用内容不能因审计事件编号误判而删除");
+  assert.equal(result.story.events.find(event => event.id === "event_1").status, "superseded", "只有与discardedText语义一致的旧事件才可自动标为已撤回");
+  assert.equal(result.story.events.find(event => event.id === "event_2").status, "active", "最终采用内容不能因审计事件编号误判而删除");
 }
 
 async function testPrefixCorrection() {
@@ -249,14 +249,11 @@ async function testPrefixCorrection() {
     corrections: [{ id: "bird_correction", discardedText: "不是白色的鸟", adoptedText: "灰灰的小鸟", sourceSpanIds: ["span_1"] }]
   };
   const responses = [
-    extracted,
-    { hardErrors: [{ type: "missing_child_event", eventIds: ["right_bird"], missingMeaning: "我喂了灰灰的小鸟" }], verdict: "hard_fail" },
-    { title: "小鸟", sentences: [{ sceneId: "bird_scene", text: "我喂了灰灰的小鸟。", eventIds: ["right_bird"] }] },
-    { hardErrors: [], softIssues: [], verdict: "pass" }
+    { ...extracted, title: "小鸟", sentences: [{ text: "我喂了灰灰的小鸟。", eventIds: ["right_bird"] }] }
   ];
   const result = await finalizeSemanticDiary({ transcript, facts: [] }, async () => responses.shift());
-  assert.equal(result.story.events.find(event => event.id === "wrong_bird").status, "superseded", "‘不是A，是B’必须把A当作被撤回属性，不得造成否定动作");
-  assert.deepEqual(result.story.events.find(event => event.id === "right_bird").details, [], "被纠正的旧属性不得残留在新事件细节中");
+  assert.equal(result.story.events.find(event => event.id === "event_1").status, "superseded", "‘不是A，是B’必须把A当作被撤回属性，不得造成否定动作");
+  assert.deepEqual(result.story.events.find(event => event.id === "event_2").details, [], "被纠正的旧属性不得残留在新事件细节中");
   assert.equal(result.sentences[0].text.includes("白色"), false, "被纠正的旧属性不得进入正文");
 }
 
@@ -271,13 +268,10 @@ async function testSpatialPostureNormalization() {
     ]
   };
   const responses = [
-    extracted,
-    { hardErrors: [], verdict: "pass" },
-    { title: "吃苹果", sentences: [{ sceneId: "scene_1", text: "我坐在石头上吃甜甜的苹果。", eventIds: ["sit", "eat"] }] },
-    { hardErrors: [], softIssues: [], verdict: "pass" }
+    { ...extracted, title: "吃苹果", sentences: [{ text: "我坐在石头上吃甜甜的苹果。", eventIds: ["sit", "eat"] }] }
   ];
   const result = await finalizeSemanticDiary({ transcript, facts: [] }, async () => responses.shift());
-  const sit = result.story.events.find(event => event.id === "sit");
+  const sit = result.story.events.find(event => event.id === "event_1");
   assert.equal(sit.action, "坐", "位置姿态动作应保留核心动词");
   assert.equal(sit.object, "", "坐的地点不是动作宾语");
   assert.equal(sit.location, "石头上", "应从原始来源恢复完整位置。");

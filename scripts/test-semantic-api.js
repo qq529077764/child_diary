@@ -18,19 +18,18 @@ function listen(server) {
 function fakeModelResponse(messages) {
   const joined = messages.map(message => message.content).join("\n");
   const story = {
-    titleHint: "公园日记",
-    spanRoles: { child_story: ["span_1"], adult_guidance: [], background_audio: [], meta_speech: [], noise: [] },
-    scenes: [{ id: "scene_park", label: "公园", order: 0, sourceSpanIds: ["span_1"] }],
+    title: "公园日记",
     events: [
-      { id: "event_park", sceneId: "scene_park", subject: "我和妈妈", action: "去", object: "公园", time: "", location: "", manner: "", result: "", feeling: "", polarity: "positive", certainty: "certain", details: [], childExpressions: [], sourceSpanIds: ["span_1"], status: "active", confidence: 0.99 },
-      { id: "event_feed", sceneId: "scene_park", subject: "我", action: "喂", object: "鸽子", time: "", location: "", manner: "", result: "", feeling: "", polarity: "positive", certainty: "certain", details: [], childExpressions: [{ text: "好多好多", bindTo: "object", policy: "preserve", reason: "" }], sourceSpanIds: ["span_1"], status: "active", confidence: 0.99 }
+      { id: "e1", subject: "我和妈妈", action: "去", object: "公园", sourceSpanIds: ["span_1"] },
+      { id: "e2", subject: "我", action: "喂", object: "鸽子", expressions: ["好多好多"], sourceSpanIds: ["span_1"] }
     ],
-    relations: [{ id: "relation_1", type: "before", from: "event_park", to: "event_feed", sourceSpanIds: ["span_1"] }]
+    sentences: [{ text: "我和妈妈去了公园，那里有好多好多鸽子，我还喂了它们。", eventIds: ["e1", "e2"] }],
+    corrections: []
   };
   if (joined.includes("独立的儿童日记修改补丁审计员")) return { hardErrors: [], verdict: "pass" };
   if (joined.includes("revisionSpan")) {
     const revisionSpanId = JSON.parse(messages.at(-1).content).revisionSpan.id;
-    return { intent: "correct", operations: [{ type: "update_event", eventId: "event_feed", changes: { object: "小鸟", childExpressions: { add: [{ text: "小小的", bindTo: "object", policy: "preserve" }], removeTexts: [] } }, sourceSpanIds: [revisionSpanId] }] };
+    return { intent: "correct", operations: [{ type: "update_event", eventId: "event_2", changes: { object: "小鸟", childExpressions: { add: [{ text: "小小的", bindTo: "object", policy: "preserve" }], removeTexts: [] } }, sourceSpanIds: [revisionSpanId] }] };
   }
   if (joined.includes('"current_text"')) {
     return {
@@ -47,12 +46,12 @@ function fakeModelResponse(messages) {
   return {
     title: "公园日记",
     scenes: [{
-      sceneId: "scene_park",
+      sceneId: "scene_main",
       sentences: [{
         text: revised
           ? "我和妈妈去了公园，那里有好多好多小小的鸟，我还喂了它们。"
           : "我和妈妈去了公园，那里有好多好多鸽子，我还喂了它们。",
-        eventIds: ["event_park", "event_feed"]
+        eventIds: ["event_1", "event_2"]
       }]
     }]
   };
@@ -139,7 +138,7 @@ async function run() {
     assert.match(processOutput, /Qwen stage retry/, "模型首次返回截断JSON时必须用紧凑模式自动重试");
     assert.equal(draft.body.story.schemaVersion, 2);
     assert.equal(draft.body.story.spans[0].text, transcript, "模型只回传片段分类，服务端必须恢复原始来源文本");
-    assert.deepEqual(draft.body.sentences[0].eventIds, ["event_park", "event_feed"]);
+    assert.deepEqual(draft.body.sentences[0].eventIds, ["event_1", "event_2"]);
     const saved = await request("/api/diaries", "POST", {
       id: "semantic_api_test", title: draft.body.title, sentences: draft.body.sentences,
       story: draft.body.story, transcript, facts: [], savedAt: Date.now()
