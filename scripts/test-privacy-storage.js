@@ -61,6 +61,14 @@ async function run() {
   assert.ok(auth.body.token);
   const headers = { authorization: `Bearer ${auth.body.token}` };
 
+  const staleSession = await request("/api/auth/session", {
+    method: "POST",
+    headers: { authorization: "Bearer stale-preview-token" },
+    body: JSON.stringify({})
+  });
+  assert.equal(staleSession.status, 401);
+  assert.equal(staleSession.body.error, "invalid_session");
+
   const beforeConsent = await request("/api/diaries", { headers });
   assert.equal(beforeConsent.status, 403);
   assert.equal(beforeConsent.body.error, "guardian_consent_required");

@@ -166,9 +166,14 @@ function upsertDeviceUser(installationId) {
 }
 
 async function handleAuthSession(req, res) {
+  const presentedToken = bearerToken(req);
   const current = authenticatedUser(req);
   if (current) {
-    sendJson(res, 200, { token: bearerToken(req), authMode: current.auth_mode });
+    sendJson(res, 200, { token: presentedToken, authMode: current.auth_mode });
+    return;
+  }
+  if (presentedToken) {
+    sendError(res, 401, "invalid_session", "登录信息已失效，请重新连接服务器。");
     return;
   }
   const input = await readJson(req);
