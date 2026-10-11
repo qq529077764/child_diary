@@ -4,7 +4,7 @@
 
 ## 核心链路
 
-开始说 → 腾讯语音转文字 → 说话人/主线过滤 → 千问实时事实与追问 → 我说完啦 → 最终主线审计与成文 → 语音修改 → 服务器保存
+开始说 → 腾讯语音转文字 → 实时事实与引导 → 我说完啦 → 最终事实审计 → 低年级日记成文 → 基于事实ID的语音修改 → 服务器保存
 
 ## 项目结构
 
@@ -40,10 +40,12 @@ http://127.0.0.1:5178/health
 3. 开发测试阶段关闭合法域名校验。
 4. 手机与电脑连接同一个 Wi-Fi 后生成预览码测试。
 
-服务端规则与修改链路回归测试：
+事实成文、服务端路由与修改事务回归测试：
 
 ```bash
 node scripts/test-server-logic.js
+node scripts/test-fact-pipeline.js
+node scripts/test-fact-api.js
 node scripts/test-miniapp-revision.js
 node scripts/test-privacy-storage.js
 ```

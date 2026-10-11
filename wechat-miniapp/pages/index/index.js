@@ -30,6 +30,35 @@ const CHILD_PRIVACY_SECTIONS = [
   }
 ];
 
+function uniqueTexts(values) {
+  return [...new Set(values.map(value => String(value || "").trim()).filter(Boolean))];
+}
+
+function joinEvidence(values) {
+  const items = uniqueTexts(values);
+  if (items.length <= 1) return items[0] || "";
+  return items.map(item => item.replace(/[，。；,.;]+$/u, "")).join("；");
+}
+
+function enrichSentencesWithEvidence(sentences, facts) {
+  const factById = new Map((facts || []).map(fact => [fact.id, fact]));
+  return sentences.map(sentence => {
+    const linkedFacts = uniqueTexts(sentence.factIds || []).map(id => factById.get(id)).filter(Boolean);
+    const factTexts = linkedFacts.length
+      ? uniqueTexts(linkedFacts.map(fact => fact.text))
+      : uniqueTexts(sentence.factTexts || []);
+    const sourceTexts = linkedFacts.length
+      ? uniqueTexts(linkedFacts.map(fact => fact.quote))
+      : uniqueTexts([sentence.sourceText]);
+    return {
+      ...sentence,
+      factTexts,
+      factSummary: factTexts.join("；") || sentence.factSummary || sentence.text,
+      sourceText: joinEvidence(sourceTexts) || sentence.sourceText || ""
+    };
+  });
+}
+
 Page({
   data: {
     phase: "home",
@@ -122,9 +151,8 @@ Page({
     this.finalizeStarted = false;
     this.segmentActive = false;
     this.analysisRunning = false;
-    this.analysisPending = false;
+    this.analysisQueue = [];
     this.analysisPromise = null;
-    this.latestSegmentText = "";
     this.revisionBaseSnapshot = null;
     this.editingDiaryId = null;
     this.editingDiarySavedAt = null;
@@ -156,7 +184,7 @@ Page({
   presentDiary(record, index = 0) {
     const savedAt = Number(record.savedAt) || Date.now();
     const facts = Array.isArray(record.facts) ? record.facts.map(fact => ({ ...fact, active: fact.active !== false })) : [];
-    const sentences = (record.sentences || []).map((sentence, sentenceIndex) => {
+    const storedSentences = (record.sentences || []).map((sentence, sentenceIndex) => {
       if (typeof sentence === "string") {
         const matchingFacts = facts.filter(fact =>
           fact?.text && (sentence.includes(fact.text) || fact.text.includes(sentence))
@@ -183,6 +211,7 @@ Page({
         sourceText: sentence.sourceText || factTexts.join("；")
       };
     });
+    const sentences = enrichSentencesWithEvidence(storedSentences, facts);
     return {
       ...record,
       id: record.id || `diary_${savedAt}_${index}`,
@@ -330,7 +359,7 @@ Page({
       url: `${API_BASE_URL}${path}`,
       method,
       data,
-      timeout: path === "/api/finalize" ? 120000 : path === "/api/compose" ? 90000 : 60000,
+      timeout: ["/api/finalize", "/api/revise"].includes(path) ? 150000 : 60000,
       header: {
         "content-type": "application/json",
         ...(includeAuth && this.cloudToken ? { Authorization: `Bearer ${this.cloudToken}` } : {})
@@ -728,15 +757,22 @@ Page({
       this.setData({ revisionDisplay: `我听到：${this.tail(this.revisionTranscript, 72)}` });
       return;
     }
-    this.latestSegmentText = text;
     this.transcript = this.appendText(this.transcript, text);
+    this.analysisQueue.push({
+      recentText: text,
+      transcriptSnapshot: this.transcript,
+      currentQuestion: this.currentQuestion ? { ...this.currentQuestion } : null,
+      questionTranscriptLength: this.questionTranscriptLength,
+      previousQuestions: this.questions.slice(),
+      previousQuestionKeys: this.questionKeys.slice(),
+      followupCount: this.followupCount
+    });
     this.transcriptAnchorSequence += 1;
     this.setData({
       latestText: this.tail(this.transcript, 86),
       transcriptAnchorId: `transcript_end_${this.transcriptAnchorSequence}`
     });
-    if (/(我)?说完(了|啦)?|讲完(了|啦)?/.test(text) && !this.data.isFinishing) this.finishStory();
-    else this.analyzeRealtime();
+    this.analyzeRealtime();
   },
 
   appendText(base, addition) {
@@ -749,18 +785,20 @@ Page({
   tail(text, length) { return text.length > length ? `…${text.slice(-length)}` : text; },
 
   analyzeRealtime() {
-    if (this.analysisRunning) { this.analysisPending = true; return this.analysisPromise; }
+    if (this.analysisRunning) return this.analysisPromise;
+    const pending = this.analysisQueue.shift();
+    if (!pending) return Promise.resolve();
     this.analysisRunning = true;
     const runtimeToken = this.runtimeToken;
-    const transcriptSnapshot = this.transcript;
+    const transcriptSnapshot = pending.transcriptSnapshot;
     const request = this.request("/api/analyze", {
-      text: transcriptSnapshot, recentText: this.latestSegmentText || transcriptSnapshot, realtime: true,
+      text: transcriptSnapshot, recentText: pending.recentText, realtime: true,
       existingFacts: this.facts.map(({ slot, label, text, quote }) => ({ slot, label, text, quote })),
-      currentQuestion: this.currentQuestion,
-      answerTextSinceQuestion: this.currentQuestion ? transcriptSnapshot.slice(this.questionTranscriptLength) : "",
-      previousQuestions: this.questions,
-      previousQuestionKeys: this.questionKeys,
-      followupCount: this.followupCount,
+      currentQuestion: pending.currentQuestion,
+      answerTextSinceQuestion: pending.currentQuestion ? transcriptSnapshot.slice(pending.questionTranscriptLength) : "",
+      previousQuestions: pending.previousQuestions,
+      previousQuestionKeys: pending.previousQuestionKeys,
+      followupCount: pending.followupCount,
       maxFollowups: 50
     }).then(data => {
       if (runtimeToken !== this.runtimeToken) return;
@@ -785,7 +823,7 @@ Page({
     }).catch(() => {}).finally(() => {
       if (runtimeToken !== this.runtimeToken) return;
       this.analysisRunning = false;
-      if (this.analysisPending) { this.analysisPending = false; this.analyzeRealtime(); }
+      if (this.analysisQueue.length) this.analyzeRealtime();
     });
     this.analysisPromise = request;
     return request;
@@ -799,9 +837,9 @@ Page({
   },
 
   async waitForRealtimeAnalysis() {
-    while (this.analysisRunning || this.analysisPending) {
+    while (this.analysisRunning || this.analysisQueue.length) {
       try { await this.analysisPromise; } catch (error) {}
-      if (this.analysisRunning || this.analysisPending) await new Promise(resolve => setTimeout(resolve, 40));
+      if (this.analysisRunning || this.analysisQueue.length) await new Promise(resolve => setTimeout(resolve, 40));
     }
   },
 
@@ -845,14 +883,6 @@ Page({
         facts: this.facts.filter(fact => fact.active !== false),
         previousQuestions: this.questions
       });
-      if (Array.isArray(data.acceptedFactIds)) {
-        const acceptedIds = new Set(data.acceptedFactIds);
-        this.facts.forEach(fact => {
-          if (fact.id && !acceptedIds.has(fact.id)) fact.active = false;
-        });
-        this.setData({ factChips: this.facts.filter(fact => fact.active !== false) });
-      }
-      this.mergeFacts(data.facts || []);
       this.applyDiaryResponse(data);
     } catch (error) {
       this.finalizeStarted = false;
@@ -860,72 +890,25 @@ Page({
     }
   },
 
-  async composeDiary(options = {}) {
-    const { applyResult = true, ...requestOptions } = options;
-    const facts = this.facts.filter(fact => fact.active !== false);
-    const data = await this.request("/api/compose", {
-      facts,
-      utterances: this.utterances,
-      ...requestOptions
-    });
-    if (applyResult) this.applyDiaryResponse(data);
-    return data;
-  },
-
-  validateRevisionComposition(lockedDiary, operations, data) {
-    const revisedSentences = Array.isArray(data?.sentences) ? data.sentences : [];
-    const changedSentenceIds = new Set(Array.isArray(data?.changedSentenceIds) ? data.changedSentenceIds : []);
-    if (!revisedSentences.length) throw new Error("修改结果没有完整句子");
-    if (!Array.isArray(data?.changedSentenceIds)) throw new Error("修改结果缺少局部校验信息");
-
-    const revisedById = new Map(revisedSentences.filter(sentence => sentence?.id).map(sentence => [sentence.id, sentence]));
-    for (const original of lockedDiary) {
-      if (changedSentenceIds.has(original.id)) continue;
-      const preserved = revisedById.get(original.id);
-      if (!preserved || preserved.text !== original.text) {
-        throw new Error("这次修改影响了无关内容");
-      }
-    }
-
-    const revisedFactIds = new Set(revisedSentences.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []));
-    const revisedFactOrder = revisedSentences.flatMap(sentence => Array.isArray(sentence.factIds) ? sentence.factIds : []);
-    const revisedText = revisedSentences.map(sentence => sentence.text || "").join("");
-    for (const operation of operations) {
-      if (operation.type === "add" && operation.applied_fact_id && !revisedFactIds.has(operation.applied_fact_id)) {
-        throw new Error("新补充的内容没有写进日记");
-      }
-      if (operation.type === "replace" && operation.target_fact_id && !revisedFactIds.has(operation.target_fact_id)) {
-        throw new Error("要修改的事情在结果中丢失了");
-      }
-      if (operation.type === "delete" && operation.target_fact_id && revisedFactIds.has(operation.target_fact_id)) {
-        throw new Error("要删除的内容仍然存在");
-      }
-      if (operation.type === "remove_phrase" && operation.old_text && revisedText.includes(operation.old_text)) {
-        throw new Error("要去掉的话仍然存在");
-      }
-      if (operation.type === "reorder") {
-        let cursor = -1;
-        for (const factId of operation.ordered_fact_ids || []) {
-          const nextIndex = revisedFactOrder.findIndex((id, index) => index > cursor && id === factId);
-          if (nextIndex < 0) throw new Error("事情的先后顺序还没有调整正确");
-          cursor = nextIndex;
-        }
-      }
-    }
-    return true;
-  },
-
   applyDiaryResponse(data) {
-    const sentences = (data.sentences || []).map(sentence => ({
+    if (Array.isArray(data.facts)) {
+      this.facts = JSON.parse(JSON.stringify(data.facts)).map(fact => ({ ...fact, active: fact.active !== false }));
+    }
+    const baseSentences = (data.sentences || []).map(sentence => ({
       id: sentence.id || `sentence_${Date.now()}_${Math.random()}`,
       text: sentence.text,
-      factTexts: sentence.factTexts || [],
-      factIds: sentence.factIds || this.facts
-        .filter(fact => (sentence.factTexts || []).some(text => text === fact.text || text.includes(fact.text) || fact.text.includes(text)))
-        .map(fact => fact.id),
-      sourceText: (sentence.factTexts || []).join("；")
+      factTexts: Array.isArray(sentence.factTexts) ? sentence.factTexts : [],
+      factIds: Array.isArray(sentence.factIds) ? sentence.factIds : [],
+      sourceText: sentence.sourceText || ""
     }));
-    this.setData({ phase: "diary", isFinishing: false, diaryTitle: data.title || "我的日记", diarySentences: sentences });
+    const sentences = enrichSentencesWithEvidence(baseSentences, this.facts);
+    this.setData({
+      phase: "diary",
+      isFinishing: false,
+      diaryTitle: data.title || "我的日记",
+      diarySentences: sentences,
+      factChips: this.facts.filter(fact => fact.active !== false)
+    });
   },
 
   async saveDiary() {
@@ -986,44 +969,25 @@ Page({
 
   async finishRevision() {
     if (!this.revisionTranscript) { this.finalizeStarted = false; this.setData({ isFinishing: false, revisionDisplay: "刚才没有听清，请再说一次。" }); return; }
+    if (!this.facts.length || !this.data.diarySentences.some(sentence => Array.isArray(sentence.factIds) && sentence.factIds.length)) {
+      this.finalizeStarted = false;
+      this.setData({ isFinishing: false, revisionDisplay: "这篇旧日记缺少事实来源，暂时不能安全修改。" });
+      wx.showModal({ title: "旧日记暂不修改", content: "这篇旧日记没有可核对的事实来源。为避免改错，原文已完整保留；新录制的日记可以直接语音修改。", showCancel: false });
+      return;
+    }
     try {
-      // 旧版历史日记的句子与事实关联可能不完整，修改时必须提供该篇保存的全部有效事实。
-      const activeFacts = this.facts.filter(fact => fact.active !== false);
-      const revisionDiary = this.data.diarySentences.map(item => ({
-        id: item.id,
-        text: item.text,
-        factTexts: item.factTexts || [],
-        factIds: item.factIds || []
-      }));
-      const result = await this.request("/api/revise", { instruction: this.revisionTranscript, facts: activeFacts, diary: revisionDiary });
-      let changed = 0;
-      const appliedOperations = [];
-      (result.operations || []).forEach(operation => {
-        const target = this.facts.find(fact => fact.active !== false && fact.id === operation.target_fact_id);
-        if (operation.type === "replace" && target && operation.new_text) {
-          const oldText = target.text;
-          target.text = operation.new_text; target.quote = this.revisionTranscript; target.source = "语音修改"; changed += 1; appliedOperations.push({ ...operation, old_text: oldText });
-        }
-        if (operation.type === "delete" && target) {
-          target.active = false; changed += 1; appliedOperations.push({ ...operation, old_text: target.text });
-        }
-        if (operation.type === "add" && operation.new_text) {
-          const id = `rev_${Date.now()}_${changed}`;
-          this.facts.push({ id, slot: operation.slot, label: operation.label || "语音修改", text: operation.new_text, quote: this.revisionTranscript, source: "语音修改", active: true });
-          appliedOperations.push({ ...operation, applied_fact_id: id });
-          changed += 1;
-        }
-        if (operation.type === "remove_phrase" && operation.target_sentence_id && operation.old_text) {
-          changed += 1;
-          appliedOperations.push(operation);
-        }
-        if (operation.type === "reorder" && Array.isArray(operation.ordered_fact_ids) && operation.ordered_fact_ids.length >= 2 &&
-          operation.ordered_fact_ids.every(id => this.facts.some(fact => fact.active !== false && fact.id === id))) {
-          changed += 1;
-          appliedOperations.push(operation);
-        }
+      const result = await this.request("/api/revise", {
+        instruction: this.revisionTranscript,
+        title: this.data.diaryTitle,
+        sentences: this.data.diarySentences.map(item => ({
+          id: item.id,
+          text: item.text,
+          factIds: item.factIds || [],
+          factTexts: item.factTexts || []
+        })),
+        facts: this.facts.filter(fact => fact.active !== false)
       });
-      if (!changed) {
+      if (!result.changed) {
         this.finalizeStarted = false;
         this.setData({ isFinishing: false, revisionDisplay: result.message || "还没有找到要修改的地方，请再说清楚一点。" });
         wx.showModal({
@@ -1033,22 +997,7 @@ Page({
         });
         return;
       }
-      const lockedDiary = this.data.diarySentences.map(item => ({
-        id: item.id,
-        text: item.text,
-        factTexts: item.factTexts,
-        factIds: item.factIds
-      }));
-      const composition = await this.composeDiary({
-        applyResult: false,
-        lockedTitle: this.data.diaryTitle,
-        lockedDiary,
-        revisionOperations: appliedOperations,
-        revisionInstruction: this.revisionTranscript,
-        revisionMode: result.revisionMode || ""
-      });
-      this.validateRevisionComposition(lockedDiary, appliedOperations, composition);
-      this.applyDiaryResponse(composition);
+      this.applyDiaryResponse(result);
       this.revisionBaseSnapshot = null;
     } catch (error) {
       if (this.revisionBaseSnapshot) {

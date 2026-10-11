@@ -1,0 +1,55 @@
+[
+  {
+    "id": "mixed-audio-filtering",
+    "transcript": "妈妈说你讲讲滑梯。电视里说欢迎收看。今天我和哥哥玩了大大的滑梯，它特别高。",
+    "mustKeepMeanings": ["我和哥哥玩滑梯", "滑梯大大的", "滑梯特别高"],
+    "mustKeepExpressions": ["大大的", "特别高"],
+    "mustExclude": ["你讲讲滑梯", "欢迎收看"]
+  },
+  {
+    "id": "fragment-and-repetition",
+    "transcript": "我去了公园，然后我去了公园，跟妈妈。喂鸽子，鸽子好多好多。",
+    "mustKeepMeanings": ["我跟妈妈去公园", "我喂鸽子", "鸽子好多好多"],
+    "mustKeepExpressions": ["好多好多"],
+    "mustExclude": ["重复的去公园事件"]
+  },
+  {
+    "id": "late-order-detail",
+    "transcript": "我吃了午饭，然后睡午觉。哦对了，吃午饭以前我先洗了手。",
+    "mustKeepMeanings": ["洗手", "吃午饭", "睡午觉"],
+    "requiredOrder": ["洗手", "吃午饭", "睡午觉"]
+  },
+  {
+    "id": "self-correction-binding",
+    "transcript": "树是甜甜的，不对，是苹果甜甜的。苹果红红的。",
+    "mustKeepMeanings": ["苹果甜甜的", "苹果红红的"],
+    "mustKeepExpressions": ["甜甜的", "红红的"],
+    "mustExclude": ["树是甜甜的"]
+  },
+  {
+    "id": "negative-event",
+    "transcript": "我没有骑自行车，我在旁边看哥哥骑。",
+    "mustKeepMeanings": ["我没有骑自行车", "我看哥哥骑自行车"],
+    "mustExclude": ["我骑了自行车"]
+  },
+  {
+    "id": "related-restatement",
+    "current": "我和妹妹搭了积木。",
+    "revision": "我们搭的是一个高高的城堡，搭了好久。",
+    "mustKeepMeanings": ["我和妹妹搭积木", "积木搭成高高的城堡", "搭了好久"],
+    "mustKeepExpressions": ["高高的", "好久"]
+  },
+  {
+    "id": "reorder-existing-events",
+    "current": "我睡完午觉吃了午饭。",
+    "revision": "顺序不对，我先吃午饭，再睡午觉。",
+    "requiredOrder": ["吃午饭", "睡午觉"],
+    "mustExclude": ["修改指令"]
+  },
+  {
+    "id": "unrelated-scene-locked",
+    "current": "早上我去了学校。中午我吃了米饭。放学后妈妈来接我。",
+    "revision": "中午吃的是面条，不是米饭。",
+    "mustRemainVerbatim": ["早上我去了学校。", "放学后妈妈来接我。"]
+  }
+]
