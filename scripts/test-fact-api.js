@@ -72,6 +72,9 @@ function fakeModelResponse(messages) {
       }))
     };
   }
+  if (joined.includes("先清理rawInstruction")) {
+    return { usable: true, instruction: payload.rawInstruction, evidence: [payload.rawInstruction] };
+  }
   if (joined.includes("原子化的事实变更计划")) {
     return {
       changes: [{
@@ -92,10 +95,12 @@ function fakeModelResponse(messages) {
   }
   if (joined.includes("分别为每个operation写局部替换句")) {
     return {
-      operations: [{
-        key: "operation_1",
-        sentences: [{ text: "我和妈妈去了公园，那里有好多好多小小的鸟，我还喂了它们。", factKeys: ["kept_1_1", "new_1_1"] }]
-      }]
+      schema: {
+        operations: [{
+          key: "operation_1",
+          sentences: [{ text: "我和妈妈去了公园，那里有好多好多小小的鸟，我还喂了它们。", factKeys: ["kept_1_1", "new_1_1"] }]
+        }]
+      }
     };
   }
   if (joined.includes("把finalFacts组织")) {
@@ -123,11 +128,13 @@ async function waitForServer(baseUrl, child) {
 
 async function run() {
   let malformedCompositionInjected = false;
+  const modelRequests = [];
   const fakeModel = http.createServer((req, res) => {
     let body = "";
     req.on("data", chunk => { body += chunk; });
     req.on("end", () => {
       const request = JSON.parse(body);
+      modelRequests.push(request);
       const joined = (request.messages || []).map(message => message.content).join("\n");
       const shouldInjectMalformed = !malformedCompositionInjected
         && joined.includes("把finalFacts组织")
@@ -151,6 +158,8 @@ async function run() {
       ALLOW_DEVICE_AUTH: "true",
       QWEN_API_KEY: "test-key",
       QWEN_MODEL: "test-model",
+      QWEN_FAST_MODEL: "test-fast-model",
+      QWEN_ENABLE_THINKING: "false",
       QWEN_BASE_URL: `http://127.0.0.1:${modelPort}`,
       TENCENT_SECRET_ID: "",
       TENCENT_SECRET_KEY: ""
@@ -216,6 +225,14 @@ async function run() {
     assert.equal(revised.body.changed, true, JSON.stringify(revised.body));
     assert.match(revised.body.sentences[0].text, /小小的/);
     assert.equal(revised.body.facts.find(fact => fact.id === "f2").text, "我喂了好多好多小小的鸟");
+    assert.equal(modelRequests.every(item => item.enable_thinking === false), true, "结构化模型调用必须关闭深度思考");
+    const modelsFor = marker => modelRequests
+      .filter(item => (item.messages || []).some(message => String(message.content).includes(marker)))
+      .map(item => item.model);
+    assert.deepEqual(modelsFor("整理成可直接用于成文"), ["test-fast-model"]);
+    assert.deepEqual(modelsFor("先清理rawInstruction"), ["test-model"]);
+    assert.equal(modelsFor("把finalFacts组织").every(model => model === "test-model"), true, "成文重试不得切换模型");
+    assert.equal(modelsFor("原子化的事实变更计划").every(model => model === "test-model"), true);
     const legacy = await request("/api/compose", "POST", {}, token);
     assert.equal(legacy.response.status, 410);
     console.log("fact API integration: ok");

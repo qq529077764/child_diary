@@ -328,8 +328,9 @@ async function transcribeWithTencent(audio) {
 function qwenConfig() {
   return {
     apiKey: process.env.QWEN_API_KEY,
-    model: process.env.QWEN_MODEL || "qwen-plus",
-    fastModel: process.env.QWEN_FAST_MODEL || "qwen-flash",
+    model: process.env.QWEN_MODEL || "qwen3.8-max",
+    fastModel: process.env.QWEN_FAST_MODEL || "deepseek-v4.1-flash",
+    enableThinking: String(process.env.QWEN_ENABLE_THINKING || "false").toLowerCase() === "true",
     baseUrl: (process.env.QWEN_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/$/, "")
   };
 }
@@ -363,10 +364,12 @@ async function callQwenJson(messages, options = {}) {
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     const startedAt = Date.now();
     try {
-      const fastStage = /^(?:audit|reaudit)_(?:diary|revision)/u.test(stage);
-      const model = options.model || (compactRetry
-        ? (fastStage ? config.model : config.fastModel)
-        : (fastStage ? config.fastModel : config.model));
+      const fastStage = new Set([
+        "audit_final_facts",
+        "verify_revision_changes",
+        "verify_revision_changes_retry"
+      ]).has(stage);
+      const model = options.model || (fastStage ? config.fastModel : config.model);
       const response = await fetch(`${config.baseUrl}/chat/completions`, {
         method: "POST",
         headers: {
@@ -378,6 +381,7 @@ async function callQwenJson(messages, options = {}) {
           messages: requestMessages,
           temperature: 0.1,
           max_tokens: maxTokens,
+          enable_thinking: config.enableThinking,
           response_format: { type: "json_object" }
         }),
         signal: AbortSignal.timeout(timeoutMs)
@@ -401,6 +405,7 @@ async function callQwenJson(messages, options = {}) {
       console.log("Qwen stage completed", {
         stage,
         model,
+        enableThinking: config.enableThinking,
         attempt,
         elapsedMs: Date.now() - startedAt,
         outputChars: content.length,

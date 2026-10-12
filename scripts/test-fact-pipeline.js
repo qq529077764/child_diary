@@ -5,9 +5,15 @@ const {
   compositionIssues,
   finalizeFactDiary,
   normalizeComposition,
+  normalizeRevisionCleaning,
   reviseFactDiary,
   sanitizeRevisionChanges
 } = require("../lib/fact-pipeline");
+
+function passthroughRevisionCleaning(messages) {
+  const payload = JSON.parse(messages[messages.length - 1].content);
+  return { usable: true, instruction: payload.rawInstruction, evidence: [payload.rawInstruction] };
+}
 
 const facts = [
   { id: "f1", slot: "what", label: "穿衣服", text: "我自己穿好了衣服", quote: "我自己穿好衣服" },
@@ -234,6 +240,7 @@ async function testRevision() {
     sentences: currentSentences
   }, async (messages, options) => {
     stages.push(options.stage);
+    if (options.stage === "audit_revision_instruction") return passthroughRevisionCleaning(messages);
     if (options.stage === "revise_semantic_changes") {
       return {
         changes: [{
@@ -262,7 +269,7 @@ async function testRevision() {
     }
     throw new Error(`unexpected stage: ${options.stage}`);
   });
-  assert.deepEqual(stages, ["revise_semantic_changes", "verify_revision_changes", "compose_revision_changes"], "修改必须先确定语义变化、复核事实，再单独完成局部成文");
+  assert.deepEqual(stages, ["audit_revision_instruction", "revise_semantic_changes", "verify_revision_changes", "compose_revision_changes"], "修改必须先清理口述，再确定语义变化、复核事实和局部成文");
   assert.equal(result.changed, true);
   assert.equal(result.facts.find(fact => fact.id === "f3").text, "医生姐姐给我量了身高");
   assert.equal(result.sentences[0].text, currentSentences[0].text);
@@ -285,6 +292,7 @@ async function testLongRevisionRecovery() {
     facts: localFacts,
     sentences: localSentences
   }, async (messages, options) => {
+    if (options.stage === "audit_revision_instruction") return passthroughRevisionCleaning(messages);
     if (options.stage === "revise_semantic_changes") {
       return {
         changes: [{
@@ -347,6 +355,7 @@ async function testDirtyLegacyRevision() {
     facts: legacyFacts,
     sentences: legacySentences
   }, async (messages, options) => {
+    if (options.stage === "audit_revision_instruction") return passthroughRevisionCleaning(messages);
     if (options.stage === "revise_semantic_changes") {
       return {
         changes: [
@@ -436,8 +445,85 @@ async function testDirtyLegacyRevision() {
   assert.equal((article.match(/山药/gu) || []).length, 1, "早餐内容不能被补漏逻辑重复写入");
 }
 
-Promise.all([testFinalize(), testRevision(), testLongRevisionRecovery(), testDirtyLegacyRevision()]).then(() => {
+async function testMixedRevisionCleaningBoundary() {
+  const localFacts = [
+    { id: "training", slot: "what", label: "跆拳道", text: "爸爸妈妈带我去打跆拳道", quote: "爸爸妈妈带我去打跆拳道" },
+    { id: "home", slot: "what", label: "回家", text: "活动结束后我们回家", quote: "活动结束后我们回家" }
+  ];
+  const localSentences = [
+    { id: "s_training", text: "爸爸妈妈带我去打了跆拳道。", factIds: ["training"] },
+    { id: "s_home", text: "活动结束后，我们回了家。", factIds: ["home"] }
+  ];
+  const rawInstruction = "然后呢，下午我去坐了一辆木质的太阳能小汽车。车去一个地方拿了花。这些不用说，你的小汽车是什么样子？下午我去坐了一辆木质的太阳能小汽车。不是坐，是制作了一辆木质的太阳能小汽车。";
+  const cleanedInstruction = "下午我制作了一辆木质的太阳能小汽车。";
+  const result = await reviseFactDiary({
+    instruction: rawInstruction,
+    title: "和爸爸妈妈的一天",
+    facts: localFacts,
+    sentences: localSentences
+  }, async (messages, options) => {
+    if (options.stage === "audit_revision_instruction") {
+      return { usable: true, instruction: cleanedInstruction, evidence: ["不是坐，是制作了一辆木质的太阳能小汽车。"] };
+    }
+    if (options.stage === "revise_semantic_changes") {
+      const payload = JSON.parse(messages[messages.length - 1].content);
+      assert.equal(payload.instruction, cleanedInstruction, "事实变更层只能看见清理后的修改语义");
+      assert.equal(payload.instruction.includes("这些不用说"), false, "家长引导不得进入事实变更层");
+      return {
+        changes: [{
+          mode: "insert",
+          insertAfterFactId: "training",
+          facts: [{ eventKey: "制作小汽车", slot: "what", label: "制作小汽车", text: "下午我制作了一辆木质的太阳能小汽车" }]
+        }]
+      };
+    }
+    if (options.stage === "verify_revision_changes") {
+      return {
+        changes: [{
+          mode: "insert",
+          insertAfterFactId: "training",
+          facts: [{ eventKey: "制作小汽车", slot: "what", label: "制作小汽车", text: "下午我制作了一辆木质的太阳能小汽车" }]
+        }]
+      };
+    }
+    if (options.stage === "compose_revision_changes") {
+      return { operations: [{ key: "operation_1", sentences: [{ text: "下午，我制作了一辆木质的太阳能小汽车。", factKeys: ["new_1_1"] }] }] };
+    }
+    throw new Error(`unexpected stage: ${options.stage}`);
+  });
+  const combined = `${result.sentences.map(sentence => sentence.text).join("")}；${result.facts.map(fact => fact.text).join("；")}`;
+  assert.match(combined, /制作.*木质.*太阳能小汽车/u);
+  assert.equal(combined.includes("这些不用说"), false);
+  assert.equal(combined.includes("车去一个地方拿了花"), false);
+  const newFact = result.facts.find(fact => /\u5236\u4f5c.*\u5c0f\u6c7d\u8f66/u.test(fact.text));
+  assert.equal(newFact.quote, "不是坐，是制作了一辆木质的太阳能小汽车。", "修改证据只保留当次有效原话，不累积历史指令");
+}
+
+function testRevisionCleaningValidation() {
+  const raw = "绘本不是三只小猪，是小红帽。";
+  const cleaned = normalizeRevisionCleaning({
+    usable: true,
+    instruction: "绘本不是三只小猪，是小红帽。",
+    evidence: [raw, "原话中没有的片段"]
+  }, raw);
+  assert.equal(cleaned.usable, true);
+  assert.equal(cleaned.evidence, raw, "非原话证据不得进入日记事实");
+  const invented = normalizeRevisionCleaning({ usable: true, instruction: "我们去了动物园", evidence: [] }, raw);
+  assert.equal(invented.usable, false, "与原始修改口述没有语义词重合时必须拒绝");
+  const exclusionRaw = "车去一个地方拿了花。这些不用说。不是坐，是制作一辆木质小汽车。";
+  const withExclusion = normalizeRevisionCleaning({
+    usable: true,
+    instruction: "车去一个地方拿了花。不是坐，是制作一辆木质小汽车。",
+    evidence: ["不是坐，是制作一辆木质小汽车。"],
+    excludedEvidence: ["车去一个地方拿了花。", "原话里没有的排除片段"]
+  }, exclusionRaw);
+  assert.equal(withExclusion.instruction.includes("拿了花"), false, "明确排除的原话不得进入下一层补漏");
+  assert.equal(withExclusion.excludedEvidence, "车去一个地方拿了花。", "只能接受能在原话中找到的排除证据");
+}
+
+Promise.all([testFinalize(), testRevision(), testLongRevisionRecovery(), testDirtyLegacyRevision(), testMixedRevisionCleaningBoundary()]).then(() => {
   testRevisionPlan();
+  testRevisionCleaningValidation();
   console.log("fact pipeline regression: ok");
 }).catch(error => {
   console.error(error);
