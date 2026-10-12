@@ -75,6 +75,7 @@ Page({
     diaryHistory: [],
     selectedDiary: null,
     revisionDisplay: "",
+    isStartingStory: false,
     transcriptAnchorId: "transcript_end_0",
     feedAnchorId: "feed_end_0",
     showGuardianConsent: false,
@@ -102,6 +103,9 @@ Page({
     this.cloudToken = wx.getStorageSync(CLOUD_TOKEN_KEY) || "";
     this.authError = null;
     this.authPromise = null;
+    this.cloudHistoryPromise = null;
+    this.storyStartPromise = null;
+    this.recordPermissionPromise = null;
     this.guardianConsentServerSynced = false;
     this.cloudHistoryInitialized = false;
     this.pendingProtectedAction = "";
@@ -118,9 +122,9 @@ Page({
     const guardianConsentRecorded = this.hasGuardianConsent();
     this.setData({ guardianConsentRecorded });
     if (guardianConsentRecorded) {
-      this.startCloudInitialization().catch(error => {
-        this.authError = error;
-      });
+      this.startCloudInitialization()
+        .then(() => this.synchronizeDiaryHistory())
+        .catch(error => { this.authError = error; });
     }
   },
 
@@ -244,8 +248,11 @@ Page({
   requireGuardianConsent(action) {
     if (this.hasGuardianConsent()) return true;
     this.pendingProtectedAction = action || this.pendingProtectedAction || "";
-    this.setData({ showGuardianConsent: true, guardianConsentRecorded: false });
-    this.requestWechatPrivacyAuthorization();
+    this.setData({ showGuardianConsent: true, guardianConsentRecorded: false }, () => {
+      const requestAuthorization = () => this.requestWechatPrivacyAuthorization();
+      if (typeof wx.nextTick === "function") wx.nextTick(requestAuthorization);
+      else setTimeout(requestAuthorization, 0);
+    });
     return false;
   },
 
@@ -288,7 +295,11 @@ Page({
       this.resolvePrivacyAuthorization("agree");
       const action = this.pendingProtectedAction;
       this.pendingProtectedAction = "";
-      await this.ensureCloudSession();
+      await new Promise(resolve => {
+        const continueAfterDialog = () => setTimeout(resolve, 120);
+        if (typeof wx.nextTick === "function") wx.nextTick(continueAfterDialog);
+        else continueAfterDialog();
+      });
       if (action === "story") await this.beginStory();
       if (action === "history") await this.enterHistory();
     } catch (error) {
@@ -375,11 +386,11 @@ Page({
     }));
   },
 
-  async initializeCloudDiary() {
+  async initializeCloudSession() {
     if (!this.hasGuardianConsent()) throw new Error("需要监护人同意后才能连接日记服务器");
     await this.authenticateCloudSession();
     await this.syncGuardianConsent();
-    return this.synchronizeDiaryHistory();
+    return this.cloudToken;
   },
 
   async authenticateCloudSession() {
@@ -406,7 +417,7 @@ Page({
   startCloudInitialization() {
     if (!this.hasGuardianConsent()) return Promise.reject(new Error("需要监护人同意后才能继续"));
     if (!this.authPromise) {
-      this.authPromise = this.initializeCloudDiary()
+      this.authPromise = this.initializeCloudSession()
         .catch(error => {
           this.authError = error;
           throw error;
@@ -431,25 +442,31 @@ Page({
 
   async synchronizeDiaryHistory() {
     if (this.cloudHistoryInitialized) return this.data.diaryHistory;
-    const localHistory = this.readDiaryHistory();
-    for (const record of localHistory) {
-      try { await this.rawRequest("/api/diaries", "POST", record); } catch (error) {}
+    if (!this.cloudHistoryPromise) {
+      this.cloudHistoryPromise = (async () => {
+        const localHistory = this.readDiaryHistory();
+        for (const record of localHistory) {
+          try { await this.rawRequest("/api/diaries", "POST", record); } catch (error) {}
+        }
+        const history = await this.refreshCloudHistory();
+        this.cloudHistoryInitialized = true;
+        return history;
+      })().finally(() => { this.cloudHistoryPromise = null; });
     }
-    const history = await this.refreshCloudHistory();
-    this.cloudHistoryInitialized = true;
-    return history;
+    return this.cloudHistoryPromise;
   },
 
-  async ensureCloudSession() {
+  async ensureCloudSession({ syncHistory = true } = {}) {
     if (!this.hasGuardianConsent()) throw new Error("需要监护人同意后才能继续");
-    if (!this.cloudToken) await this.startCloudInitialization();
+    if (this.authPromise) await this.authPromise;
+    else if (!this.cloudToken) await this.startCloudInitialization();
     else await this.syncGuardianConsent();
     if (!this.cloudToken) {
       const error = this.authError;
       this.authError = null;
       throw new Error(error?.message || "还没有连接到日记服务器");
     }
-    if (!this.cloudHistoryInitialized) await this.synchronizeDiaryHistory();
+    if (syncHistory && !this.cloudHistoryInitialized) await this.synchronizeDiaryHistory();
     return this.cloudToken;
   },
 
@@ -586,27 +603,51 @@ Page({
   },
 
   async beginStory() {
-    try {
-      await this.ensureCloudSession();
-    } catch (error) {
-      wx.showModal({ title: "还没有连上服务器", content: error.message || "请稍后再试。", showCancel: false });
-      return;
-    }
-    this.resetRuntime();
-    this.setData({ phase: "listen", statusTitle: "正在打开麦克风", statusHint: "开始以后一直说就好。" });
-    await this.startRecorder("story");
+    if (this.storyStartPromise) return this.storyStartPromise;
+    this.storyStartPromise = (async () => {
+      this.resetRuntime();
+      this.setData({
+        phase: "listen",
+        isStartingStory: true,
+        statusTitle: "正在准备",
+        statusHint: "请在微信提示中允许使用麦克风。"
+      });
+
+      const sessionResult = this.ensureCloudSession({ syncHistory: false })
+        .then(() => ({ ok: true }))
+        .catch(error => ({ ok: false, error }));
+      const allowed = await this.ensureRecordPermission();
+      if (!allowed) return;
+
+      const session = await sessionResult;
+      if (!session.ok) {
+        this.setData({ phase: "home" });
+        wx.showModal({ title: "还没有连上服务器", content: session.error?.message || "请稍后再试。", showCancel: false });
+        return;
+      }
+      this.activateRecorder("story");
+    })().finally(() => {
+      this.storyStartPromise = null;
+      this.setData({ isStartingStory: false });
+    });
+    return this.storyStartPromise;
   },
 
   async startRecorder(kind) {
     const allowed = await this.ensureRecordPermission();
     if (!allowed) return;
+    this.activateRecorder(kind);
+  },
+
+  activateRecorder(kind) {
     this.segmentKind = kind;
     this.keepRecording = true;
     this.startSegment();
   },
 
   ensureRecordPermission() {
-    return new Promise(resolve => {
+    if (this.recordPermissionPromise) return this.recordPermissionPromise;
+    const permissionRequest = new Promise(resolve => {
       wx.getSetting({
         success: setting => {
           if (setting.authSetting["scope.record"] === true) return resolve(true);
@@ -617,7 +658,7 @@ Page({
           wx.authorize({
             scope: "scope.record",
             success: () => resolve(true),
-            fail: () => this.openRecordSettings(resolve)
+            fail: () => setTimeout(() => this.openRecordSettings(resolve), 250)
           });
         },
         fail: error => {
@@ -626,6 +667,11 @@ Page({
         }
       });
     });
+    this.recordPermissionPromise = permissionRequest;
+    permissionRequest.finally(() => {
+      if (this.recordPermissionPromise === permissionRequest) this.recordPermissionPromise = null;
+    });
+    return permissionRequest;
   },
 
   openRecordSettings(resolve) {

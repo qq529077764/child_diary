@@ -13,7 +13,7 @@
       <text class="theme">今天你帮助别人做了什么？</text>
     </view>
     <view class="home-actions">
-      <button class="button primary" bindtap="startStory">开始说</button>
+      <button class="button primary" disabled="{{isStartingStory}}" bindtap="startStory">{{isStartingStory ? '正在准备' : '开始说'}}</button>
       <button class="button soft history-entry" bindtap="openHistory">我的日记 {{diaryHistory.length ? diaryHistory.length + ' 篇' : ''}}</button>
     </view>
   </view>
@@ -28,7 +28,7 @@
         <text class="history-preview">{{item.preview}}</text>
       </view>
     </scroll-view>
-    <button class="button primary" bindtap="startStory">讲一个新故事</button>
+    <button class="button primary" disabled="{{isStartingStory}}" bindtap="startStory">{{isStartingStory ? '正在准备' : '讲一个新故事'}}</button>
     <button class="history-privacy" bindtap="openPrivacyCenter">家长与隐私</button>
   </view>
 

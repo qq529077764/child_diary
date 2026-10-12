@@ -5,6 +5,7 @@ const storage = new Map();
 const modals = [];
 let loginCalls = 0;
 let privacyHandler;
+let privacyAuthorizationCalls = 0;
 
 global.Page = definition => { pageDefinition = definition; };
 global.wx = {
@@ -13,6 +14,12 @@ global.wx = {
   removeStorageSync: key => storage.delete(key),
   showModal: options => { modals.push(options); },
   login: () => { loginCalls += 1; },
+  nextTick: callback => callback(),
+  requirePrivacyAuthorize: options => {
+    privacyAuthorizationCalls += 1;
+    if (privacyHandler) privacyHandler(() => {});
+    if (options?.success) options.success();
+  },
   onNeedPrivacyAuthorization: handler => { privacyHandler = handler; },
   offNeedPrivacyAuthorization: () => { privacyHandler = undefined; },
   getRecorderManager: () => ({ onStart() {}, onStop() {}, onError() {}, stop() {} })
@@ -24,7 +31,7 @@ function createPage(overrides = {}) {
   const page = {
     ...pageDefinition,
     data: structuredClone(pageDefinition.data),
-    setData(update) { Object.assign(this.data, update); },
+    setData(update, callback) { Object.assign(this.data, update); if (callback) callback(); },
     recorder: { stop() {} },
     ...overrides
   };
@@ -46,14 +53,44 @@ async function run() {
   const privacyPage = {
     ...pageDefinition,
     data: structuredClone(pageDefinition.data),
-    setData(update) { Object.assign(this.data, update); }
+    setData(update, callback) { Object.assign(this.data, update); if (callback) callback(); }
   };
   privacyPage.onLoad();
   assert.equal(loginCalls, 0, "没有监护人同意时，启动小程序不能调用微信登录");
   await privacyPage.startStory();
   assert.equal(privacyPage.data.showGuardianConsent, true, "首次开始录音前必须显示监护人确认");
+  assert.equal(privacyAuthorizationCalls, 1, "首次监护人提醒只应发起一次微信隐私授权");
   assert.equal(typeof privacyHandler, "function", "小程序应接入微信隐私授权回调");
   privacyPage.onUnload();
+
+  storage.set("guardianConsent", { agreed: true, policyVersion: "2026-10-09-v1", agreedAt: Date.now() });
+  const startupPage = createPage();
+  startupPage.cloudToken = "test-token";
+  startupPage.authPromise = null;
+  startupPage.guardianConsentServerSynced = false;
+  startupPage.cloudHistoryInitialized = false;
+  startupPage.authenticateCloudSession = async () => "test-token";
+  startupPage.syncGuardianConsent = async () => { startupPage.guardianConsentServerSynced = true; };
+  let historySyncCalls = 0;
+  startupPage.synchronizeDiaryHistory = async () => { historySyncCalls += 1; return []; };
+  await startupPage.ensureCloudSession({ syncHistory: false });
+  assert.equal(historySyncCalls, 0, "开始录音所需连接不能等待历史日记同步");
+  await startupPage.ensureCloudSession();
+  assert.equal(historySyncCalls, 1, "进入日记等普通流程仍应完成历史同步");
+
+  let permissionChecks = 0;
+  let finishPermissionCheck;
+  wx.getSetting = options => {
+    permissionChecks += 1;
+    finishPermissionCheck = () => options.success({ authSetting: { "scope.record": true } });
+  };
+  const permissionPage = createPage();
+  const firstPermission = permissionPage.ensureRecordPermission();
+  const secondPermission = permissionPage.ensureRecordPermission();
+  assert.equal(firstPermission, secondPermission, "重复点击不能发起第二个麦克风授权流程");
+  assert.equal(permissionChecks, 1, "麦克风权限检查必须串行");
+  finishPermissionCheck();
+  assert.equal(await firstPermission, true);
 
   const listeningPage = createPage();
   let finishCalls = 0;
