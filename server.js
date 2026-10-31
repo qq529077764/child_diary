@@ -328,7 +328,7 @@ async function transcribeWithTencent(audio) {
 function qwenConfig() {
   return {
     apiKey: process.env.QWEN_API_KEY,
-    model: process.env.QWEN_MODEL || "qwen3.8-max",
+    model: process.env.QWEN_MODEL || "qwen3.8-max-0902",
     fastModel: process.env.QWEN_FAST_MODEL || "deepseek-v4.1-flash",
     enableThinking: String(process.env.QWEN_ENABLE_THINKING || "false").toLowerCase() === "true",
     baseUrl: (process.env.QWEN_BASE_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/$/, "")
